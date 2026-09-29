@@ -609,6 +609,37 @@ class KeyPool:
             key.stats.failures += 1
             key.last_error = detail or "client error"
 
+    def revive_invalid(self, detail_hints: Iterable[str] = ()) -> int:
+        """复活被判失效的 Key（清冷却、清连续失败）。
+
+        为什么需要它：旧版把"模型不在套餐"误判成凭据失效，导致 6 把好 Key 全部
+        INVALID、池子瘫痪；即使切回可用模型，Key 依然是 INVALID，只能等 invalid_ttl
+        或重启。切换模型时调用本方法，让被误判的 Key 立刻恢复参与轮换。
+
+        Args:
+            detail_hints: 只复活 ``last_error`` 里包含这些关键词的失效 Key；
+                为空则复活全部。用于"只洗掉被模型错误误判的 Key，真失效的照旧"。
+
+        Returns:
+            复活的数量。
+        """
+        hints = tuple(detail_hints)
+        with self._cond:
+            revived = 0
+            for key in self._keys:
+                if key.status is not KeyStatus.INVALID:
+                    continue
+                if hints and not any(h in (key.last_error or "").lower() for h in hints):
+                    continue
+                key.status = KeyStatus.HEALTHY
+                key.cooldown_until = 0.0
+                key.consecutive_failures = 0
+                key.last_error = ""
+                revived += 1
+            if revived:
+                self._cond.notify_all()
+            return revived
+
     # ------------------------------------------------------------ 快照
 
     def snapshot(self) -> list[dict[str, object]]:

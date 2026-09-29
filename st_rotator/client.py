@@ -21,7 +21,7 @@ from dataclasses import replace
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
-from .config import AccountConfig, Config, RateControlConfig, STRATEGIES
+from .config import AccountConfig, Config, RateControlConfig, STRATEGIES, next_account_name
 from .errors import (
     AllKeysInvalid,
     ApiError,
@@ -45,6 +45,29 @@ AUTH_HINTS = (
     "unauthorized", "authentication failed", "authentication_error",
     "invalid token", "token expired", "no permission", "permission denied",
     "account disabled", "account suspended", "arrears", "欠费", "鉴权失败", "密钥无效", "无权限",
+)
+# 响应体里出现这些词，说明是"请求的模型不在当前 Key 的套餐/token plan 里"，
+# 而不是凭据失效。这类错误**不能把 Key 标记失效**：
+# - 换 Key 也没用（同池子的套餐通常一致，白打 N 次 401/403）
+# - 更致命的是误判会毒化整个池子——日志里 6 把好 Key 全部 [失效]、网关瘫痪，
+#   而且切回可用模型后 Key 仍是 INVALID，只能等 invalid_ttl 或重启（这就是
+#   "切换回可用 model 不能恢复"的根因）。
+MODEL_UNAVAILABLE_HINTS = (
+    "model is not available in the current token plan",
+    "model is not available",
+    "model not available",
+    "model not found",
+    "model does not exist",
+    "no such model",
+    "unknown model",
+    "model not supported",
+    "model is not in",
+    "model not in",
+    "token plan",
+    "模型不存在",
+    "模型不可用",
+    "模型未开通",
+    "模型无权限",
 )
 
 _RETRY_AFTER_BODY = re.compile(r'"retry_?after"?\s*[:=]\s*"?(\d+(?:\.\d+)?)', re.I)
@@ -86,7 +109,7 @@ def parse_retry_after(response: Response | StreamResponse, body: str = "") -> fl
 
 
 def classify(response: Response | StreamResponse, body: str) -> tuple[str, float | None]:
-    """把响应归类为 ok / retry / invalid / fatal。
+    """把响应归类为 ok / retry / invalid / fatal / model。
 
     Returns:
         (动作, 服务端建议等待秒数)
@@ -94,6 +117,13 @@ def classify(response: Response | StreamResponse, body: str) -> tuple[str, float
     status = response.status
     if status < 400:
         return "ok", None
+    lowered = (body or "").lower()
+    if any(hint in lowered for hint in MODEL_UNAVAILABLE_HINTS):
+        # 请求的模型不在当前 Key 的套餐里：Key 本身是好的。
+        # 不能标记失效——否则一把好 Key 被误判 INVALID，切回可用模型也恢复不了。
+        # 归为 "model"：换下一把 Key 试试（不同账号套餐可能不同），
+        # 全部不行再透传上游错误（见 _post_with_rotation 的 model 分支）。
+        return "model", None
     if status in AUTH_STATUS:
         return "invalid", None
     if status == 429:
@@ -350,6 +380,10 @@ class StRotator:
                 return "ok", "ok"
             detail = f"{status} {extract_error(safe_text(response))}"
             if status in AUTH_STATUS:
+                lowered = (safe_text(response) or "").lower()
+                if any(hint in lowered for hint in MODEL_UNAVAILABLE_HINTS):
+                    # 探测用的是默认模型；模型不在套餐不等于 Key 失效
+                    return "unknown", f"默认模型不可用（{detail}）"
                 return "invalid", detail
             if status in RETRYABLE_STATUS:
                 return "unknown", detail
@@ -369,6 +403,9 @@ class StRotator:
                     return "ok", "ok"
                 probe_detail = f"{probe.status} {extract_error(safe_text(probe))}"
                 if probe.status in AUTH_STATUS:
+                    lowered = (safe_text(probe) or "").lower()
+                    if any(hint in lowered for hint in MODEL_UNAVAILABLE_HINTS):
+                        return "unknown", f"默认模型不可用（{probe_detail}）"
                     return "invalid", probe_detail
                 if probe.status in RETRYABLE_STATUS:
                     return "unknown", probe_detail
@@ -411,7 +448,7 @@ class StRotator:
         weight: float = 1.0,
     ) -> ApiKey:
         """运行中加一把 Key，立刻参与轮换。"""
-        acct_name = account or f"账号{len(self.config.accounts) + 1}"
+        acct_name = account or next_account_name(a.name for a in self.config.accounts)
         item = self.pool.add_key(
             key,
             acct_name,
@@ -453,12 +490,23 @@ class StRotator:
         return False
 
     def set_default_model(self, model: str) -> str:
-        """切换默认模型。下一次请求即生效（``_build_payload`` 每次现读配置）。"""
+        """切换默认模型。下一次请求即生效（``_build_payload`` 每次现读配置）。
+
+        切换模型时顺带把被误判失效的 Key 全部复活：旧版会把"模型不在套餐"
+        错当成凭据失效，导致切回可用模型后 Key 依然是 INVALID、池子瘫痪。
+        现在切换模型就是一次"重新验证"的机会，让好 Key 立刻恢复参与轮换。
+        """
         model = (model or "").strip()
         if not model:
             raise ConfigError("模型名不能为空")
+        # 只复活被"模型不在套餐"误判失效的 Key；真失效（401/403 凭据问题）的不碰，
+        # 避免复活后又白打一次请求。
+        revived = self.pool.revive_invalid(MODEL_UNAVAILABLE_HINTS)
         self.config.default_model = model
-        self._log(f"[配置] 默认模型切换为 {model}")
+        if revived:
+            self._log(f"[配置] 默认模型切换为 {model}，已复活 {revived} 把被误判失效的 Key")
+        else:
+            self._log(f"[配置] 默认模型切换为 {model}")
         return model
 
     def set_strategy(self, strategy: str) -> str:
@@ -681,6 +729,16 @@ class StRotator:
                     excluded.add(key.key)
                     self._log(f"[失效] {key.masked}({key.account}) 凭据无效，已排除: {extract_error(body)}")
                     retryable = True
+                elif action == "model":
+                    # 模型不在当前 Key 的套餐：Key 本身是好的，绝不能标记失效。
+                    # 本轮排除这把、换下一把试试（不同账号套餐可能不同）；
+                    # 若所有 Key 都报模型不可用，直接透传上游错误，不空等。
+                    self.pool.report_client_error(key, extract_error(body))
+                    excluded.add(key.key)
+                    self._log(f"[模型] {key.masked}({key.account}) 套餐不含该模型，换下一把: {extract_error(body)}")
+                    if all(k.key in excluded for k in self.pool.keys):
+                        raise ApiError(response.status, body)
+                    retryable = True
                 elif action == "retry":
                     if response.status == 429:
                         delay = self.pool.report_rate_limit(key, retry_after)
@@ -796,6 +854,16 @@ class StRotator:
                     self.pool.report_invalid(key, extract_error(body))
                     excluded.add(key.key)
                     self._log(f"[失效] {key.masked}({key.account}) 凭据无效: {extract_error(body)}")
+                    retryable = True
+                elif action == "model":
+                    # 同非流式：模型不在套餐 ≠ Key 失效，换下一把试试；
+                    # 所有 Key 都报模型不可用时直接透传上游错误。
+                    last_status, last_body = response.status, body
+                    self.pool.report_client_error(key, extract_error(body))
+                    excluded.add(key.key)
+                    self._log(f"[模型] {key.masked}({key.account}) 套餐不含该模型，换下一把: {extract_error(body)}")
+                    if all(k.key in excluded for k in self.pool.keys):
+                        raise ApiError(response.status, body)
                     retryable = True
                 elif action == "retry":
                     last_status, last_body = response.status, body
