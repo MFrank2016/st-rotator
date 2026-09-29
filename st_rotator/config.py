@@ -11,7 +11,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from .errors import ConfigError
 
@@ -34,6 +34,24 @@ def expand_env(value: str) -> str:
         raise ConfigError(f"环境变量 {name} 未设置，且未提供默认值")
 
     return _ENV_PATTERN.sub(_sub, value)
+
+
+def next_account_name(existing: Iterable[str]) -> str:
+    """给一个不与现有账号重名的默认账号名（``账号1``、``账号2``……）。
+
+    命名约定：从「现有账号数 + 1」起算，若该名字已被占用则继续往后找。
+    所以现有 ``[账号1, 账号3]`` 会得到 ``账号4``（而不是补空位的 ``账号2``）——
+    保持"追加在末尾"的直觉，同时避免和已存在的名字撞车。
+
+    ⚠️ 批量加 Key 时必须**先算一次名字、整批复用**。如果每把 Key 都现算一次，
+    它们会各自拿到一个新名字、被拆成 N 个账号，于是账号级配额聚合与 429 联动冷却
+    全部失效（每把 Key 独占一份配额，同账号雪崩照样发生）。
+    """
+    names = {str(name) for name in existing}
+    index = len(names) + 1
+    while f"账号{index}" in names:
+        index += 1
+    return f"账号{index}"
 
 
 @dataclass
@@ -135,8 +153,11 @@ class CooldownConfig:
 class AccountConfig:
     """一个账号（可含多把 Key）。
 
-    同一账号下的多把 Key 共享账号级配额，因此 ``rpm_limit`` 建议按"账号总配额 /
-    Key 数量"填写，或者干脆留空由服务端兜底。
+    ``rpm_limit`` 是**账号级**配额：同一账号下的多把 Key 共享同一个 60s 滑动窗口
+    （见 ``keypool.AccountState``），撞到上限时整个账号一起停，避免同账号的多把 Key
+    连环送死。所以这里填的是**账号总配额**，不要再除以 Key 数量——除以 Key 数量是
+    旧的"每把 Key 各自一个窗口"语义，会让闸门被收窄 N 倍。留空表示不做本地 RPM 限制，
+    完全依赖上游 429 反馈。
     """
 
     name: str
@@ -386,7 +407,9 @@ class ConfigStore:
         if not key:
             raise ConfigError("api_key 不能为空")
         accounts = self._accounts_raw()
-        name = account or f"账号{len(accounts) + 1}"
+        name = account or next_account_name(
+            item.get("name") for item in accounts if isinstance(item, dict)
+        )
         for item in accounts:
             if isinstance(item, dict) and item.get("name") == name:
                 keys = item.get("api_keys")
@@ -406,6 +429,14 @@ class ConfigStore:
         }
         accounts.append(entry)
         return entry
+
+    def account_names(self) -> list[str]:
+        """当前配置里的账号名（按出现顺序）。"""
+        return [
+            str(item["name"])
+            for item in self._accounts_raw()
+            if isinstance(item, dict) and item.get("name")
+        ]
 
     def remove_key(self, key: str) -> bool:
         """从配置文件里删掉一把 Key；账号空了就一并删掉该账号。"""

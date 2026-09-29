@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from .client import StRotator
-from .config import STRATEGIES, Config, ConfigStore, RateControlConfig
+from .config import STRATEGIES, Config, ConfigStore, RateControlConfig, next_account_name
 from .dashboard import DASHBOARD_HTML
 from .errors import ConfigError, RotatorError
 from .logs import LogBuffer
@@ -261,6 +261,13 @@ class ConsoleState:
         rejected: list[dict[str, Any]] = []
         warnings: list[str] = []
 
+        # 整批 Key 落在同一个账号下。账号级 rpm_limit 与 429 冷却都是按账号聚合的
+        # （见 keypool.AccountState），如果逐把 Key 现算名字，它们会被拆成 N 个账号，
+        # 聚合与联动冷却就全失效了 —— 每把 Key 独占一份配额，同账号雪崩照旧。
+        # 名字只算一次、整批复用；想让它们分属不同账号，请分多批并显式指定账号名。
+        with self.lock:
+            target_account = account or next_account_name(self.store.account_names())
+
         for key in candidates:
             if len(key) < 8:
                 rejected.append({"key": _mask(key), "reason": "长度不足 8 位，不像有效 Key"})
@@ -279,9 +286,6 @@ class ConsoleState:
                     warnings.append(f"{_mask(key)} 暂时无法确认（{detail}），已按可用处理")
 
             with self.lock:
-                target_account = account
-                if not target_account:
-                    target_account = f"账号{len(self.store._accounts_raw()) + 1}"
                 try:
                     self.store.add_key(key, target_account, max_concurrency=max_concurrency, rpm_limit=rpm_limit)
                 except ConfigError as exc:
@@ -301,14 +305,17 @@ class ConsoleState:
             added.append({"id": item.key_id, "key": item.masked, "account": item.account})
 
         if added:
-            self._save_and_log(f"通过控制台新增 {len(added)} 把 Key")
+            self._save_and_log(f"通过控制台新增 {len(added)} 把 Key（账号 {target_account}）")
         if not added and not rejected:
             return UiResponse.error("没有可添加的 Key")
         message = f"新增 {len(added)} 把"
+        if added:
+            message += f"（归入账号 {target_account}，同账号共享配额与 429 冷却）"
         if rejected:
             message += f"，跳过 {len(rejected)} 把"
         return UiResponse.json({
             "ok": bool(added),
+            "account": target_account,
             "added": added,
             "rejected": rejected,
             "warnings": warnings,
