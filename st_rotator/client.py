@@ -83,6 +83,8 @@ _FX_ACTIVE = 0
 # 噪声图按尺寸进程级共享——烧点请求体动辄数 MB，反复生成会让 glibc 堆碎片化、
 # RSS 只涨不降（实测一波烧点 37MB→200MB 不回落）；同尺寸图生成一次重复用即可。
 _FX_IMG_CACHE: dict[int, str] = {}
+# 带图请求体每发约 1MB×N 图，是唯一的内存大头：全局限 8 个在飞，防多账号同烧时 OOM
+_FX_IMG_SEM = threading.Semaphore(8)
 
 
 def _noise_png_b64(size: int) -> str:
@@ -803,14 +805,19 @@ class StRotator:
                         {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}
                         for b64 in imgs
                     ]
+                    max_tok = min(fx.long_text_max_tokens, 1024)  # 图请求输出小，省时间
                 else:
                     content = fx.long_text_prompt
+                    max_tok = fx.long_text_max_tokens
                 payload = {
                     "model": fx.model,
                     "messages": [{"role": "user", "content": content}],
-                    "max_tokens": fx.long_text_max_tokens,
+                    "max_tokens": max_tok,
                     "stream": False,
                 }
+                is_img = isinstance(content, list)
+                if is_img:
+                    _FX_IMG_SEM.acquire()  # 大图请求进限流闸，防瞬时内存峰值
                 try:
                     resp = self._client.request("POST", "/chat/completions", json_body=payload, headers=self._auth(key))
                     if resp.status == 200:
@@ -823,7 +830,7 @@ class StRotator:
                         n_img = len(content) - 1 if isinstance(content, list) else 0
                         self._log(
                             f"[一换一] {key.account} 第 {i + 1} 发烧点完成"
-                            f"（{'%d图' % n_img if n_img else '长文'}，输出≈{usage.get('completion_tokens', '?')} tokens，累计 {done}）"
+                            f"（{'%d图' % n_img if n_img else '长文'}，总耗≈{usage.get('total_tokens', '?')} tokens，累计 {done}）"
                         )
                         return "ok"
                     if resp.status == 429:
@@ -839,6 +846,9 @@ class StRotator:
                     self._log(f"[一换一] {key.account} 烧点异常: {type(exc).__name__}: {exc}")
                     stop.set()
                     return "stop"
+                finally:
+                    if is_img:
+                        _FX_IMG_SEM.release()
 
             def probe_recovered() -> bool:
                 """用默认模型发一个极小请求，探测通用池是否已回补。"""

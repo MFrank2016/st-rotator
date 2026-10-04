@@ -180,8 +180,8 @@ class FlashLiteExchangeConfig:
 
     enabled: bool = False
     model: str = "sensenova-6.8-flash-lite"
-    concurrency: int = 8
-    requests_per_trigger: int = 128
+    concurrency: int = 24
+    requests_per_trigger: int = 32
     min_interval_s: float = 300.0
     long_text_max_tokens: int = 4096
     long_text_prompt: str = (
