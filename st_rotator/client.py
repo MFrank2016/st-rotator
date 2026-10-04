@@ -879,8 +879,7 @@ class StRotator:
                         pass
                     recovered = True
                     break
-                if not stop.is_set() and time.time() < deadline:
-                    time.sleep(5)  # 轮间节奏，别把推广池窗口打太死
+                # 暴力烧点：正常时立刻下一轮；只有撞推广池窗口限流（soft429）才在 one() 里自行降速
 
             if not recovered and time.time() >= deadline:
                 self._log(f"[一换一] {key.account} 冷却窗口到期，结束烧点（成功 {done} 发，等待正常复探）")

@@ -448,8 +448,8 @@ class ConsoleState:
                 if f in fx_payload:
                     fx_changes[f] = bool(fx_payload[f])
             fx_num_fields = (
-                ("concurrency", int, 1, 16, "一换一并发"),
-                ("requests_per_trigger", int, 1, 512, "一换一单轮上限"),
+                ("concurrency", int, 1, 64, "一换一并发"),
+                ("requests_per_trigger", int, 1, 2048, "一换一单轮上限"),
                 ("min_interval_s", float, 60.0, 86400.0, "一换一触发间隔"),
                 ("long_text_max_tokens", int, 128, 16384, "一换一长文预算"),
                 ("image_size", int, 256, 2048, "一换一大图边长"),

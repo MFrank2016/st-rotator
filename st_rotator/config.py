@@ -180,10 +180,10 @@ class FlashLiteExchangeConfig:
 
     enabled: bool = False
     model: str = "sensenova-6.8-flash-lite"
-    concurrency: int = 2
-    requests_per_trigger: int = 64
+    concurrency: int = 8
+    requests_per_trigger: int = 128
     min_interval_s: float = 300.0
-    long_text_max_tokens: int = 1024
+    long_text_max_tokens: int = 4096
     long_text_prompt: str = (
         "请写一篇结构完整、细节丰富的深度综述文章，题目为《人工智能基础设施的演进："
         "从单机推理到全球调度》，包含引言、三个主体章节和总结，不少于1500字。"
@@ -200,10 +200,10 @@ class FlashLiteExchangeConfig:
         if unknown:
             raise ConfigError(f"flash_lite_exchange 存在未知字段: {sorted(unknown)}")
         cfg = cls(**data)
-        if cfg.concurrency < 1:
-            raise ConfigError("flash_lite_exchange.concurrency 必须 >= 1")
-        if cfg.requests_per_trigger < 1:
-            raise ConfigError("flash_lite_exchange.requests_per_trigger 必须 >= 1")
+        if not (1 <= cfg.concurrency <= 64):
+            raise ConfigError("flash_lite_exchange.concurrency 需在 1~64 之间")
+        if not (1 <= cfg.requests_per_trigger <= 2048):
+            raise ConfigError("flash_lite_exchange.requests_per_trigger 需在 1~2048 之间")
         if cfg.min_interval_s < 0:
             raise ConfigError("flash_lite_exchange.min_interval_s 不能为负")
         if cfg.long_text_max_tokens < 16:

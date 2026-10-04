@@ -320,11 +320,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </label>
         <label class="field" style="width:82px;margin-bottom:0">
           <span>并发</span>
-          <input id="opt-fx-concurrency" type="number" min="1" max="16">
+          <input id="opt-fx-concurrency" type="number" min="1" max="64">
         </label>
         <label class="field" style="width:96px;margin-bottom:0">
           <span>单轮上限</span>
-          <input id="opt-fx-req" type="number" min="1" max="512">
+          <input id="opt-fx-req" type="number" min="1" max="2048">
         </label>
         <label class="field" style="width:110px;margin-bottom:0">
           <span>触发间隔(秒)</span>
