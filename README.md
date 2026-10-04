@@ -175,7 +175,7 @@ resp = client.chat.completions.create(
     "min_interval_s": 300,        // 同账号触发最小间隔
     "long_text_max_tokens": 1024,
     "image_enabled": true,
-    "image_size": 768,
+    "image_size": 512,
     "max_workers": 8              // 全局最多同时烧点的账号数
   ]
 }

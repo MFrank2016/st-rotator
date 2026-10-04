@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import random
 import re
@@ -79,12 +80,19 @@ _FX_LOCK = threading.Lock()
 _FX_LAST: dict[str, float] = {}
 _FX_ACTIVE = 0
 
+# 噪声图按尺寸进程级共享——烧点请求体动辄数 MB，反复生成会让 glibc 堆碎片化、
+# RSS 只涨不降（实测一波烧点 37MB→200MB 不回落）；同尺寸图生成一次重复用即可。
+_FX_IMG_CACHE: dict[int, str] = {}
+
 
 def _noise_png_b64(size: int) -> str:
-    """生成 size×size 随机噪声 PNG 的 base64（纯标准库）。
+    """生成 size×size 随机噪声 PNG 的 base64（纯标准库；按尺寸缓存，避免重复分配 MB 级缓冲）。
 
     噪声几乎不可压缩，能保证视觉模型按高分辨率图片计费——这正是烧点的目的。
     """
+    cached = _FX_IMG_CACHE.get(size)
+    if cached is not None:
+        return cached
     import base64
     import os
     import struct
@@ -105,7 +113,43 @@ def _noise_png_b64(size: int) -> str:
         + chunk(b"IDAT", zlib.compress(raw, 1))
         + chunk(b"IEND", b"")
     )
-    return base64.b64encode(png).decode("ascii")
+    b64 = base64.b64encode(png).decode("ascii")
+    with _FX_LOCK:
+        if len(_FX_IMG_CACHE) < 8:  # 最多缓存 8 种尺寸，防无界
+            _FX_IMG_CACHE[size] = b64
+        return _FX_IMG_CACHE.get(size, b64)
+
+
+# ------------------------------------------------------------ 内存看门人
+# CPython 持有已释放的 arena 不还给 OS（glibc 堆碎片化后 RSS 只涨不降，
+# 烧点这类 MB 级瞬时分配会把网关进程的 RSS 顶上去——实测一波烧点 37MB→200MB）。
+# 定期 gc + malloc_trim 可以把空闲堆页真正还给内核；非 glibc 平台自动静默跳过。
+_JANITOR_STARTED = False
+
+
+def _start_janitor() -> None:
+    global _JANITOR_STARTED
+    if _JANITOR_STARTED:
+        return
+    _JANITOR_STARTED = True
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    except OSError:
+        libc = None  # Windows / macOS：obmalloc  arenas 保留，但无 trim 可用
+
+    def loop() -> None:
+        while True:
+            time.sleep(60)
+            try:
+                gc.collect()
+                if libc is not None:
+                    libc.malloc_trim(64 * 1024)
+            except Exception:
+                pass
+
+    threading.Thread(target=loop, daemon=True, name="mem-janitor").start()
 
 
 def safe_text(response: Response | StreamResponse) -> str:
@@ -320,6 +364,9 @@ class StRotator:
         # 一个客户端请求可能因为 429 变成好几次上游尝试，这个比值就是轮换的成本。
         self._attempts_lock = threading.Lock()
         self._upstream_attempts = 0
+        _start_janitor()
+
+    # ------------------------------------------------------------ 生命周期（内存）
 
     # ------------------------------------------------------------ 生命周期
 
@@ -840,6 +887,8 @@ class StRotator:
             elif not recovered:
                 self._log(f"[一换一] {key.account} 结束烧点，成功 {done} 发")
         finally:
+            images_b64 = None  # 确定性释放 MB 级图组，别等 GC
+            gc.collect()
             with _FX_LOCK:
                 _FX_ACTIVE -= 1
 

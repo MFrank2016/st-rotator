@@ -189,7 +189,7 @@ class FlashLiteExchangeConfig:
         "从单机推理到全球调度》，包含引言、三个主体章节和总结，不少于1500字。"
     )
     image_enabled: bool = True
-    image_size: int = 768
+    image_size: int = 512
     multi_image_count: int = 3
     max_workers: int = 8
 
