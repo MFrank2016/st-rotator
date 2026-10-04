@@ -609,6 +609,35 @@ class KeyPool:
             key.stats.failures += 1
             key.last_error = detail or "client error"
 
+    def report_model_unavailable(self, key: ApiKey, detail: str = "") -> float:
+        """记录一次"模型不在套餐 / 套餐额度耗尽"，返回冷却秒数。
+
+        不是凭据失效，不能标 INVALID；但额度是账号级的、立刻重试必然再失败，
+        所以给整账号一个中短冷却（cooldown.model_unavailable，默认 300s），
+        到期自动复探——额度补充（数小时）后最多再白打一次即可发现恢复。
+        冷却为 0 时退化为只计数（旧行为）。
+        """
+        with self._cond:
+            key.stats.client_errors += 1
+            key.stats.failures += 1
+            key.last_error = detail or "model unavailable in plan"
+            delay = max(0.0, self.cooldown.model_unavailable)
+            if delay <= 0:
+                return 0.0
+            until = self._clock() + delay
+            key.status = KeyStatus.COOLDOWN
+            key.cooldown_until = max(key.cooldown_until, until)
+            if key.account_state is not None:
+                key.account_state.cooldown_until = max(key.account_state.cooldown_until, until)
+                key.account_state.last_error = key.last_error
+                for sibling in self._keys:
+                    if sibling.account_state is key.account_state and sibling.status is not KeyStatus.INVALID:
+                        sibling.status = KeyStatus.COOLDOWN
+                        sibling.cooldown_until = max(sibling.cooldown_until, until)
+                        sibling.last_error = key.last_error
+            self._cond.notify_all()
+            return delay
+
     def revive_invalid(self, detail_hints: Iterable[str] = ()) -> int:
         """复活被判失效的 Key（清冷却、清连续失败）。
 

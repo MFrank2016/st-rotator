@@ -73,6 +73,40 @@ MODEL_UNAVAILABLE_HINTS = (
 _RETRY_AFTER_BODY = re.compile(r'"retry_?after"?\s*[:=]\s*"?(\d+(?:\.\d+)?)', re.I)
 _RETRY_AFTER_CN = re.compile(r"(\d+(?:\.\d+)?)\s*(?:秒|s)\s*(?:后|之后)", re.I)
 
+# ------------------------------------------------------------ 智能一换一
+# 模块级状态（进程内共享）：触发节流 + 全局并发护栏
+_FX_LOCK = threading.Lock()
+_FX_LAST: dict[str, float] = {}
+_FX_ACTIVE = 0
+
+
+def _noise_png_b64(size: int) -> str:
+    """生成 size×size 随机噪声 PNG 的 base64（纯标准库）。
+
+    噪声几乎不可压缩，能保证视觉模型按高分辨率图片计费——这正是烧点的目的。
+    """
+    import base64
+    import os
+    import struct
+    import zlib
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    raw = b"".join(b"\x00" + os.urandom(size * 3) for _ in range(size))
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw, 1))
+        + chunk(b"IEND", b"")
+    )
+    return base64.b64encode(png).decode("ascii")
+
 
 def safe_text(response: Response | StreamResponse) -> str:
     """安全读取响应体文本（流式响应会顺带读完并归还连接）。"""
@@ -191,6 +225,48 @@ def _parse_model_list(payload: Any) -> list[dict[str, Any]]:
         })
     models.sort(key=lambda m: m["id"])
     return models
+
+
+# ------------------------------------------------------------ 智能一换一
+# 触发条件：账号因「套餐额度耗尽」(model 类错误且报文含 entitlement/quota/exhausted/额度)
+# 被判冷却。此时该账号的推广池（如 sensenova-6.8-flash-lite）通常还有余量，
+# 并发烧推广池（长文 + 大图），按官方活动 1 积分推广池换 1 积分通用池，
+# 推动额度回补，比干等恢复窗口更快让账号复活。
+_FX_KEYWORDS = ("entitlement", "exhausted", "quota", "额度", "耗尽")
+_FX_LOCK = threading.Lock()
+_FX_LAST: dict[str, float] = {}   # account -> 上次触发时刻（time.time）
+_FX_ACTIVE = 0                    # 进行中烧点任务数（全局护栏）
+
+
+def fx_keyword_hit(detail: str) -> bool:
+    """报文里确实在说「额度耗尽」才触发；只是模型不在套餐列表则不烧钱。"""
+    low = (detail or "").lower()
+    return any(k in low for k in _FX_KEYWORDS)
+
+
+def _noise_png_b64(size: int) -> str:
+    """纯标准库生成 size×size 随机噪声 PNG 的 base64。噪声几乎不可压缩，图够"大"。"""
+    import base64
+    import os
+    import struct
+    import zlib
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    raw = b"".join(b"\x00" + os.urandom(size * 3) for _ in range(size))
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw, 1))
+        + chunk(b"IEND", b"")
+    )
+    return base64.b64encode(png).decode("ascii")
 
 
 class StRotator:
@@ -608,6 +684,166 @@ class StRotator:
         """把当前租约对应的 Key 注入请求头。"""
         return {"Authorization": f"Bearer {key.key}"}
 
+    # ------------------------------------------------------------ 智能一换一
+
+    def _maybe_flash_lite_exchange(self, key: ApiKey, detail: str = "") -> None:
+        """账号被判"套餐耗尽冷却"后，自动烧该账号的推广池积分换通用池额度。
+
+        只在错误明确是"额度耗尽"（entitlement/quota/耗尽）时触发；"模型不在套餐"
+        （账号从未开过该模型）烧了也白烧，不触发。
+        同账号有最小触发间隔 + 全局并发护栏，防止多请求并发把触发打成螺旋。
+        """
+        fx = getattr(self.config, "flash_lite_exchange", None)
+        if fx is None or not fx.enabled:
+            return
+        text = (detail or "").lower()
+        if text and not any(k in text for k in ("entitlement", "quota", "exhaust", "额度", "耗尽")):
+            return
+        global _FX_ACTIVE
+        now = time.time()
+        with _FX_LOCK:
+            last = _FX_LAST.get(key.account, 0.0)
+            if now - last < fx.min_interval_s:
+                return
+            if _FX_ACTIVE >= max(1, fx.max_workers):
+                self._log(f"[一换一] {key.account} 触发过频（全局 {_FX_ACTIVE} 个任务在烧），跳过")
+                return
+            _FX_LAST[key.account] = now
+        threading.Thread(
+            target=self._flash_lite_burn, args=(key, fx), daemon=True, name=f"fx-{key.account}"
+        ).start()
+
+    def _flash_lite_burn(self, key: ApiKey, fx: Any) -> None:
+        """烧点任务本体（后台线程，不阻塞正常流量）。
+
+        循环烧到三种结局之一：
+        1. 探测请求确认通用池已回补 → 立即复活账号、收工（目标达成）
+        2. 套餐冷却窗口（cooldown.model_unavailable）到期 → 收工，交给正常复探
+        3. 推广池积分也耗尽（429 entitlement）→ 收工，不硬烧
+        """
+        global _FX_ACTIVE
+        with _FX_LOCK:
+            _FX_ACTIVE += 1
+        try:
+            cooldown_s = max(60.0, float(self.config.cooldown.model_unavailable))
+            deadline = time.time() + cooldown_s
+            self._log(
+                f"[一换一] {key.masked}({key.account}) 套餐耗尽，开始持续烧 {fx.model} 换通用池"
+                f"（窗口 {cooldown_s:.0f}s / 上限 {fx.requests_per_trigger} 发 / 并发 {fx.concurrency}）…"
+            )
+            stop = threading.Event()  # 硬停止信号（推广池耗尽 / 网络异常）
+            done = 0
+            lock = threading.Lock()
+            images_b64: list[str] | None = None  # 本任务的图组（首次用到时一次性生成）
+
+            def ensure_images() -> list[str]:
+                nonlocal images_b64
+                with lock:
+                    if images_b64 is None:
+                        n = max(1, fx.multi_image_count)
+                        images_b64 = [_noise_png_b64(fx.image_size) for _ in range(n)]
+                    return images_b64
+
+            def one(i: int) -> str:
+                """单发烧点。返回 'ok' / 'soft429' / 'stop' / 'err'。"""
+                nonlocal done
+                if stop.is_set():
+                    return "stop"
+                if fx.image_enabled and i % 2 == 1:
+                    imgs = ensure_images()
+                    content: Any = [{"type": "text", "text": "请逐一详细描述这些图片的内容，不少于300字。"}]
+                    content += [
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}
+                        for b64 in imgs
+                    ]
+                else:
+                    content = fx.long_text_prompt
+                payload = {
+                    "model": fx.model,
+                    "messages": [{"role": "user", "content": content}],
+                    "max_tokens": fx.long_text_max_tokens,
+                    "stream": False,
+                }
+                try:
+                    resp = self._client.request("POST", "/chat/completions", json_body=payload, headers=self._auth(key))
+                    if resp.status == 200:
+                        try:
+                            usage = (resp.json() or {}).get("usage") or {}
+                        except Exception:
+                            usage = {}
+                        with lock:
+                            done += 1
+                        n_img = len(content) - 1 if isinstance(content, list) else 0
+                        self._log(
+                            f"[一换一] {key.account} 第 {i + 1} 发烧点完成"
+                            f"（{'%d图' % n_img if n_img else '长文'}，输出≈{usage.get('completion_tokens', '?')} tokens，累计 {done}）"
+                        )
+                        return "ok"
+                    if resp.status == 429:
+                        low = safe_text(resp).lower()
+                        if any(k in low for k in ("entitlement", "quota", "exhaust", "额度", "耗尽")):
+                            self._log(f"[一换一] {key.account} 推广池额度也耗尽（429 entitlement），本轮停止")
+                            stop.set()
+                            return "stop"
+                        return "soft429"  # 分钟级 TPM 窗口：额度还在，放慢即可
+                    self._log(f"[一换一] {key.account} 烧点失败 HTTP {resp.status}: {safe_text(resp)[:120]}")
+                    return "err"
+                except Exception as exc:  # 后台任务，异常不外抛
+                    self._log(f"[一换一] {key.account} 烧点异常: {type(exc).__name__}: {exc}")
+                    stop.set()
+                    return "stop"
+
+            def probe_recovered() -> bool:
+                """用默认模型发一个极小请求，探测通用池是否已回补。"""
+                payload = {
+                    "model": self.config.default_model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 8,
+                    "stream": False,
+                }
+                try:
+                    resp = self._client.request("POST", "/chat/completions", json_body=payload, headers=self._auth(key))
+                    return resp.status == 200
+                except Exception:
+                    return False
+
+            round_i = 0
+            recovered = False
+            while not stop.is_set() and time.time() < deadline and done < fx.requests_per_trigger:
+                # 每轮并发打一小批
+                batch = min(max(1, fx.concurrency), fx.requests_per_trigger - done)
+                threads = []
+                for _ in range(batch):
+                    if stop.is_set() or time.time() >= deadline:
+                        break
+                    t = threading.Thread(target=one, args=(round_i,), daemon=True)
+                    threads.append(t)
+                    t.start()
+                    round_i += 1
+                for t in threads:
+                    t.join()
+
+                # 每轮结束探测一次：通用池回补了就提前收工 + 立即复活账号
+                if probe_recovered():
+                    self._log(f"[一换一] {key.account} 通用池已回补，提前结束烧点 ✅")
+                    try:
+                        self.pool.report_success(key, latency=0.0)  # 顺带清掉冷却，立刻可用
+                    except Exception:
+                        pass
+                    recovered = True
+                    break
+                if not stop.is_set() and time.time() < deadline:
+                    time.sleep(5)  # 轮间节奏，别把推广池窗口打太死
+
+            if not recovered and time.time() >= deadline:
+                self._log(f"[一换一] {key.account} 冷却窗口到期，结束烧点（成功 {done} 发，等待正常复探）")
+            elif not recovered:
+                self._log(f"[一换一] {key.account} 结束烧点，成功 {done} 发")
+        finally:
+            with _FX_LOCK:
+                _FX_ACTIVE -= 1
+
+
     def _remaining(self, started_at: float, budget: float | None) -> float | None:
         """单请求剩余等待预算；None 表示不设上限。"""
         if budget is None:
@@ -732,10 +968,14 @@ class StRotator:
                 elif action == "model":
                     # 模型不在当前 Key 的套餐：Key 本身是好的，绝不能标记失效。
                     # 本轮排除这把、换下一把试试（不同账号套餐可能不同）；
+                    # 同时给该账号一个中短冷却，避免后续请求反复白打（额度按小时补充，
+                    # 冷却到期自动复探）；若开启智能一换一，后台烧推广池加速回补。
                     # 若所有 Key 都报模型不可用，直接透传上游错误，不空等。
-                    self.pool.report_client_error(key, extract_error(body))
+                    err_detail = extract_error(body)
+                    delay = self.pool.report_model_unavailable(key, err_detail)
+                    self._maybe_flash_lite_exchange(key, err_detail)
                     excluded.add(key.key)
-                    self._log(f"[模型] {key.masked}({key.account}) 套餐不含该模型，换下一把: {extract_error(body)}")
+                    self._log(f"[模型] {key.masked}({key.account}) 套餐不含该模型，冷却 {delay:.0f}s 换下一把: {err_detail}")
                     if all(k.key in excluded for k in self.pool.keys):
                         raise ApiError(response.status, body)
                     retryable = True
@@ -857,11 +1097,14 @@ class StRotator:
                     retryable = True
                 elif action == "model":
                     # 同非流式：模型不在套餐 ≠ Key 失效，换下一把试试；
+                    # 同时给该账号中短冷却，并按需触发一换一烧点。
                     # 所有 Key 都报模型不可用时直接透传上游错误。
                     last_status, last_body = response.status, body
-                    self.pool.report_client_error(key, extract_error(body))
+                    err_detail = extract_error(body)
+                    delay = self.pool.report_model_unavailable(key, err_detail)
+                    self._maybe_flash_lite_exchange(key, err_detail)
                     excluded.add(key.key)
-                    self._log(f"[模型] {key.masked}({key.account}) 套餐不含该模型，换下一把: {extract_error(body)}")
+                    self._log(f"[模型] {key.masked}({key.account}) 套餐不含该模型，冷却 {delay:.0f}s 换下一把: {err_detail}")
                     if all(k.key in excluded for k in self.pool.keys):
                         raise ApiError(response.status, body)
                     retryable = True

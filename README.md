@@ -162,6 +162,21 @@ resp = client.chat.completions.create(
       "max_concurrency": 4,
       "weight": 1
     }
+  ],
+
+  // 智能一换一：账号因「套餐额度耗尽」冷却时，自动用该账号并发烧推广池模型
+  //（长文+大图），按官方活动「1 推广池积分换 1 通用池积分」加速回补。
+  // 控制台「运行参数」里有开关和参数表单，改动即生效并落盘。
+  "flash_lite_exchange": {
+    "enabled": false,             // 总开关
+    "model": "sensenova-6.8-flash-lite",
+    "concurrency": 2,
+    "requests_per_trigger": 4,
+    "min_interval_s": 300,        // 同账号触发最小间隔
+    "long_text_max_tokens": 1024,
+    "image_enabled": true,
+    "image_size": 768,
+    "max_workers": 8              // 全局最多同时烧点的账号数
   ]
 }
 ```
