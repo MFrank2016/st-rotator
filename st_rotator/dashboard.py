@@ -863,3 +863,97 @@ S.timerLog = setInterval(pollLogs, 1200);
 </body>
 </html>
 """
+
+
+# 登录页：口令不对时网关回同一个文档，只把错误条从隐藏切成可见。
+# 用单份模板 + 占位符替换，避免维护两份几乎相同的 HTML 字面量。
+_LOGIN_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · 多 Key 轮换控制台</title>
+<style>
+  :root {
+    --bg: #12161d;
+    --card: #1a1f28;
+    --border: #2a3240;
+    --border-strong: #3a4456;
+    --text: #e6ebf2;
+    --muted: #93a0b4;
+    --accent: #5b93ff;
+    --red: #ff8078;
+    --red-bg: #3a1d1c;
+    --mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: var(--bg); color: var(--text);
+    font-family: var(--sans); font-size: 13px; line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .login {
+    width: 100%; max-width: 360px; margin: 20px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 26px 26px 24px;
+  }
+  .login h1 { font-size: 16px; margin: 0 0 4px; font-weight: 650; letter-spacing: .2px; }
+  .login .sub { margin: 0 0 20px; color: var(--muted); font-size: 12px; }
+  label.field { display: block; margin-bottom: 14px; }
+  label.field > span { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 5px; }
+  input[type=password] {
+    font-family: var(--mono); font-size: 13px; color: var(--text);
+    background: var(--bg); border: 1px solid var(--border-strong);
+    border-radius: 7px; padding: 9px 11px; width: 100%;
+  }
+  input[type=password]:focus { outline: none; border-color: var(--accent); }
+  button {
+    font-family: inherit; font-size: 13px; cursor: pointer; width: 100%;
+    border: 1px solid var(--accent); background: var(--accent); color: #fff;
+    padding: 9px 13px; border-radius: 7px; transition: .14s;
+  }
+  button:hover { filter: brightness(1.08); }
+  .error {
+    margin: 0 0 16px; padding: 9px 12px; border-radius: 7px;
+    background: var(--red-bg); color: var(--red); font-size: 12.5px;
+  }
+</style>
+</head>
+<body>
+  <form class="login" method="POST" action="/login">
+    <h1>多 Key 轮换控制台</h1>
+    <p class="sub">该网关启用了本地鉴权，请输入访问 Token。</p>
+    <div class="error" id="login-error" style="__ERROR_STYLE__">口令不正确，请重试</div>
+    <label class="field">
+      <span>访问 Token</span>
+      <input type="password" name="token" class="mono" placeholder="Bearer Token" autocomplete="current-password" autofocus required>
+    </label>
+    <button type="submit">登录</button>
+  </form>
+<script>
+"use strict";
+/* 带 #token=xxx 打开时：fragment 不会发给服务端，也不进 Referer。
+   读出来填进输入框（用 .value 赋值，绝不拼接标记），抹掉地址栏 fragment，再提交。
+   没有 fragment 时绝不自动提交，交给用户手输。 */
+(function () {
+  var match = /(?:^|[#&])token=([^&]+)/.exec(location.hash || "");
+  if (!match) return;
+  var input = document.querySelector('input[name="token"]');
+  if (!input) return;
+  try {
+    input.value = decodeURIComponent(match[1]);
+  } catch (err) {
+    return;
+  }
+  history.replaceState(null, "", location.pathname + location.search);
+  if (input.form) input.form.submit();
+})();
+</script>
+</body>
+</html>
+"""
+
+LOGIN_HTML = _LOGIN_TEMPLATE.replace("__ERROR_STYLE__", "display:none")
+LOGIN_HTML_INVALID = _LOGIN_TEMPLATE.replace("__ERROR_STYLE__", "")

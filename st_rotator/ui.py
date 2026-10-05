@@ -46,7 +46,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .client import StRotator
 from .config import STRATEGIES, Config, ConfigStore, RateControlConfig, next_account_name
-from .dashboard import DASHBOARD_HTML
+from .dashboard import DASHBOARD_HTML, LOGIN_HTML, LOGIN_HTML_INVALID
 from .errors import ConfigError, RotatorError
 from .logs import LogBuffer
 from .version import __version__
