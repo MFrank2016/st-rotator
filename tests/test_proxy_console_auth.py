@@ -9,15 +9,33 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import socket
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from st_rotator.config import Config, ConfigStore
-from st_rotator.proxy import create_server
+from st_rotator.proxy import LoginThrottle, _has_parent_segment, create_server
 from st_rotator.ui import ConsoleState
 
 TOKEN = "testtoken123456"
+
+def _read_status(fp) -> int:
+    """从 keep-alive 连接按 Content-Length 读一条 HTTP 响应，返回状态码。"""
+    status_line = fp.readline().decode("latin-1")
+    status = int(status_line.split()[1])
+    length = 0
+    while True:
+        line = fp.readline().decode("latin-1")
+        if line in ("\r\n", "\n", ""):
+            break
+        name, _, value = line.partition(":")
+        if name.strip().lower() == "content-length":
+            length = int(value.strip() or 0)
+    if length:
+        fp.read(length)
+    return status
 
 
 class _FakeLimiter:
@@ -41,6 +59,7 @@ class FakeRotator:
         self.limiter = _FakeLimiter()
         self.pool = _FakePool()
         self.upstream_attempts = 0
+        self.request_calls = 0
         self.closed = False
 
     def available_models(self) -> list:
@@ -50,6 +69,7 @@ class FakeRotator:
         return {"status": "ok", "keys": []}
 
     def request(self, path, method="GET", json_body=None, headers=None) -> dict:
+        self.request_calls += 1
         return {"object": "list", "data": [], "path": path, "method": method}
 
     def chat(self, messages, model=None, **kwargs) -> dict:
@@ -84,6 +104,7 @@ class _ProxyServerTestCase(unittest.TestCase):
 
     token: str | None = TOKEN
     auto_start = True
+    login_throttle = None
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -124,6 +145,7 @@ class _ProxyServerTestCase(unittest.TestCase):
             port=0,
             token=token,
             console=self.console,
+            login_throttle=self.login_throttle,
         )
         self.console.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -289,6 +311,158 @@ class AuthHardeningTest(_ProxyServerTestCase):
             "POST", "/login", headers={"Content-Length": "40000000"}
         )
         self.assertEqual(resp.status, 413)
+
+
+class LoginThrottleTest(_ProxyServerTestCase):
+    """MF-3：登录失败限流（同一来源窗口内失败过多 -> 429 + Retry-After）。"""
+
+    def setUp(self) -> None:
+        self.login_throttle = LoginThrottle(max_failures=2, window=60.0)
+        super().setUp()
+
+    def _wrong_login(self):
+        return self.request(
+            "POST",
+            "/login",
+            body="token=wrong",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    def test_throttle_after_failures(self) -> None:
+        first, _ = self._wrong_login()
+        second, _ = self._wrong_login()
+        third, _ = self._wrong_login()
+        self.assertEqual(first.status, 401)
+        self.assertEqual(second.status, 401)
+        self.assertEqual(third.status, 429)
+        self.assertIsNotNone(third.getheader("Retry-After"))
+
+    def test_success_resets(self) -> None:
+        wrong, _ = self._wrong_login()
+        self.assertEqual(wrong.status, 401)
+        resp, _ = self.request(
+            "POST",
+            "/login",
+            body=f"token={self.token}",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(resp.status, 303)
+        again, _ = self._wrong_login()
+        self.assertEqual(again.status, 401)
+
+    def test_retry_after_unit(self) -> None:
+        now = [0.0]
+        throttle = LoginThrottle(max_failures=2, window=10.0, clock=lambda: now[0])
+        throttle.record_failure("1.2.3.4")
+        throttle.record_failure("1.2.3.4")
+        first = throttle.retry_after("1.2.3.4")
+        self.assertGreater(first, 0.0)
+        now[0] = 5.0
+        second = throttle.retry_after("1.2.3.4")
+        self.assertGreater(second, 0.0)
+        self.assertLess(second, first)
+        now[0] = 10.0
+        self.assertEqual(throttle.retry_after("1.2.3.4"), 0.0)
+
+    def test_sweep_bounds_memory(self) -> None:
+        now = [0.0]
+        throttle = LoginThrottle(max_failures=2, window=10.0, clock=lambda: now[0])
+        with mock.patch.object(LoginThrottle, "_MAX_TRACKED_KEYS", 3, create=True):
+            for i in range(4):
+                throttle.record_failure(f"10.0.0.{i}")
+            self.assertEqual(len(throttle._failures), 4)
+            now[0] = 100.0  # 远超 10s 窗口，旧时间戳全部过期
+            throttle.record_failure("10.0.0.99")
+            self.assertLess(len(throttle._failures), 4)
+
+
+class RevealTokenTest(_ProxyServerTestCase):
+    """MF-4：token 只对 Bearer 鉴权的调用方显示；Cookie 会话不回显。"""
+
+    def test_api_state_bearer_reveals_token(self) -> None:
+        resp, body = self.request(
+            "GET", "/api/state", headers={"Authorization": f"Bearer {TOKEN}"}
+        )
+        self.assertEqual(resp.status, 200)
+        parsed = json.loads(body)
+        self.assertEqual(parsed["gateway"]["token"], TOKEN)
+
+    def test_api_state_cookie_hides_token(self) -> None:
+        pair = self.login()
+        resp, body = self.request("GET", "/api/state", headers={"Cookie": pair})
+        self.assertEqual(resp.status, 200)
+        parsed = json.loads(body)
+        self.assertEqual(parsed["gateway"]["token"], "")
+
+
+class PathTraversalTest(_ProxyServerTestCase):
+    """MF-5：/v1/* 透传拒绝 `..` 路径段，且不得触达上游。"""
+
+    def test_v1_dotdot_rejected(self) -> None:
+        resp, _ = self.request(
+            "GET", "/v1/../healthz", headers={"Authorization": f"Bearer {TOKEN}"}
+        )
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.fake.request_calls, 0)
+
+    def test_has_parent_segment_detects_encoded_traversal(self) -> None:
+        cases = (
+            "../x",
+            "/v1/../x",
+            "%2e%2e/x",
+            "..%2fhealthz",
+            "%2e%2e%2fmodels",
+            "..%5csecret",
+            "..\\secret",
+            "%252e%252e%252f",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                self.assertTrue(_has_parent_segment(case), case)
+
+    def test_has_parent_segment_allows_safe_paths(self) -> None:
+        for case in ("v1/models", "..foo/bar"):
+            with self.subTest(case=case):
+                self.assertFalse(_has_parent_segment(case), case)
+
+    def test_v1_encoded_slash_traversal_rejected(self) -> None:
+        resp, _ = self.request(
+            "GET", "/v1/..%2fhealthz", headers={"Authorization": f"Bearer {TOKEN}"}
+        )
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.fake.request_calls, 0)
+
+
+class KeepAliveTest(_ProxyServerTestCase):
+    """MF-6：无 token 时 /login 也必须读完请求体，否则 HTTP/1.1 管线错位。"""
+
+    auto_start = False
+
+    def test_no_token_login_drains_body(self) -> None:
+        self.start(None)
+        sock = socket.create_connection(
+            ("127.0.0.1", self.server.server_address[1]), timeout=5
+        )
+        try:
+            payload = (
+                b"POST /login HTTP/1.1\r\n"
+                b"Host: x\r\n"
+                b"Content-Length: 14\r\n"
+                b"Content-Type: application/x-www-form-urlencoded\r\n"
+                b"\r\n"
+                b"token=whatever"
+                b"GET /healthz HTTP/1.1\r\n"
+                b"Host: x\r\n"
+                b"\r\n"
+            )
+            sock.sendall(payload)
+            reader = sock.makefile("rb")
+            first = _read_status(reader)
+            second = _read_status(reader)
+        finally:
+            sock.close()
+        self.assertEqual(first, 303)
+        self.assertEqual(second, 200)
 
 
 if __name__ == "__main__":

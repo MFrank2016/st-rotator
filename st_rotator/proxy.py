@@ -29,9 +29,10 @@ import hmac
 import json
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any, Callable, Mapping
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .client import StRotator
 from .errors import AllKeysInvalid, ApiError, NoAvailableKey, RotationExhausted, RotatorError
@@ -60,6 +61,80 @@ def _constant_time_equals(supplied: str, expected: str) -> bool:
     return hmac.compare_digest(
         supplied.encode("utf-8", "replace"), expected.encode("utf-8", "replace")
     )
+
+
+class LoginThrottle:
+    """登录失败限流：同一来源在窗口内失败次数过多时暂时拒绝。"""
+    _MAX_TRACKED_KEYS = 4096
+
+    def __init__(
+        self,
+        max_failures: int = 8,
+        window: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._max_failures = max_failures
+        self._window = window
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._failures: dict[str, list[float]] = {}
+
+    def _prune_locked(self, key: str, now: float) -> list[float]:
+        stamps = self._failures.get(key)
+        if not stamps:
+            return []
+        cutoff = now - self._window
+        fresh = [stamp for stamp in stamps if stamp > cutoff]
+        if fresh:
+            self._failures[key] = fresh
+        else:
+            self._failures.pop(key, None)
+        return fresh
+
+    def _sweep_locked(self, now: float) -> None:
+        """清除所有时间戳均已过期（早于 now - window）的来源，防止字典无限增长。"""
+        cutoff = now - self._window
+        stale = [
+            key
+            for key, stamps in self._failures.items()
+            if not any(stamp > cutoff for stamp in stamps)
+        ]
+        for key in stale:
+            self._failures.pop(key, None)
+
+    def retry_after(self, key: str) -> float:
+        """返回该来源剩余的锁定时长；0.0 表示当前未锁定。"""
+        with self._lock:
+            now = self._clock()
+            fresh = self._prune_locked(key, now)
+            if len(fresh) >= self._max_failures:
+                remaining = self._window - (now - fresh[0])
+                return remaining if remaining > 0 else 0.0
+            return 0.0
+
+    def record_failure(self, key: str) -> None:
+        with self._lock:
+            now = self._clock()
+            fresh = self._prune_locked(key, now)
+            fresh.append(now)
+            self._failures[key] = fresh
+            if len(self._failures) > self._MAX_TRACKED_KEYS:
+                self._sweep_locked(now)
+
+    def reset(self, key: str) -> None:
+        with self._lock:
+            self._failures.pop(key, None)
+
+
+def _has_parent_segment(path: str) -> bool:
+    """路径里只要有一个 `..` 段（含百分号/反斜杠编码）就判定为穿越。"""
+    decoded = path
+    for _ in range(3):
+        new = unquote(decoded)
+        if new == decoded:
+            break
+        decoded = new
+    return any(seg == ".." for seg in decoded.replace("\\", "/").split("/"))
 
 
 def error_payload(message: str, err_type: str = "upstream_error", code: str | None = None) -> dict:
@@ -91,6 +166,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
     verbose: bool = False
     log_sink: Callable[[str], None] | None = None
     console: "ConsoleState | None" = None
+    login_throttle: "LoginThrottle"
 
     # ------------------------------------------------------------ 基础设施
 
@@ -140,23 +216,27 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             raise ValueError("请求体过大")
         return self.rfile.read(length)
 
-    def _authorized(self, *, allow_cookie: bool = False) -> bool:
+    def _auth_kind(self, *, allow_cookie: bool = False) -> str | None:
+        """判断调用方的鉴权方式：open / bearer / cookie / None（未通过）。"""
         if not self.token:
-            return True
+            return "open"
         header = self.headers.get("Authorization") or ""
         supplied = header[7:].strip() if header.lower().startswith("bearer ") else header.strip()
         if _constant_time_equals(supplied, self.token):
-            return True
+            return "bearer"
         if not allow_cookie:
-            return False
+            return None
         expected = _session_value(self.token)
         for pair in (self.headers.get("Cookie") or "").split(";"):
             name, sep, value = pair.partition("=")
             if not sep:
                 continue
             if name.strip() == SESSION_COOKIE and _constant_time_equals(value.strip(), expected):
-                return True
-        return False
+                return "cookie"
+        return None
+
+    def _authorized(self, *, allow_cookie: bool = False) -> bool:
+        return self._auth_kind(allow_cookie=allow_cookie) is not None
 
     def _send_json(self, status: int, payload: Mapping[str, Any], *, retry_after: float | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -231,10 +311,13 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         *,
         query: Mapping[str, list[str]] | None = None,
         body: Mapping[str, Any] | None = None,
+        reveal_token: bool = False,
     ) -> None:
         """把请求交给控制台处理。控制台内部异常不能把网关带崩。"""
         try:
-            result = self.console.handle(method, path, query=query, body=body)  # type: ignore[union-attr]
+            result = self.console.handle(  # type: ignore[union-attr]
+                method, path, query=query, body=body, reveal_token=reveal_token
+            )
         except Exception as exc:  # pragma: no cover - 兜底
             result = ui.UiResponse.error(f"控制台内部错误：{type(exc).__name__}: {exc}", status=500)
         if result is None:
@@ -294,10 +377,13 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             return
         # 控制台接口：未鉴权返回 JSON 401（前端 authbar 依赖它）
         if self.console is not None and path.startswith(ui.API_PREFIX):
-            if not self._authorized(allow_cookie=True):
+            kind = self._auth_kind(allow_cookie=True)
+            if kind is None:
                 self._send_json(401, error_payload("invalid console token", "authentication_error"))
                 return
-            self._dispatch_console("GET", path, query=parse_qs(parsed.query))
+            self._dispatch_console(
+                "GET", path, query=parse_qs(parsed.query), reveal_token=(kind == "bearer")
+            )
             return
         if not self._authorized():
             self._send_json(401, error_payload("invalid proxy token", "authentication_error"))
@@ -358,6 +444,8 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------ 具体处理
 
     def _handle_login(self) -> None:
+        # 先读完请求体：即使没有 token 也必须在重定向之前 drain，
+        # 否则请求体会残留在 socket 里，破坏 HTTP/1.1 keep-alive 的下一条管线请求。
         try:
             raw = self._read_body()
         except ValueError as exc:
@@ -366,18 +454,33 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         if not self.token:
             self._send_redirect(303, "/")
             return
+        key = self.client_address[0]
+        wait = self.login_throttle.retry_after(key)
+        if wait > 0:
+            self._send_json(
+                429,
+                error_payload("登录尝试过于频繁，请稍后再试", "rate_limit_exceeded", "429"),
+                retry_after=wait,
+            )
+            return
         params = parse_qs(raw.decode("utf-8", "replace"))
         supplied = (params.get("token") or [""])[0]
         if _constant_time_equals(supplied, self.token):
+            self.login_throttle.reset(key)
             cookie = (
                 f"{SESSION_COOKIE}={_session_value(self.token)}"
                 "; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800"
             )
             self._send_redirect(303, "/", {"Set-Cookie": cookie})
             return
+        self.login_throttle.record_failure(key)
         self._send_raw(401, ui.LOGIN_HTML_INVALID, "text/html; charset=utf-8")
 
     def _handle_logout(self) -> None:
+        try:
+            self._read_body()
+        except ValueError:
+            pass
         cookie = f"{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
         self._send_redirect(303, "/login", {"Set-Cookie": cookie})
 
@@ -492,6 +595,9 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
 
     def _forward_simple(self, method: str, upstream_path: str, raw: bytes = b"") -> None:
         """其余端点（embeddings / images / models…）原样透传，同样享受轮换。"""
+        if _has_parent_segment(upstream_path):
+            self._send_json(400, error_payload("非法路径", "invalid_request_error"))
+            return
         if self._paused:
             self._send_json(503, error_payload("gateway paused from console", "service_unavailable", "503"))
             return
@@ -533,8 +639,11 @@ def create_server(
     verbose: bool = False,
     log_sink: Callable[[str], None] | None = None,
     console: "ConsoleState | None" = None,
+    login_throttle: LoginThrottle | None = None,
 ) -> ThreadingHTTPServer:
     """创建网关服务实例（不启动）。"""
+    if login_throttle is None:
+        login_throttle = LoginThrottle()
     handler = type(
         "BoundRotatorProxyHandler",
         (RotatorProxyHandler,),
@@ -546,6 +655,7 @@ def create_server(
             # 绑定成方法，调用时多传一个 self。
             "log_sink": staticmethod(log_sink),
             "console": console,
+            "login_throttle": login_throttle,
         },
     )
     server = ThreadingHTTPServer((host, port), handler)

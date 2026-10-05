@@ -485,7 +485,7 @@ function renderSpark(rate) {
 
 function renderGateway(state) {
   var g = state.gateway || {};
-  var tokenText = g.token ? g.token : "未设置（本机任意进程都可调用）";
+  var tokenText = g.token || S.token || "未显示（用 #token= 打开可显示）";
   var rows = [
     ["Base URL", g.base_url],
     ["对话端点", g.chat_endpoint],
@@ -517,7 +517,7 @@ function renderSnippet(g) {
   if (g) lastGateway = g;
   g = lastGateway || {};
   var base = g.base_url || "http://127.0.0.1:8080/v1";
-  var token = g.token || "sk-local-any";
+  var token = g.token || S.token || "<本地口令>";
   var model = g.model || "deepseek-v4-flash";
   var text;
   if (S.tab === "curl") {

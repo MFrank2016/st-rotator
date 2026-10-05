@@ -187,7 +187,7 @@ class ConsoleState:
     def config(self) -> Config:
         return self.rotator.config
 
-    def gateway_info(self) -> dict[str, Any]:
+    def gateway_info(self, *, reveal_token: bool = False) -> dict[str, Any]:
         """给上层应用抄的接入信息。"""
         base = f"http://{self.host}:{self.port}"
         return {
@@ -198,19 +198,19 @@ class ConsoleState:
             "health_endpoint": f"{base}/healthz",
             "stats_endpoint": f"{base}/stats",
             "console_url": f"{base}/",
-            "token": self.token or "",
+            "token": (self.token or "") if reveal_token else "",
             "model": self.config.default_model,
             "upstream": self.config.base_url,
         }
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, *, reveal_token: bool = False) -> dict[str, Any]:
         """整页刷新所需的全部状态。"""
         rate = self.rotator.limiter.stats()
         metrics = self.metrics.snapshot()
         metrics["upstream_attempts"] = self.rotator.upstream_attempts
         return {
             "version": __version__,
-            "gateway": self.gateway_info(),
+            "gateway": self.gateway_info(reveal_token=reveal_token),
             "summary": self.rotator.pool.summary(),
             "keys": self.rotator.pool.snapshot(),
             "rate_control": rate,
@@ -485,6 +485,7 @@ class ConsoleState:
         *,
         query: Mapping[str, Sequence[str]] | None = None,
         body: Mapping[str, Any] | None = None,
+        reveal_token: bool = False,
     ) -> UiResponse | None:
         """处理控制台请求；路径不属于控制台时返回 None，交回网关处理。"""
         if method == "GET" and path in PAGE_PATHS:
@@ -495,7 +496,7 @@ class ConsoleState:
         try:
             if method == "GET":
                 if path == "/api/state":
-                    return UiResponse.json(self.snapshot())
+                    return UiResponse.json(self.snapshot(reveal_token=reveal_token))
                 if path == "/api/logs":
                     cursor = _first_int(query, "cursor", 0)
                     return UiResponse.json(self.logs_since(cursor))
