@@ -409,9 +409,10 @@ function fmtCountdown(resetAt, longForm) {
 function minReset(a, b) { if (!b) return a; return a ? Math.min(a, b) : b; }
 
 function quotaAggregate() {
-  var agg = {g5: 0, g7: 0, f5: 0, f7: 0, reset5: null, reset7: null};
+  var agg = {g5: 0, g7: 0, f5: 0, f7: 0, reset5: null, reset7: null, ok: 0};
   (S.quota || []).forEach(function (a) {
     if (a.status !== "ok") return;
+    agg.ok += 1;
     function add(pair, k5, k7, r5, r7) {
       if (!pair) return;
       if (pair.h5) { agg[k5] += pair.h5.remaining || 0; agg[r5] = minReset(agg[r5], pair.h5.reset_at); }
@@ -422,6 +423,9 @@ function quotaAggregate() {
   });
   return agg;
 }
+
+/* 没有任何可用账号贡献时聚合值显示 —（而非误导性的 0）。 */
+function aggText(agg, key) { return agg.ok ? fmtInt(agg[key]) : "—"; }
 
 function quotaFor(account) {
   var list = S.quota || [];
@@ -439,9 +443,10 @@ function quotaResetAt(pair, window) {
   return pair && pair[window] ? pair[window].reset_at : null;
 }
 
-function countdownCell(resetAt) {
+function countdownCell(resetAt, longForm) {
   if (!resetAt) return '<td class="num">—</td>';
-  return '<td class="num" data-reset-at="' + esc(resetAt) + '">' + esc(fmtCountdown(resetAt, false)) + "</td>";
+  return '<td class="num" data-reset-at="' + esc(resetAt) + '"' + (longForm ? ' data-long="1"' : "") + '>' +
+    esc(fmtCountdown(resetAt, longForm)) + "</td>";
 }
 
 async function fetchQuota(force) {
@@ -503,11 +508,11 @@ function renderKpis(state) {
     ["当前限速", rateText, rateClass, rateSub + " req/s"],
     ["已服务请求", fmtInt(m.client_requests), "", ampText],
     ["运行时长", fmtDuration(m.uptime_seconds), "", m.stream_requests ? "其中流式 " + fmtInt(m.stream_requests) : "进程已启动"],
-    ["通用积分 5h 累计余量", fmtInt(agg.g5), agg.g5 ? "green" : "", "所有可用账号合计"],
-    ["通用积分 7d 累计余量", fmtInt(agg.g7), agg.g7 ? "green" : "", "所有可用账号合计"],
-    ["Flash-Lite 专属积分 5h 累计余量", fmtInt(agg.f5), agg.f5 ? "green" : "", "所有可用账号合计"],
-    ["Flash-Lite 专属积分 7d 累计余量", fmtInt(agg.f7), agg.f7 ? "green" : "", "所有可用账号合计"],
-    ["5h 重置倒计时", fmtCountdown(agg.reset5, true), "", "最早到期窗口", agg.reset5, true],
+    ["通用积分 5h 累计余量", aggText(agg, "g5"), agg.g5 ? "green" : "", "所有可用账号合计"],
+    ["通用积分 7d 累计余量", aggText(agg, "g7"), agg.g7 ? "green" : "", "所有可用账号合计"],
+    ["Flash-Lite 专属积分 5h 累计余量", aggText(agg, "f5"), agg.f5 ? "green" : "", "所有可用账号合计"],
+    ["Flash-Lite 专属积分 7d 累计余量", aggText(agg, "f7"), agg.f7 ? "green" : "", "所有可用账号合计"],
+    ["5h 重置倒计时", fmtCountdown(agg.reset5, false), "", "最早到期窗口", agg.reset5, false],
     ["7d 重置倒计时", fmtCountdown(agg.reset7, true), "", "最早到期窗口", agg.reset7, true]
   ];
   $("kpis").innerHTML = cards.map(function (c) {
@@ -706,7 +711,7 @@ function renderPool(state) {
         '<td class="num">' + esc(quotaRemaining(general, "h5")) + "</td>" +
         '<td class="num">' + esc(quotaRemaining(general, "d7")) + "</td>" +
         countdownCell(quotaResetAt(general, "h5")) +
-        countdownCell(quotaResetAt(general, "d7")) +
+        countdownCell(quotaResetAt(general, "d7"), true) +
         '<td class="num">' + esc(quotaRemaining(flash, "h5")) + "</td>" +
         '<td class="num">' + esc(quotaRemaining(flash, "d7")) + "</td>" +
         '<td style="text-align:right;white-space:nowrap">' +
