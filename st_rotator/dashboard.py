@@ -346,6 +346,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <input id="opt-fx-image" type="checkbox" style="width:auto;margin:0">
           <span>带大图</span>
         </label>
+        <label class="field" style="width:auto;margin-bottom:0;flex-direction:row;align-items:center;gap:6px">
+          <input id="opt-fx-yield" type="checkbox" style="width:auto;margin:0">
+          <span title="有用户请求在途时烧点主动让路，优先保证首字延迟">服务优先</span>
+        </label>
+        <label class="field" style="width:118px;margin-bottom:0">
+          <span>内存下限(MB)</span>
+          <input id="opt-fx-minmem" type="number" min="0" max="8192" step="50">
+        </label>
       </div>
       <div class="muted" style="font-size:11.5px;margin-bottom:8px">
         智能一换一：账号因「套餐额度耗尽」冷却期间，自动用该账号持续调用推广池模型
@@ -706,6 +714,10 @@ function renderOptions(state) {
   if (document.activeElement !== fe) fe.checked = !!fx.enabled;
   var fi = $("opt-fx-image");
   if (document.activeElement !== fi) fi.checked = !!fx.image_enabled;
+  var fy = $("opt-fx-yield");
+  if (document.activeElement !== fy) fy.checked = fx.yield_to_serve !== false;
+  var fm = $("opt-fx-minmem");
+  if (document.activeElement !== fm && fx.min_available_mb != null) fm.value = fx.min_available_mb;
   [["opt-fx-concurrency", "concurrency"], ["opt-fx-req", "requests_per_trigger"],
    ["opt-fx-interval", "min_interval_s"], ["opt-fx-tokens", "long_text_max_tokens"],
    ["opt-fx-imgsize", "image_size"], ["opt-fx-imgcount", "multi_image_count"]].forEach(function (p) {
@@ -818,6 +830,8 @@ async function onApplyOptions() {
     flash_lite: {
       enabled: $("opt-fx-enabled").checked,
       image_enabled: $("opt-fx-image").checked,
+      yield_to_serve: $("opt-fx-yield").checked,
+      min_available_mb: parseFloat($("opt-fx-minmem").value),
       concurrency: parseInt($("opt-fx-concurrency").value, 10),
       requests_per_trigger: parseInt($("opt-fx-req").value, 10),
       min_interval_s: parseFloat($("opt-fx-interval").value),

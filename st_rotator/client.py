@@ -129,6 +129,44 @@ def _noise_png_b64(size: int) -> str:
 _JANITOR_STARTED = False
 
 
+# ------------------------------------------------------------ 服务优先（烧点让路）
+# 小内存设备上，烧点与用户请求抢 CPU/内存/网络会直接把 TTFT 拖到几十秒。
+# 网关每处理一个用户请求就 +1，烧点在发请求前先看这个计数：有人在等就先让路。
+_SERVE_LOCK = threading.Lock()
+_SERVE_INFLIGHT = 0
+
+
+def note_serve_begin() -> None:
+    """网关开始处理一个用户请求（烧点据此让路）。"""
+    global _SERVE_INFLIGHT
+    with _SERVE_LOCK:
+        _SERVE_INFLIGHT += 1
+
+
+def note_serve_end() -> None:
+    """用户请求处理结束。"""
+    global _SERVE_INFLIGHT
+    with _SERVE_LOCK:
+        _SERVE_INFLIGHT = max(0, _SERVE_INFLIGHT - 1)
+
+
+def serve_inflight() -> int:
+    with _SERVE_LOCK:
+        return _SERVE_INFLIGHT
+
+
+def available_mb() -> float | None:
+    """Linux 下返回 /proc/meminfo 的 MemAvailable（MB）；其他平台返回 None。"""
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 def _start_janitor() -> None:
     global _JANITOR_STARTED
     if _JANITOR_STARTED:
@@ -748,6 +786,11 @@ class StRotator:
         text = (detail or "").lower()
         if text and not any(k in text for k in ("entitlement", "quota", "exhaust", "额度", "耗尽")):
             return
+        # 内存护栏：小内存设备上宁可晚点换额度，也不能把整机拖死
+        avail = available_mb()
+        if avail is not None and 0 < fx.min_available_mb and avail < fx.min_available_mb:
+            self._log(f"[一换一] {key.account} 可用内存仅 {avail:.0f}MB < {fx.min_available_mb:.0f}MB，跳过烧点")
+            return
         global _FX_ACTIVE
         now = time.time()
         with _FX_LOCK:
@@ -816,6 +859,12 @@ class StRotator:
                     "stream": False,
                 }
                 is_img = isinstance(content, list)
+                # 服务优先：有用户请求在途就先让路（最多等 8s，避免烧点被彻底饿死）
+                if fx.yield_to_serve:
+                    waited = 0.0
+                    while serve_inflight() > 0 and not stop.is_set() and waited < 8.0:
+                        time.sleep(0.3)
+                        waited += 0.3
                 if is_img:
                     _FX_IMG_SEM.acquire()  # 大图请求进限流闸，防瞬时内存峰值
                 try:
@@ -866,7 +915,20 @@ class StRotator:
 
             round_i = 0
             recovered = False
+            last_mem_warn = 0.0
             while not stop.is_set() and time.time() < deadline and done < fx.requests_per_trigger:
+                # 内存护栏：内存吃紧就先歇着（小内存设备保命优先，别把整机拖死）
+                avail = available_mb()
+                if avail is not None and 0 < fx.min_available_mb and avail < fx.min_available_mb:
+                    if time.time() - last_mem_warn > 60:  # 每分钟最多提示一次，别刷日志
+                        self._log(f"[一换一] {key.account} 可用内存 {avail:.0f}MB 偏低，暂停烧点等待内存回收")
+                        last_mem_warn = time.time()
+                    time.sleep(10)
+                    continue
+                # 服务优先：有用户请求在途就让路，避免抢 CPU/网络把首字延迟拖长
+                if fx.yield_to_serve and serve_inflight() > 0:
+                    time.sleep(1.0)
+                    continue
                 # 每轮并发打一小批
                 batch = min(max(1, fx.concurrency), fx.requests_per_trigger - done)
                 threads = []
@@ -988,6 +1050,7 @@ class StRotator:
                 key = self.pool.acquire(
                     exclude=excluded,
                     timeout=self._acquire_timeout(remaining),
+                    fail_fast=self.config.acquire_fail_fast,
                 )
             except AllKeysInvalid:
                 self.limiter.refund()
@@ -1036,6 +1099,14 @@ class StRotator:
                     self._log(f"[模型] {key.masked}({key.account}) 套餐不含该模型，冷却 {delay:.0f}s 换下一把: {err_detail}")
                     if all(k.key in excluded for k in self.pool.keys):
                         raise ApiError(response.status, body)
+                    # 池子已整体不可用（都耗尽/冷却）→ 立即失败，别把剩下的 Key 一把把白打一遍
+                    if not self.pool.any_usable():
+                        wait = self.pool.soonest_wait()
+                        last_exc = NoAvailableKey(
+                            f"所有 Key 的套餐额度都不可用（最快 {wait:.0f}s 后复探）",
+                            retry_after=wait or None,
+                        )
+                        break
                     retryable = True
                 elif action == "retry":
                     if response.status == 429:
@@ -1103,6 +1174,7 @@ class StRotator:
                 key = self.pool.acquire(
                     exclude=excluded,
                     timeout=self._acquire_timeout(remaining),
+                    fail_fast=self.config.acquire_fail_fast,
                 )
             except AllKeysInvalid:
                 self.limiter.refund()
@@ -1165,6 +1237,13 @@ class StRotator:
                     self._log(f"[模型] {key.masked}({key.account}) 套餐不含该模型，冷却 {delay:.0f}s 换下一把: {err_detail}")
                     if all(k.key in excluded for k in self.pool.keys):
                         raise ApiError(response.status, body)
+                    if not self.pool.any_usable():
+                        wait = self.pool.soonest_wait()
+                        last_exc = NoAvailableKey(
+                            f"所有 Key 的套餐额度都不可用（最快 {wait:.0f}s 后复探）",
+                            retry_after=wait or None,
+                        )
+                        break
                     retryable = True
                 elif action == "retry":
                     last_status, last_body = response.status, body
@@ -1240,6 +1319,10 @@ class StRotator:
         last_body: str,
         last_exc: Exception | None,
     ) -> RotatorError:
+        # 池子整体不可用（额度耗尽/全在冷却）时保留 NoAvailableKey 语义：
+        # 网关会据此返回 429 + Retry-After，上层立刻改道，而不是当成上游故障（502）。
+        if isinstance(last_exc, NoAvailableKey):
+            return last_exc
         detail = extract_error(last_body) if last_body else (str(last_exc) if last_exc else "未知原因")
         return RotationExhausted(
             f"已尝试 {attempts} 次仍失败，最后一次状态 {last_status or 'N/A'}：{detail}",

@@ -391,12 +391,16 @@ class KeyPool:
         *,
         exclude: Iterable[str] = (),
         timeout: float | None = None,
+        fail_fast: float = 0.0,
     ) -> ApiKey:
         """取一把可用 Key（已计入 inflight 与 RPM 窗口）。
 
         Args:
             exclude: 本轮不要使用的 Key 明文集合（例如刚被判失效的）。
             timeout: 最长等待秒数；None 表示一直等到有 Key 可用。
+            fail_fast: 若"最快可用时刻"仍在此秒数之外，立即失败而不是干等。
+                额度耗尽场景下所有 Key 冷却 5~10 分钟，干等 120s 只会把用户的
+                首字延迟拖到分钟级；快速返回 429 + Retry-After 让上层立刻改道。
 
         Raises:
             AllKeysInvalid: 池内所有 Key 均已失效，等待没有意义。
@@ -424,6 +428,12 @@ class KeyPool:
                     return self._reserve(self._pick(candidates), now)
 
                 wait = self._next_wait(now, excluded)
+                if fail_fast > 0 and wait > fail_fast:
+                    raise NoAvailableKey(
+                        f"最快 {wait:.0f}s 后才有 Key 可用（超过快速失败阈值 {fail_fast:g}s）："
+                        f"{self._describe(now, excluded)}",
+                        retry_after=wait,
+                    )
                 sleep_for = wait if wait > 0 else 0.05
                 if deadline is not None:
                     remain = deadline - now
@@ -505,6 +515,20 @@ class KeyPool:
                 return 0.0
             soonest = moment if soonest is None else min(soonest, moment)
         return 0.0 if soonest is None else max(soonest - now, 0.0)
+
+    def any_usable(self) -> bool:
+        """当前是否有任何 Key 立即可用（不等待）。额度耗尽的快速失败靠它判断。"""
+        with self._cond:
+            now = self._clock()
+            self._refresh(now)
+            return any(k.is_usable(now) for k in self._keys)
+
+    def soonest_wait(self) -> float:
+        """最快还要等多久才有 Key 可用（秒）。"""
+        with self._cond:
+            now = self._clock()
+            self._refresh(now)
+            return self._next_wait(now, frozenset())
 
     def _describe(self, now: float, excluded: frozenset[str] = frozenset()) -> str:
         parts = []

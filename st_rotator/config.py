@@ -176,6 +176,8 @@ class FlashLiteExchangeConfig:
         image_size: 生成的噪声大图边长（像素，纯标准库即时生成）。
         multi_image_count: 每个带图请求附带几张图片（1~9）。
         max_workers: 全局最多同时进行的烧点任务数（账号级任务，不是请求）。
+        yield_to_serve: 服务优先——有用户请求在途时烧点主动让路，避免拖慢首字延迟。
+        min_available_mb: 可用内存低于此值（MB）时暂停/跳过烧点；0 = 不检查。
     """
 
     enabled: bool = False
@@ -192,6 +194,8 @@ class FlashLiteExchangeConfig:
     image_size: int = 512
     multi_image_count: int = 3
     max_workers: int = 8
+    yield_to_serve: bool = True
+    min_available_mb: float = 300.0
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any] | None) -> "FlashLiteExchangeConfig":
@@ -280,6 +284,9 @@ class Config:
     timeout: float = 60.0
     connect_timeout: float = 10.0
     acquire_timeout: float = 120.0
+    # 取 Key 的快速失败阈值：最快可用时刻若超过此秒数，立即返回 429 而不是干等。
+    # 额度耗尽时所有 Key 会冷却数分钟，干等会把首字延迟拖到分钟级。
+    acquire_fail_fast: float = 15.0
     max_total_wait: float = 90.0
     retry_backoff: float = 0.5
     max_retry_backoff: float = 8.0
@@ -313,6 +320,8 @@ class Config:
             raise ConfigError("timeout / connect_timeout 必须 > 0")
         if self.max_total_wait < 0:
             raise ConfigError("max_total_wait 不能为负")
+        if self.acquire_fail_fast < 0:
+            raise ConfigError("acquire_fail_fast 不能为负")
         if not self.base_url.startswith(("http://", "https://")):
             raise ConfigError(f"base_url 必须以 http(s):// 开头，当前为 {self.base_url!r}")
         self.base_url = self.base_url.rstrip("/")
@@ -394,6 +403,7 @@ _SCALAR_FIELDS: dict[str, type] = {
     "timeout": float,
     "connect_timeout": float,
     "acquire_timeout": float,
+    "acquire_fail_fast": float,
     "retry_backoff": float,
     "max_retry_backoff": float,
     "max_connections": int,

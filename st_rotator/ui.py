@@ -238,6 +238,8 @@ class ConsoleState:
                     "image_enabled": self.config.flash_lite_exchange.image_enabled,
                     "image_size": self.config.flash_lite_exchange.image_size,
                     "multi_image_count": self.config.flash_lite_exchange.multi_image_count,
+                    "yield_to_serve": self.config.flash_lite_exchange.yield_to_serve,
+                    "min_available_mb": self.config.flash_lite_exchange.min_available_mb,
                 },
             },
         }
@@ -444,7 +446,7 @@ class ConsoleState:
                 return UiResponse.error("flash_lite 必须是对象")
             fx_cfg = self.config.flash_lite_exchange
             fx_changes: dict[str, Any] = {}
-            for f in ("enabled", "image_enabled"):
+            for f in ("enabled", "image_enabled", "yield_to_serve"):
                 if f in fx_payload:
                     fx_changes[f] = bool(fx_payload[f])
             fx_num_fields = (
@@ -454,6 +456,7 @@ class ConsoleState:
                 ("long_text_max_tokens", int, 128, 16384, "一换一长文预算"),
                 ("image_size", int, 256, 2048, "一换一大图边长"),
                 ("multi_image_count", int, 1, 9, "一换一每请求图片数"),
+                ("min_available_mb", float, 0.0, 8192.0, "一换一内存下限(MB)"),
             )
             for f, typ, lo, hi, label in fx_num_fields:
                 if f not in fx_payload:

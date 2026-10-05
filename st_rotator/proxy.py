@@ -32,7 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 from urllib.parse import parse_qs, urlparse
 
-from .client import StRotator
+from .client import StRotator, note_serve_begin, note_serve_end
 from .errors import AllKeysInvalid, ApiError, NoAvailableKey, RotationExhausted, RotatorError
 from . import ui
 
@@ -295,6 +295,14 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         if self._paused:
             self._send_json(503, error_payload("gateway paused from console", "service_unavailable", "503"))
             return
+        # 告诉烧点模块"有用户在等"，让它主动让路（小内存设备上这一步直接决定 TTFT）
+        note_serve_begin()
+        try:
+            self._handle_chat_inner(raw)
+        finally:
+            note_serve_end()
+
+    def _handle_chat_inner(self, raw: bytes) -> None:
         try:
             payload = json.loads(raw or b"{}")
         except json.JSONDecodeError as exc:
