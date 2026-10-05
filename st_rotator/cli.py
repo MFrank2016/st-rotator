@@ -369,6 +369,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_quota_service(config: Config) -> QuotaService | None:
+    """仅当存在配置了 user+password 的账号时才创建 QuotaService。"""
+    from .quota import QuotaService
+
+    if not any(a.user and a.password for a in config.accounts):
+        return None
+    return QuotaService(config)
+
+
 def cmd_ui(args: argparse.Namespace) -> int:
     """启动网关 + 图形控制台，并自动开一个无地址栏的应用窗口。"""
     from .proxy import serve
@@ -387,6 +396,7 @@ def cmd_ui(args: argparse.Namespace) -> int:
         token=token,
         buffer=buffer,
         log_file=args.log_file or default_log,
+        quota=build_quota_service(config),
     )
 
     sink(
@@ -486,6 +496,7 @@ def cmd_tray(args: argparse.Namespace) -> int:
         token=token,
         buffer=buffer,
         log_file=args.log_file or default_log,
+        quota=build_quota_service(config),
     )
 
     try:
