@@ -295,7 +295,17 @@ def _build_runtime(
     if log_file == "":
         log_file = default_log_file
     if log_file:
-        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+        parent = Path(log_file).parent
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # 目录建不出来（父级是文件 / 无写权限等）不能炸掉整个进程：
+            # build_logger 已能优雅降级，这里只要放弃文件日志、退回内存日志即可。
+            print(
+                f"[警告] 无法创建日志目录 {parent}：{exc}（改为仅内存日志）",
+                file=sys.stderr,
+            )
+            log_file = None
 
     buffer = LogBuffer(maxlen=getattr(args, "log_lines", 500))
     logger = build_logger(log_file) if log_file else None
@@ -317,10 +327,20 @@ def resolve_console_token(
     return explicit or configured or fallback or None
 
 
-def _warn_short_token(token: str | None, sink: Callable[[str], None]) -> None:
-    """口令过短时提醒用户；空口令由调用方自行决定是否放行。"""
-    if token and len(token) < 16:
-        sink("[警告] 控制台 Token 长度不足 16，建议改用更长的随机口令")
+MIN_TOKEN_LENGTH = 16
+
+
+def _check_token_length(token: str | None, sink: Callable[[str], None]) -> bool:
+    """校验控制台 Token 长度；过短时输出错误并返回 False 以中止启动。"""
+    if token and len(token) < MIN_TOKEN_LENGTH:
+        message = (
+            f"[错误] 控制台 Token 长度不足 {MIN_TOKEN_LENGTH} 位，"
+            "请改用更长的随机口令（或留空以关闭鉴权）"
+        )
+        sink(message)
+        print(message, file=sys.stderr)
+        return False
+    return True
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -329,7 +349,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     _store, config, sink, rotator, _buffer = _build_runtime(args)
     token = resolve_console_token(args.token, config.console_token)
-    _warn_short_token(token, sink)
+    if not _check_token_length(token, sink):
+        return 1
     sink(
         f"启动网关 host={args.host} port={args.port} keys={config.total_keys} "
         f"限速={config.rate_control.mode} 模型={config.default_model}"
@@ -356,7 +377,8 @@ def cmd_ui(args: argparse.Namespace) -> int:
     default_log = str(Path(args.config).resolve().parent / "rotator.log")
     store, config, sink, rotator, buffer = _build_runtime(args, default_log_file=default_log)
     token = resolve_console_token(args.token, config.console_token)
-    _warn_short_token(token, sink)
+    if not _check_token_length(token, sink):
+        return 1
     console = ConsoleState(
         store=store,
         rotator=rotator,
@@ -443,7 +465,8 @@ def cmd_tray(args: argparse.Namespace) -> int:
     token = resolve_console_token(
         args.token, config.console_token, fallback=_load_or_create_token(config_path.parent)
     )
-    _warn_short_token(token, sink)
+    if not _check_token_length(token, sink):
+        return 1
 
     url_base = f"http://{args.host}:{args.port}/"
 

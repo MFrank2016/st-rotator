@@ -1,10 +1,10 @@
-"""控制台 Token 解析与短 Token 警告的行为测试。"""
+"""控制台 Token 解析与最小长度校验的行为测试。"""
 
 from __future__ import annotations
 
 import unittest
 
-from st_rotator.cli import _warn_short_token, resolve_console_token
+from st_rotator.cli import _check_token_length, resolve_console_token
 
 
 class ResolveTokenTest(unittest.TestCase):
@@ -21,21 +21,28 @@ class ResolveTokenTest(unittest.TestCase):
         self.assertEqual(resolve_console_token(None, "", fallback="fb"), "fb")
 
 
-class TokenWarningTest(unittest.TestCase):
-    def test_short_token_warns(self) -> None:
+class TokenLengthTest(unittest.TestCase):
+    def test_short_token_rejected(self) -> None:
         messages: list[str] = []
-        _warn_short_token("short", messages.append)
+        self.assertIs(_check_token_length("short", messages.append), False)
         self.assertEqual(len(messages), 1)
-        self.assertIn("控制台 Token 长度不足", messages[0])
+        self.assertIn("控制台 Token", messages[0])
+        self.assertTrue("16" in messages[0] or "长度" in messages[0])
 
-    def test_long_token_silent(self) -> None:
+    def test_min_length_accepted(self) -> None:
         messages: list[str] = []
-        _warn_short_token("0123456789abcdef", messages.append)
+        self.assertIs(_check_token_length("0123456789abcdef", messages.append), True)
         self.assertEqual(messages, [])
 
-    def test_none_token_silent(self) -> None:
+    def test_long_token_accepted(self) -> None:
         messages: list[str] = []
-        _warn_short_token(None, messages.append)
+        self.assertIs(_check_token_length("0123456789abcdefghijklmn", messages.append), True)
+        self.assertEqual(messages, [])
+
+    def test_none_and_empty_accepted(self) -> None:
+        messages: list[str] = []
+        self.assertIs(_check_token_length(None, messages.append), True)
+        self.assertIs(_check_token_length("", messages.append), True)
         self.assertEqual(messages, [])
 
 
