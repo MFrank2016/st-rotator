@@ -35,6 +35,9 @@ USER_AGENT = (
 )
 REQUEST_TIMEOUT = 20
 
+# 缓存 token 距过期不足该秒数时，下一次拉取前主动重登（spec §6.4）
+TOKEN_EXP_MARGIN = 300.0
+
 
 class QuotaUnavailable(RuntimeError):
     """余量功能不可用（如未安装 jwcrypto）。"""
@@ -396,11 +399,13 @@ class QuotaService:
         config: Config,
         *,
         ttl: float = 300.0,
+        error_ttl: float = 60.0,
         transport: QuotaTransport | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
         self._ttl = ttl
+        self.error_ttl = error_ttl
         self._transport: QuotaTransport = transport or HttpQuotaTransport()
         self._clock = clock
         self._lock = threading.Lock()
@@ -424,18 +429,43 @@ class QuotaService:
     def _fetch_one(self, name: str, user: str, phone: str) -> AccountQuota:
         try:
             token = self._tokens.get(name)
+            if token is not None and self._token_needs_refresh(token):
+                token = None
+                self._tokens.pop(name, None)
             if token is None:
                 token = self._transport.login(user, self._password_of(name))
                 self._tokens[name] = token
-            pools = self._transport.fetch_pools(token.access_token)
+            try:
+                pools = self._transport.fetch_pools(token.access_token)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 401:
+                    raise
+                # 401：token 失效 → 丢弃、重新登录一次，再重试一次 fetch（spec §6.4）
+                self._tokens.pop(name, None)
+                token = self._transport.login(user, self._password_of(name))
+                self._tokens[name] = token
+                pools = self._transport.fetch_pools(token.access_token)
             return map_account_quota(name, user, phone, pools, fetched_at=self._clock())
         except QuotaUnavailable as exc:
-            return AccountQuota(name, user, phone, "error", str(exc), None, None, None)
+            return AccountQuota(name, user, phone, "error", str(exc), None, None, self._clock())
         except Exception as exc:  # noqa: BLE001 - 单账号失败不影响其它
             self._tokens.pop(name, None)
             return AccountQuota(
-                name, user, phone, "error", f"{type(exc).__name__}: {exc}", None, None, None
+                name, user, phone, "error", f"{type(exc).__name__}: {exc}", None, None, self._clock()
             )
+
+    def _token_needs_refresh(self, token: TokenBundle) -> bool:
+        """判断缓存的 token 是否应在下一次拉取前重登。
+
+        优先用 JWT 的 ``exp``（真实过期时刻，epoch 秒）；解析不出时退回到
+        ``acquired_at + expires_in`` 估算（``acquired_at`` 为 0 视为未知，不判过期）。
+        """
+        exp = jwt_exp(token.access_token)
+        if exp is not None:
+            return exp - time.time() <= TOKEN_EXP_MARGIN
+        if token.acquired_at > 0:
+            return time.time() - token.acquired_at >= max(0.0, token.expires_in - TOKEN_EXP_MARGIN)
+        return False
 
     def _password_of(self, name: str) -> str:
         for a in self._config.accounts:
@@ -453,14 +483,11 @@ class QuotaService:
                     )
                     continue
                 cached = self._cache.get(name)
-                if (
-                    cached is not None
-                    and cached.fetched_at is not None
-                    and not force
-                    and self._clock() - cached.fetched_at < self._ttl
-                ):
-                    out.append(cached)
-                    continue
+                if cached is not None and not force:
+                    ttl = self._ttl if cached.status == "ok" else self.error_ttl
+                    if cached.fetched_at is not None and self._clock() - cached.fetched_at < ttl:
+                        out.append(cached)
+                        continue
                 aq = self._fetch_one(name, user, phone)
                 self._cache[name] = aq
                 out.append(aq)

@@ -2,7 +2,9 @@ import base64
 import http.server
 import json
 import threading
+import time
 import unittest
+import urllib.error
 from unittest import mock
 
 from st_rotator import quota
@@ -148,7 +150,7 @@ class _FakeTransport:
         self.calls["login"] += 1
         if self.fail_login:
             raise quota.QuotaAuthError("用户名或密码错误")
-        return quota.TokenBundle("jwt", "", 10800, 0.0)
+        return quota.TokenBundle("jwt", "", 10800, time.time())
 
     def fetch_pools(self, access_token):
         self.calls["fetch"] += 1
@@ -164,6 +166,24 @@ class _FailOnceTransport(_FakeTransport):
         self.calls["fetch"] += 1
         if self.calls["fetch"] == 1:
             raise RuntimeError("boom")
+        return quota.normalize_pools(SAMPLE)
+
+
+class _NearExpiryTransport(_FakeTransport):
+    """login 返回一枚即将过期的 JWT（exp = now + 100s），验证过期前主动重登。"""
+
+    def login(self, user, password):
+        self.calls["login"] += 1
+        return quota.TokenBundle(_jwt(int(time.time()) + 100), "", 10800, time.time())
+
+
+class _Retry401Transport(_FakeTransport):
+    """首次 fetch 抛 HTTP 401，重新登录后第二次成功。"""
+
+    def fetch_pools(self, access_token):
+        self.calls["fetch"] += 1
+        if self.calls["fetch"] == 1:
+            raise urllib.error.HTTPError("http://x", 401, "Unauthorized", {}, None)
         return quota.normalize_pools(SAMPLE)
 
 
@@ -206,13 +226,37 @@ class QuotaServiceTest(unittest.TestCase):
         out = self._svc(_FakeTransport(fail_fetch=True)).snapshot()
         self.assertEqual(next(a for a in out if a.account == "账号1").status, "error")
 
-    def test_error_is_not_cached_and_retried(self):
+    def test_error_cached_for_error_ttl_then_retried(self):
         t = _FailOnceTransport()
-        svc = self._svc(t)  # clock=lambda: 0.0：error 若被缓存，第 2 次仍会返回 error
+        now = {"t": 0.0}
+        svc = self._svc(t, clock=lambda: now["t"])  # error 缓存 60s，ok 缓存 300s
         first = next(a for a in svc.snapshot() if a.account == "账号1")
         self.assertEqual(first.status, "error")
+        # 错误被缓存：未过 error_ttl 前第二次快照不再发起网络请求
         second = next(a for a in svc.snapshot() if a.account == "账号1")
-        self.assertEqual(second.status, "ok")
+        self.assertEqual(second.status, "error")
+        self.assertEqual(t.calls["fetch"], 1)
+        # 越过 error_ttl 后重新尝试，第二次成功
+        now["t"] = 61.0
+        third = next(a for a in svc.snapshot() if a.account == "账号1")
+        self.assertEqual(third.status, "ok")
+        self.assertEqual(t.calls["fetch"], 2)
+
+    def test_near_expiry_token_triggers_relogin(self):
+        t = _NearExpiryTransport()
+        cfg = _config_with([{"name": "账号1", "api_keys": ["k1"], "user": "u1", "password": "p1"}])
+        svc = quota.QuotaService(cfg, ttl=0.0, transport=t, clock=lambda: 0.0)
+        svc.snapshot()
+        svc.snapshot()
+        self.assertEqual(t.calls["login"], 2)
+        self.assertEqual(t.calls["fetch"], 2)
+
+    def test_401_drops_token_relogins_and_retries_once(self):
+        t = _Retry401Transport()
+        out = self._svc(t).snapshot()
+        aq = next(a for a in out if a.account == "账号1")
+        self.assertEqual(aq.status, "ok")
+        self.assertEqual(t.calls["login"], 2)
         self.assertEqual(t.calls["fetch"], 2)
 
     def test_verify_credentials(self):

@@ -16,6 +16,13 @@ class DashboardQuotaTest(unittest.TestCase):
     def test_quota_fetch_present(self):
         self.assertIn("/api/quota", DASHBOARD_HTML)
 
+    def test_quota_refresh_decoupled_from_state_poll(self):
+        # C1：余量不再挂在 2s 的 refreshState 上，而是独立的 ~60s 节奏。
+        self.assertIn(
+            "S.timerQuota = setInterval(function () { refreshQuota(false); }, 60000);", DASHBOARD_HTML
+        )
+        self.assertIn("refreshState().then(function () { refreshQuota(false); });", DASHBOARD_HTML)
+
     def test_countdown_formats_match_window(self):
         # 5h 窗口用短格式（X h Y m），7d 窗口用长格式（X d Y h Z m）。
         self.assertIn("fmtCountdown(agg.reset5, false)", DASHBOARD_HTML)

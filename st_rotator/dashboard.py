@@ -366,7 +366,8 @@ var S = {
   quota: [],
   timerState: null,
   timerLog: null,
-  timerCountdown: null
+  timerCountdown: null,
+  timerQuota: null
 };
 
 /* 窗口是带 #token=xxx 打开的（fragment 不会发给服务端，也不进 Referer）。
@@ -475,6 +476,13 @@ function countdownCell(resetAt, longForm) {
 async function fetchQuota(force) {
   try { S.quota = (await api("/api/quota" + (force ? "?refresh=1" : ""))).accounts || []; }
   catch (e) { S.quota = []; }
+}
+
+/* 余量单独按 ~60s 节奏刷新：避免 2s 轮询对失败账号反复重登（C1）。 */
+async function refreshQuota(force) {
+  await fetchQuota(force);
+  renderKpis(lastState);
+  renderPool(lastState);
 }
 
 /* ------------------------------------------------------------------ 请求 */
@@ -927,7 +935,6 @@ var lastState = {};
 async function refreshState() {
   try {
     var state = await api("/api/state");
-    await fetchQuota(false);
     lastState = state;
     $("authbar").classList.remove("show");
     renderKpis(state);
@@ -987,11 +994,12 @@ function bind() {
 }
 
 bind();
-refreshState();
+refreshState().then(function () { refreshQuota(false); });
 pollLogs();
 S.timerState = setInterval(refreshState, 2000);
 S.timerLog = setInterval(pollLogs, 1200);
 S.timerCountdown = setInterval(tickCountdowns, 1000);
+S.timerQuota = setInterval(function () { refreshQuota(false); }, 60000);
 </script>
 </body>
 </html>
