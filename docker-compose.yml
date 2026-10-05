@@ -1,0 +1,18 @@
+services:
+  st-rotator:
+    build: .
+    image: st-rotator:latest
+    container_name: st-rotator
+    restart: unless-stopped
+    # 默认只发布到宿主机回环地址；需要远程访问请改绑 0.0.0.0 并前置 TLS 反向代理
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      # 控制台/接口的固定密钥（fail-closed：未设置则 compose 直接报错）
+      CONSOLE_TOKEN: "${CONSOLE_TOKEN:?请设置 CONSOLE_TOKEN 环境变量}"
+      SENSENOVA_KEY_1: "${SENSENOVA_KEY_1:-}"
+      SENSENOVA_KEY_2: "${SENSENOVA_KEY_2:-}"
+      SENSENOVA_KEY_3: "${SENSENOVA_KEY_3:-}"
+    volumes:
+      # 挂载目录需包含 config.json（其中 console_token 写 "${CONSOLE_TOKEN}"），且对 uid 10001 可写
+      - ./data:/data
