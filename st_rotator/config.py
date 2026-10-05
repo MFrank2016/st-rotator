@@ -455,6 +455,20 @@ class ConfigStore:
         accounts.append(entry)
         return entry
 
+    def set_account_credentials(
+        self, name: str, *, user: str, phone: str, password: str
+    ) -> None:
+        """定点写入某账号的登录凭据（保留其余字段与占位符）。"""
+        accounts = self._accounts_raw()
+        for item in accounts:
+            if isinstance(item, dict) and item.get("name") == name:
+                item["user"] = user
+                item["phone"] = phone
+                item["password"] = password
+                self.reload()
+                return
+        raise ConfigError(f"账号 {name} 不存在")
+
     def account_names(self) -> list[str]:
         """当前配置里的账号名（按出现顺序）。"""
         return [

@@ -1,8 +1,11 @@
+import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from st_rotator.config import AccountConfig, Config
+from st_rotator.config import AccountConfig, Config, ConfigStore
 from st_rotator.errors import ConfigError
 
 
@@ -38,6 +41,31 @@ class AccountCredentialsTest(unittest.TestCase):
         self.assertEqual(d["user"], "u1")
         self.assertEqual(d["phone"], "138")
         self.assertNotIn("password", d)
+
+
+class SetAccountCredentialsTest(unittest.TestCase):
+    def _store(self, tmp: str) -> ConfigStore:
+        path = Path(tmp) / "config.json"
+        path.write_text(json.dumps(_cfg()), encoding="utf-8")
+        return ConfigStore.load(path)
+
+    def test_sets_credentials_and_persists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            store.set_account_credentials("账号1", user="u1", phone="138", password="p1")
+            store.save()
+            reloaded = json.loads((Path(tmp) / "config.json").read_text(encoding="utf-8"))
+            acct = reloaded["accounts"][0]
+            self.assertEqual(acct["user"], "u1")
+            self.assertEqual(acct["phone"], "138")
+            self.assertEqual(acct["password"], "p1")
+            self.assertEqual(store.config.accounts[0].user, "u1")
+
+    def test_unknown_account_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            with self.assertRaises(ConfigError):
+                store.set_account_credentials("不存在", user="u", phone="", password="p")
 
 
 if __name__ == "__main__":
