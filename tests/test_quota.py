@@ -66,6 +66,18 @@ class PureHelpersTest(unittest.TestCase):
         )
         self.assertIsNone(pools[0].window_5h.reset_at)
 
+    def test_normalize_remaining_empty_is_none(self):
+        pools = quota.normalize_pools(
+            {"pools": [{"name": "x", "pool_type": "default", "window_5h": {"remaining": ""}}]}
+        )
+        self.assertIsNone(pools[0].window_5h.remaining)
+
+    def test_normalize_remaining_zero_stays_zero(self):
+        pools = quota.normalize_pools(
+            {"pools": [{"name": "x", "pool_type": "default", "window_5h": {"remaining": "0"}}]}
+        )
+        self.assertEqual(pools[0].window_5h.remaining, 0.0)
+
     def test_select_general_and_flash_lite(self):
         pools = quota.normalize_pools(SAMPLE)
         self.assertEqual(quota.select_general(pools).name, "通用积分池")

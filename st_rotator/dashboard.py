@@ -721,9 +721,12 @@ function renderPool(state) {
   } else {
     var head = "<tr><th>账号</th><th>Key</th><th>状态</th><th>冷却</th><th>RPM</th>" +
       "<th class='num'>成功/失败</th><th class='num'>429</th><th class='num'>延迟</th>" +
-      "<th class='num'>通用 5h 余量</th><th class='num'>通用 7d 余量</th>" +
-      "<th class='num'>通用 5h 重置</th><th class='num'>通用 7d 重置</th>" +
-      "<th class='num'>FL 专属 5h 余量</th><th class='num'>FL 专属 7d 余量</th><th></th></tr>";
+      "<th class='num' title='通用积分池 5 小时窗口剩余额度'>通用 5h 余量</th>" +
+      "<th class='num' title='通用积分池 5 小时窗口重置倒计时'>通用 5h 重置</th>" +
+      "<th class='num' title='通用积分池 7 天窗口剩余额度'>通用 7d 余量</th>" +
+      "<th class='num' title='通用积分池 7 天窗口重置倒计时'>通用 7d 重置</th>" +
+      "<th class='num' title='Flash-Lite 专属积分池 5 小时窗口剩余额度'>FL 专属 5h 余量</th>" +
+      "<th class='num' title='Flash-Lite 专属积分池 7 天窗口剩余额度'>FL 专属 7d 余量</th><th></th></tr>";
     var body = keys.map(function (k) {
       var st = k.stats || {};
       var statusText = { healthy: "可用", cooldown: "冷却中", invalid: "已失效" }[k.status] || k.status;
@@ -741,8 +744,8 @@ function renderPool(state) {
         '<td class="num">' + fmtInt(st.rate_limited) + "</td>" +
         '<td class="num">' + (st.avg_latency_ms ? Math.round(st.avg_latency_ms) + "ms" : "—") + "</td>" +
         '<td class="num">' + esc(quotaRemaining(general, "h5")) + "</td>" +
-        '<td class="num">' + esc(quotaRemaining(general, "d7")) + "</td>" +
         countdownCell(quotaResetAt(general, "h5")) +
+        '<td class="num">' + esc(quotaRemaining(general, "d7")) + "</td>" +
         countdownCell(quotaResetAt(general, "d7"), true) +
         '<td class="num">' + esc(quotaRemaining(flash, "h5")) + "</td>" +
         '<td class="num">' + esc(quotaRemaining(flash, "d7")) + "</td>" +
@@ -873,6 +876,7 @@ async function onImportKeys() {
         return "<tr><td>" + r.line + "</td><td class='mono'>" + esc(r.input_masked) + "</td><td>" +
           esc(r.status) + "</td><td>" + esc(r.reason) + "</td></tr>"; }).join("") + "</table>";
     toast("导入完成：成功 " + (s.ok||0) + "，失败 " + (s.error||0) + "，跳过 " + (s.skipped||0), (s.ok ? "ok" : "err"));
+    if (s.ok) { $("import-dialog").close(); }
     await refreshState();
   } catch (err) { toast(err.message, "err"); }
   finally { btn.disabled = false; btn.textContent = "导入"; }

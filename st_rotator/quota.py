@@ -59,7 +59,7 @@ class TokenBundle:
 class QuotaWindow:
     limit: float
     used: float
-    remaining: float
+    remaining: float | None
     reset_at: int | None
 
 
@@ -113,6 +113,16 @@ def _to_float(value: Any) -> float:
         return 0.0
 
 
+def _to_optional_float(value: Any) -> float | None:
+    """把原始值转 float；缺失 / 空串 / 非数值一律 None（区别于真实的 0）。"""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _to_reset_at(value: Any) -> int | None:
     try:
         ts = int(value)
@@ -127,7 +137,7 @@ def _window(raw: Any) -> QuotaWindow | None:
     return QuotaWindow(
         limit=_to_float(raw.get("limit")),
         used=_to_float(raw.get("used")),
-        remaining=_to_float(raw.get("remaining")),
+        remaining=_to_optional_float(raw.get("remaining")),
         reset_at=_to_reset_at(raw.get("reset_at")),
     )
 
