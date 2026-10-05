@@ -7,6 +7,7 @@ UI 需要"最近 N 条日志"，但不能读文件（要反复 seek、还要处�
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 from collections import deque
 from logging.handlers import RotatingFileHandler
@@ -76,14 +77,19 @@ def build_logger(
         handler.close()
     if log_file is not None:
         path = Path(log_file)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handler = RotatingFileHandler(
-            path, maxBytes=max_bytes, backupCount=backups, encoding="utf-8", delay=False
-        )
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S")
-        )
-        logger.addHandler(handler)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handler = RotatingFileHandler(
+                path, maxBytes=max_bytes, backupCount=backups, encoding="utf-8", delay=False
+            )
+            handler.setFormatter(
+                logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S")
+            )
+            logger.addHandler(handler)
+        except OSError as exc:
+            sys.stderr.write(
+                f"[警告] 无法写入日志文件 {path}：{exc}（改为仅内存日志）\n"
+            )
     return logger
 
 
