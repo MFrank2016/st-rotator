@@ -140,6 +140,11 @@ class QuotaService:
   默认实现走 stdlib HTTP；测试注入 Fake。
 
 ```python
+@dataclass(frozen=True)
+class WindowPair:
+    h5: QuotaWindow | None
+    d7: QuotaWindow | None
+
 @dataclass
 class AccountQuota:
     account: str
@@ -147,9 +152,19 @@ class AccountQuota:
     phone: str
     status: str                 # "ok" | "unconfigured" | "error"
     error: str | None
-    pools: list[QuotaPool]
+    general: WindowPair | None      # 通用积分池（pool_type=default）
+    flash_lite: WindowPair | None   # Flash-Lite 专属积分池
     fetched_at: float | None
 ```
+
+### 6.5 池映射（通用 / Flash-Lite 专属）
+
+- **通用池** = `pool_type == "default"` 的池；若无 default 池，则取第一个「不匹配 flash-lite」的池。
+- **Flash-Lite 专属池** = `pool_type != "default"` 且其 `name` 或任一 `model_ids` 匹配正则 `flash[-_ ]?lite`（忽略大小写）；
+  若无匹配但恰好只有一个非 default 池，则取该池（兜底）。
+- 每个池映射为 `WindowPair(h5=window_5h, d7=window_7d)`；窗口缺失 -> `None`。
+- 无法确定某类池 -> 对应字段为 `None`，前端显示 `—`。
+- ⚠️ 该映射基于参考实现的 `pool_type`/`model_ids` 语义；**请确认**你的账号里 Flash-Lite 专属池确实在 `model_ids`/`name` 中带 `flash-lite`（或每账号只有一个非 default 池）。
 
 ## 7. 控制台后端（`ui.py` / `proxy.py`）
 
@@ -157,20 +172,49 @@ class AccountQuota:
 - 新接口 `GET /api/quota`：
   - 鉴权：与其他 `/api/*` 一致（Bearer 或 Cookie；未鉴权 401 JSON）。
   - `?refresh=1` 触发 `snapshot(force=True)`，否则用缓存。
-  - 返回 `{"accounts": [ {account,user,phone,status,error,pools,fetched_at} ]}`，
-    `pools` 内含归一化窗口；**不含 password / access_token**。
+  - 返回 `{"accounts": [ {account,user,phone,status,error,general,flash_lite,fetched_at} ]}`；
+    `general` / `flash_lite` 各为 `{"h5":{"remaining":<num>,"reset_at":<int|null>}, "d7":{...}}` 或 `null`。
+    **不含 password / access_token**。
   - `quota is None` 时返回 `{"accounts": []}`。
 - `/api/state` **不**内嵌余量（保持轻量），前端单独拉 `/api/quota`。
 
-## 8. 前端面板（`dashboard.py`）
+## 8. 前端呈现（`dashboard.py`）
 
-- 新卡片「账号余量」，放在「网关接入信息」附近。
-- 每个**已配置**账号一行；账号内每个 pool 显示：`通用/专属` 标签、`5h 余量/上限`、`7d 余量/上限`、
-  下次重置时间（本地时区 `MM-DD HH:MM`）、`赠送余额`（`grant_balance`）。
-- 未配置凭据的账号**不渲染**。
+不新增独立面板；余量信息**并入现有 KPI 卡片与 Key 池表格**。前端从 `GET /api/quota` 拿到按账号的数据，
+按账号名与 `state.keys[].account` 关联。
+
+### 8.1 顶部 KPI 卡片（在现有 6 张后追加 6 张）
+
+仅统计 `status="ok"` 的账号；聚合口径：
+
+| 卡片 | 值 |
+|---|---|
+| 通用积分 5h 累计余量 | Σ `general.h5.remaining` |
+| 通用积分 7d 累计余量 | Σ `general.d7.remaining` |
+| Flash-Lite 专属积分 5h 累计余量 | Σ `flash_lite.h5.remaining` |
+| Flash-Lite 专属积分 7d 累计余量 | Σ `flash_lite.d7.remaining` |
+| 5h 重置倒计时 | 所有账号 `h5.reset_at` 的**最小值** -> 倒计时 |
+| 7d 重置倒计时 | 所有账号 `d7.reset_at` 的**最小值** -> 倒计时 |
+
+- 倒计时格式：5h -> `xx h xx m`；7d -> `xx d xx h xx m`（过期/缺失显示 `—`）。
+- 数值用千分位；无任何已配置账号时这些卡片显示 `—`。
+
+### 8.2 Key 池表格（新增 6 列）
+
+在现有「账号 | Key | 状态 | 冷却 | RPM | 成功/失败 | 429 | 延迟 | 操作」后追加：
+
+`通用 5h 余量 | 5h 重置倒计时 | 通用 7d 余量 | 7d 重置倒计时 | FL 专属 5h 余量 | FL 专属 7d 余量`
+
+- 每行按该 Key 所属账号取余量；同一账号的多把 Key 显示相同值（如更希望按账号合并展示，可改为分组行——见 §15 待确认）。
+- 未配置凭据的账号：这 6 列显示 `—`（不隐藏整行）。
+- 账号 `status="error"`：对应列显示 `!` + tooltip（错误文案）。
+- 列标题用缩写，`title` 属性给全称（`通用积分 5h 余量` 等）。
+
+### 8.3 刷新与倒计时
+
 - 顶部「刷新余量」按钮 -> `GET /api/quota?refresh=1`；页面加载时拉一次（走缓存）。
-- 状态：加载中 / 正常 / 该账号 `error`（显示文案）/ 空（没有已配置账号时显示提示）。
-- 所有数值用 `esc()` 转义后渲染；无 CDN、沿用现有暗色样式。
+- 倒计时用一个 1s 的前端定时器就地更新（元素带 `data-reset-at` 属性，避免整页重渲染）。
+- 所有数值经 `esc()` 转义；无 CDN、沿用现有暗色样式。
 
 ## 9. 安全
 
@@ -193,14 +237,15 @@ class AccountQuota:
 ## 11. 测试策略（stdlib `unittest`，不访问真实商汤）
 
 - `tests/test_quota.py`（注入 Fake `QuotaTransport`）：
-  - 归一化：字符串数值、`reset_at`、缺失字段、`pool_type`、`grant_balance`。
+  - 归一化：字符串数值、`reset_at`、缺失字段、`grant_balance`。
+  - 池映射（§6.5）：`default` -> 通用；`model_ids`/`name` 含 flash-lite -> 专属；单一非 default 池的兜底。
   - `QuotaService`：未配置账号 `unconfigured` 且不发请求；TTL 内命中缓存不重复请求；`force` 触发刷新；
     JWT 临近过期自动重登；401 -> 重登一次；登录异常 -> `error` 且不影响其它账号。
   - 缺 `jwcrypto`（monkeypatch 导入失败）-> `error` 文案。
 - `tests/test_config_account_credentials.py`：三个字段解析、`${ENV}` 展开、`password` 不出现在 `to_dict`。
-- 控制台接口：`/api/quota` 未鉴权 401；已鉴权返回结构正确；响应体不含 `password`/`access_token`。
-- 前端：`DASHBOARD_HTML` 含「账号余量」面板骨架（存在性断言）。
-- 可选 live smoke：`tests/` 之外的脚本，仅当提供真实凭据时运行（默认跳过）。
+- 控制台接口：`/api/quota` 未鉴权 401；已鉴权返回结构正确（含 `general`/`flash_lite`）；响应体不含 `password`/`access_token`。
+- 前端：`DASHBOARD_HTML` 含新增 KPI 卡片与 Key 池列的表头文案（存在性断言）。
+- 可选 live smoke：仅当提供真实凭据时运行（默认跳过）。
 
 ## 12. Docker / 文档
 
@@ -218,19 +263,20 @@ class AccountQuota:
                                                │  否则 QuotaService:
                                                │    ensure JWT(exp 临近则 login)
                                                │    GET pool-usage (Bearer JWT)
-                                               └──► 归一化 -> AccountQuota[]
-浏览器 ◄── {accounts:[...]}（无 password/JWT）──┘
+                                               └──► 归一化 + 池映射 -> AccountQuota[]{general, flash_lite}
+浏览器 ◄── {accounts:[...]}（无 password/JWT）──► 前端: KPI 卡片聚合 + Key 池表格列 + 倒计时
 ```
 
 ## 14. 验收标准（场景契约）
 
-- **S1 未配置**：账号无 `user`/`password` -> `/api/quota` 中该账号 `status="unconfigured"`，前端不显示。
-- **S2 正常**：配置凭据 + Fake transport 返回样例 -> `/api/quota` 返回归一化 pools；前端显示 5h/7d 余量与重置时间。
-- **S3 登录失败**：transport 抛错 -> 该账号 `status="error"`；网关 `/v1/*`、`/healthz` 正常。
+- **S1 未配置**：账号无 `user`/`password` -> `/api/quota` 中该账号 `status="unconfigured"`；Key 池该行 6 列显示 `—`；不发起任何凭据网络请求。
+- **S2 正常**：配置凭据 + Fake transport 返回含 default 与 flash-lite 两池的样例 -> `/api/quota` 返回 `general` 与 `flash_lite`；KPI 卡片显示累计余量与倒计时；Key 池表格对应列显示余量。
+- **S3 登录失败**：transport 抛错 -> 该账号 `status="error"`；Key 池对应列显示错误标记；网关 `/v1/*`、`/healthz` 正常。
 - **S4 缺依赖**：模拟 `jwcrypto` 缺失 -> `status="error"`「未安装 jwcrypto」；其余功能正常。
 - **S5 缓存**：TTL 内连续两次 `snapshot` 只发一次网络请求；`force=True` 再发一次。
 - **S6 安全**：`/api/quota` 未鉴权 401；已鉴权响应体不含 `password`/`access_token`；日志无明文密码。
-- **S7 回归**：不带凭据的配置解析与既有全部测试通过；基础镜像/核心代码零硬依赖。
+- **S7 回归**：不带凭据的配置解析与既有全部测试通过；核心代码零硬依赖。
+- **S8 呈现**：无任何已配置账号时，新增 KPI 卡片显示 `—`、Key 池 6 列显示 `—`；页面不报错。
 
 ## 15. 风险与未决
 
@@ -238,3 +284,5 @@ class AccountQuota:
   设计上将其隔离在 `quota.py` 且失败只降级，不影响网关核心。
 - 手写 JWE 依赖 `jwcrypto` 的正确性；因此不自行实现 AES-GCM。
 - 账号级限流风控：频繁登录可能触发上游风控，故默认缓存 + 手动刷新，避免轮询。
+- **待确认（池映射）**：通用池按 `pool_type=="default"` 识别、Flash-Lite 专属池按 `model_ids`/`name` 匹配 `flash-lite`——请确认真实返回是否如此（否则调整 §6.5 规则）。
+- **待确认（展示粒度）**：Key 池表格按每把 Key 重复展示其账号余量；若更希望「按账号合并为一行」，请告知（§8.2）。
