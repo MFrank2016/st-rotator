@@ -428,8 +428,8 @@ class QuotaService:
     def verify_credentials(self, user: str, password: str) -> str | None:
         try:
             self._transport.login(user, password)
-        except QuotaUnavailable as exc:
-            return str(exc)
+        except QuotaUnavailable:
+            return "未安装 jwcrypto，无法校验凭据"
         except QuotaAuthError as exc:
             return str(exc)
         except Exception as exc:  # noqa: BLE001

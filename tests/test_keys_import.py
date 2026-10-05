@@ -3,7 +3,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
-from pathlib import Path
 
 from st_rotator import quota
 from st_rotator.config import Config, ConfigStore
@@ -164,7 +163,9 @@ class ImportKeysTest(unittest.TestCase):
             with mock.patch.dict("sys.modules", {"jwcrypto": None}):
                 body = st.import_keys("138--u1--right--sk-good8", account=None, max_concurrency=4).payload
             self.assertEqual(body["summary"]["ok"], 0)
-            self.assertIn("jwcrypto", body["results"][0]["reason"])
+            reason = body["results"][0]["reason"]
+            self.assertIn("jwcrypto", reason)
+            self.assertNotIn("凭据无效", reason)
 
     def test_import_rolls_back_store_on_pool_reject(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -174,6 +175,20 @@ class ImportKeysTest(unittest.TestCase):
             body = st.import_keys("sk-good5", account=None, max_concurrency=4).payload
             self.assertEqual(body["summary"]["error"], 1)
             self.assertNotIn("sk-good5", [k for a in st.store.config.accounts for k in a.api_keys])
+
+    def test_format2_reused_account_credentials_not_overwritten_on_pool_reject(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store_with(tmp, [
+                {"name": "老账号", "api_keys": ["sk-seed1234"],
+                 "user": "u1", "phone": "138", "password": "old"}
+            ])
+            fake = _RejectingRotator(store.config)
+            st = ConsoleState(store=store, rotator=fake, quota=quota.QuotaService(store.config, transport=_FakeTransport()))  # type: ignore[arg-type]
+            body = st.import_keys("139--u1--right--sk-good6", account=None, max_concurrency=4).payload
+            self.assertEqual(body["summary"]["error"], 1)
+            acct = next(a for a in st.store.config.accounts if a.name == "老账号")
+            self.assertEqual(acct.password, "old")
+            self.assertEqual(acct.phone, "138")
 
 
 

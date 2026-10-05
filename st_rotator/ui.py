@@ -420,7 +420,9 @@ class ConsoleState:
                 self.quota = svc
                 err = svc.verify_credentials(user, password)
                 if err is not None:
-                    results.append(row(line_no, parts, "error", f"凭据无效：{err}", _mask(text)))
+                    # 缺 jwcrypto 属「校验不可用」，不是凭据本身无效，不加误导性前缀
+                    reason = err if "jwcrypto" in err else f"凭据无效：{err}"
+                    results.append(row(line_no, parts, "error", reason, _mask(text)))
                     error += 1
                     continue
 
@@ -431,21 +433,21 @@ class ConsoleState:
                 error += 1
                 continue
 
-            # 写入：先落配置文件，再进内存池，最后同步内存配置
+            # 写入：先落配置文件，再进内存池；内存池接受后才写凭据，最后同步内存配置
             try:
                 with self.lock:
                     self.store.add_key(key, target, max_concurrency=max_concurrency)
-                    if len(parts) == 4:
-                        self.store.set_account_credentials(target, user=user, phone=phone, password=password)
                     try:
                         item = self.rotator.add_key(key, account=target, max_concurrency=max_concurrency)
                     except Exception:
-                        # 内存池拒绝 → 回滚刚落进 store 的那一条，保持两边一致（尽力而为）
+                        # 内存池拒绝 → 回滚刚落进 store 的那一条（此时尚未写凭据），保持两边一致
                         try:
                             self.store.remove_key(key)
                         except Exception:  # noqa: BLE001 - 回滚失败不掩盖原始错误
                             pass
                         raise
+                    if len(parts) == 4:
+                        self.store.set_account_credentials(target, user=user, phone=phone, password=password)
                     self.store.reload()
                     self.rotator.config.accounts = list(self.store.config.accounts)
                 added.append({"id": item.key_id, "key": item.masked, "account": item.account})
