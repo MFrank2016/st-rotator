@@ -340,8 +340,10 @@ var S = {
   autoscroll: true,
   tab: "python",
   models: [],
+  quota: [],
   timerState: null,
-  timerLog: null
+  timerLog: null,
+  timerCountdown: null
 };
 
 /* 窗口是带 #token=xxx 打开的（fragment 不会发给服务端，也不进 Referer）。
@@ -394,6 +396,59 @@ function fmtCtx(n) {
   return String(n);
 }
 
+/* ------------------------------------------------------------------ 余量 */
+
+function fmtCountdown(resetAt, longForm) {
+  if (!resetAt) return "—";
+  var secs = resetAt - Math.floor(Date.now() / 1000);
+  if (secs <= 0) return "—";
+  var d = Math.floor(secs / 86400), h = Math.floor(secs % 86400 / 3600), m = Math.floor(secs % 3600 / 60);
+  return longForm ? (d + " d " + h + " h " + m + " m") : (h + " h " + m + " m");
+}
+
+function minReset(a, b) { if (!b) return a; return a ? Math.min(a, b) : b; }
+
+function quotaAggregate() {
+  var agg = {g5: 0, g7: 0, f5: 0, f7: 0, reset5: null, reset7: null};
+  (S.quota || []).forEach(function (a) {
+    if (a.status !== "ok") return;
+    function add(pair, k5, k7, r5, r7) {
+      if (!pair) return;
+      if (pair.h5) { agg[k5] += pair.h5.remaining || 0; agg[r5] = minReset(agg[r5], pair.h5.reset_at); }
+      if (pair.d7) { agg[k7] += pair.d7.remaining || 0; agg[r7] = minReset(agg[r7], pair.d7.reset_at); }
+    }
+    add(a.general, "g5", "g7", "reset5", "reset7");
+    add(a.flash_lite, "f5", "f7", "reset5", "reset7");
+  });
+  return agg;
+}
+
+function quotaFor(account) {
+  var list = S.quota || [];
+  for (var i = 0; i < list.length; i++) if (list[i].account === account) return list[i];
+  return null;
+}
+
+function quotaRemaining(pair, window) {
+  if (!pair || !pair[window]) return "—";
+  var remaining = pair[window].remaining;
+  return remaining == null ? "—" : fmtInt(remaining);
+}
+
+function quotaResetAt(pair, window) {
+  return pair && pair[window] ? pair[window].reset_at : null;
+}
+
+function countdownCell(resetAt) {
+  if (!resetAt) return '<td class="num">—</td>';
+  return '<td class="num" data-reset-at="' + esc(resetAt) + '">' + esc(fmtCountdown(resetAt, false)) + "</td>";
+}
+
+async function fetchQuota(force) {
+  try { S.quota = (await api("/api/quota" + (force ? "?refresh=1" : ""))).accounts || []; }
+  catch (e) { S.quota = []; }
+}
+
 /* ------------------------------------------------------------------ 请求 */
 
 async function api(path, options) {
@@ -440,17 +495,25 @@ function renderKpis(state) {
   var amp = m.client_requests ? (attempts / m.client_requests) : 0;
   var ampText = "上游尝试 " + fmtInt(attempts) + " 次";
   if (amp > 1.05) ampText += "（放大 " + amp.toFixed(2) + "×）";
+  var agg = quotaAggregate();
   var cards = [
     ["可用 Key", fmtInt(s.healthy), "green", "共 " + fmtInt(s.total) + " 把"],
     ["冷却中", fmtInt(s.cooldown), s.cooldown ? "amber" : "", "等待恢复"],
     ["已失效", fmtInt(s.invalid), s.invalid ? "red" : "", "401/403 已隔离"],
     ["当前限速", rateText, rateClass, rateSub + " req/s"],
     ["已服务请求", fmtInt(m.client_requests), "", ampText],
-    ["运行时长", fmtDuration(m.uptime_seconds), "", m.stream_requests ? "其中流式 " + fmtInt(m.stream_requests) : "进程已启动"]
+    ["运行时长", fmtDuration(m.uptime_seconds), "", m.stream_requests ? "其中流式 " + fmtInt(m.stream_requests) : "进程已启动"],
+    ["通用积分 5h 累计余量", fmtInt(agg.g5), agg.g5 ? "green" : "", "所有可用账号合计"],
+    ["通用积分 7d 累计余量", fmtInt(agg.g7), agg.g7 ? "green" : "", "所有可用账号合计"],
+    ["Flash-Lite 专属积分 5h 累计余量", fmtInt(agg.f5), agg.f5 ? "green" : "", "所有可用账号合计"],
+    ["Flash-Lite 专属积分 7d 累计余量", fmtInt(agg.f7), agg.f7 ? "green" : "", "所有可用账号合计"],
+    ["5h 重置倒计时", fmtCountdown(agg.reset5, true), "", "最早到期窗口", agg.reset5, true],
+    ["7d 重置倒计时", fmtCountdown(agg.reset7, true), "", "最早到期窗口", agg.reset7, true]
   ];
   $("kpis").innerHTML = cards.map(function (c) {
+    var attr = c[4] ? ' data-reset-at="' + esc(c[4]) + '"' + (c[5] ? ' data-long="1"' : "") : "";
     return '<div class="card kpi"><div class="label">' + esc(c[0]) + '</div>' +
-      '<div class="value ' + c[2] + '">' + esc(c[1]) + '</div>' +
+      '<div class="value ' + c[2] + '"' + attr + '>' + esc(c[1]) + '</div>' +
       '<div class="label" style="margin-top:2px">' + esc(c[3]) + '</div></div>';
   }).join("");
   if (rate.mode === "adaptive") renderSpark(rate);
@@ -620,11 +683,17 @@ function renderPool(state) {
     $("pool").innerHTML = '<div class="empty">池里还没有 Key。在下面添加至少一把才能对外提供服务。</div>';
   } else {
     var head = "<tr><th>账号</th><th>Key</th><th>状态</th><th>冷却</th><th>RPM</th>" +
-      "<th class='num'>成功/失败</th><th class='num'>429</th><th class='num'>延迟</th><th></th></tr>";
+      "<th class='num'>成功/失败</th><th class='num'>429</th><th class='num'>延迟</th>" +
+      "<th class='num'>通用 5h 余量</th><th class='num'>通用 7d 余量</th>" +
+      "<th class='num'>通用 5h 重置</th><th class='num'>通用 7d 重置</th>" +
+      "<th class='num'>FL 专属 5h 余量</th><th class='num'>FL 专属 7d 余量</th><th></th></tr>";
     var body = keys.map(function (k) {
       var st = k.stats || {};
       var statusText = { healthy: "可用", cooldown: "冷却中", invalid: "已失效" }[k.status] || k.status;
       var cooldown = k.cooldown_remaining > 0 ? k.cooldown_remaining + "s" : "—";
+      var q = quotaFor(k.account);
+      var general = q && q.status === "ok" ? q.general : null;
+      var flash = q && q.status === "ok" ? q.flash_lite : null;
       return "<tr>" +
         "<td>" + esc(k.account) + "</td>" +
         '<td class="mono">' + esc(k.key) + "</td>" +
@@ -634,6 +703,12 @@ function renderPool(state) {
         '<td class="num">' + fmtInt(st.successes) + " / " + fmtInt(st.failures) + "</td>" +
         '<td class="num">' + fmtInt(st.rate_limited) + "</td>" +
         '<td class="num">' + (st.avg_latency_ms ? Math.round(st.avg_latency_ms) + "ms" : "—") + "</td>" +
+        '<td class="num">' + esc(quotaRemaining(general, "h5")) + "</td>" +
+        '<td class="num">' + esc(quotaRemaining(general, "d7")) + "</td>" +
+        countdownCell(quotaResetAt(general, "h5")) +
+        countdownCell(quotaResetAt(general, "d7")) +
+        '<td class="num">' + esc(quotaRemaining(flash, "h5")) + "</td>" +
+        '<td class="num">' + esc(quotaRemaining(flash, "d7")) + "</td>" +
         '<td style="text-align:right;white-space:nowrap">' +
           '<button class="tiny" data-act="verify" data-id="' + esc(k.id) + '" data-label="' + esc(k.account + " / " + k.key) + '">测试</button> ' +
           '<button class="tiny danger" data-act="remove" data-id="' + esc(k.id) + '" data-label="' + esc(k.account + " / " + k.key) + '">删除</button>' +
@@ -806,6 +881,7 @@ var lastState = {};
 async function refreshState() {
   try {
     var state = await api("/api/state");
+    await fetchQuota(false);
     lastState = state;
     $("authbar").classList.remove("show");
     renderKpis(state);
@@ -823,6 +899,13 @@ async function refreshState() {
   } catch (err) {
     $("subline").innerHTML = '<span class="dot" style="background:var(--red)"></span>连接失败：' + esc(err.message);
   }
+}
+
+function tickCountdowns() {
+  Array.prototype.forEach.call(document.querySelectorAll("[data-reset-at]"), function (node) {
+    var resetAt = parseInt(node.getAttribute("data-reset-at"), 10);
+    node.textContent = fmtCountdown(resetAt, node.getAttribute("data-long") === "1");
+  });
 }
 
 function bind() {
@@ -859,6 +942,7 @@ refreshState();
 pollLogs();
 S.timerState = setInterval(refreshState, 2000);
 S.timerLog = setInterval(pollLogs, 1200);
+S.timerCountdown = setInterval(tickCountdowns, 1000);
 </script>
 </body>
 </html>
