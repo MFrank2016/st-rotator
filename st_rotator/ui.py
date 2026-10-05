@@ -58,6 +58,7 @@ PAGE_PATHS = frozenset({"/", "/ui", "/ui/"})
 API_PREFIX = "/api/"
 
 MAX_KEYS_PER_REQUEST = 20
+MAX_IMPORT_LINES = 50
 _KEY_SPLIT = re.compile(r"[\s,;]+")
 
 
@@ -72,6 +73,18 @@ def parse_key_list(raw: str) -> list[str]:
         seen.add(token)
         result.append(token)
     return result
+
+
+def parse_import_lines(raw: str) -> list[tuple[int, str, tuple[str, ...]]]:
+    """逐行解析导入文本：返回 [(行号, 原文, 段元组)]，跳过空行。"""
+    rows: list[tuple[int, str, tuple[str, ...]]] = []
+    for idx, line in enumerate((raw or "").splitlines(), start=1):
+        text = line.strip()
+        if not text:
+            continue
+        parts = tuple(p.strip() for p in text.split("--"))
+        rows.append((idx, text, parts))
+    return rows
 
 
 # ---------------------------------------------------------------- 指标
@@ -342,6 +355,109 @@ class ConsoleState:
             "message": message,
         })
 
+    def import_keys(self, raw: str, *, account: str | None, max_concurrency: int) -> UiResponse:
+        """批量导入：支持「纯 Key」与「手机--用户名--密码--apikey」两种格式，逐行校验。
+
+        整批一次最多 ``MAX_IMPORT_LINES`` 行；重复（本批内 / 已在池中）跳过，
+        校验失败的逐行报错，互不影响。
+        """
+        rows = parse_import_lines(raw)
+        if not rows:
+            return UiResponse.error("没有解析出任何内容")
+        if len(rows) > MAX_IMPORT_LINES:
+            return UiResponse.error(f"一次最多导入 {MAX_IMPORT_LINES} 行，当前 {len(rows)} 行")
+
+        def row(line_no: int, parts: tuple[str, ...], status: str, reason: str, masked: str) -> dict[str, Any]:
+            return {
+                "line": line_no,
+                "input_masked": masked,
+                "format": len(parts),
+                "status": status,
+                "reason": reason,
+            }
+
+        format_error = "格式错误：应为 1 段（纯 key）或 4 段（手机--用户名--密码--apikey）"
+
+        results: list[dict[str, Any]] = []
+        added: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        ok = error = skipped = 0
+
+        for line_no, text, parts in rows:
+            if len(parts) not in (1, 4):
+                results.append(row(line_no, parts, "error", format_error, _mask(text)))
+                error += 1
+                continue
+
+            if len(parts) == 1:
+                key = parts[0]
+                phone = user = password = ""
+                target = account
+            else:
+                phone, user, password, key = parts
+                target = user or phone
+
+            if key in seen_keys:
+                results.append(row(line_no, parts, "skipped", "重复：本批已出现", _mask(key)))
+                skipped += 1
+                continue
+            if self.rotator.pool.find_key(key) is not None:
+                results.append(row(line_no, parts, "skipped", "重复：已在池中", _mask(key)))
+                skipped += 1
+                continue
+            seen_keys.add(key)
+
+            # 格式 2：先校验凭据（用户名/密码需齐全，且需要 jwcrypto）
+            if len(parts) == 4:
+                if not (user and password):
+                    results.append(row(line_no, parts, "error", "格式错误：用户名或密码为空", _mask(text)))
+                    error += 1
+                    continue
+                if self.quota is None:
+                    results.append(row(line_no, parts, "error", "未安装 jwcrypto，无法校验凭据", _mask(text)))
+                    error += 1
+                    continue
+                err = self.quota.verify_credentials(user, password)
+                if err is not None:
+                    results.append(row(line_no, parts, "error", f"凭据无效：{err}", _mask(text)))
+                    error += 1
+                    continue
+
+            # 校验 Key 本身（有效性由上游探测决定）
+            verdict, detail = self.rotator.probe_key(key)
+            if verdict == "invalid":
+                results.append(row(line_no, parts, "error", f"Key 无效：{detail}", _mask(key)))
+                error += 1
+                continue
+
+            # 写入：先落配置文件，再进内存池，最后同步内存配置
+            try:
+                with self.lock:
+                    if len(parts) == 4:
+                        self.store.add_key(key, target, max_concurrency=max_concurrency)
+                        self.store.set_account_credentials(target, user=user, phone=phone, password=password)
+                    else:
+                        target = target or next_account_name(self.store.account_names())
+                        self.store.add_key(key, target, max_concurrency=max_concurrency)
+                    item = self.rotator.add_key(key, account=target, max_concurrency=max_concurrency)
+                    self.store.reload()
+                    self.rotator.config.accounts = list(self.store.config.accounts)
+                added.append({"id": item.key_id, "key": item.masked, "account": item.account})
+                results.append(row(line_no, parts, "ok", "已导入", item.masked))
+                ok += 1
+            except Exception as exc:  # noqa: BLE001 - 单行失败不影响其余
+                results.append(row(line_no, parts, "error", str(exc), _mask(key)))
+                error += 1
+
+        if added:
+            self._save_and_log(f"通过控制台批量导入 {len(added)} 把 Key")
+        return UiResponse.json({
+            "ok": bool(added),
+            "added": added,
+            "results": results,
+            "summary": {"ok": ok, "error": error, "skipped": skipped},
+        })
+
     def verify_one(self, identifier: str) -> UiResponse:
         """体检池中某一把 Key（identifier 可以是 key_id 或明文）。"""
         item = self.rotator.pool.find_by_id(identifier)
@@ -540,6 +656,12 @@ class ConsoleState:
                         account=(str(payload.get("account")).strip() or None) if payload.get("account") else None,
                         max_concurrency=_clamp_int(payload.get("max_concurrency"), 4, 1, 64),
                         rpm_limit=rpm_limit,
+                    )
+                if path == "/api/keys/import":
+                    return self.import_keys(
+                        str(payload.get("lines") or ""),
+                        account=(str(payload.get("account")).strip() or None) if payload.get("account") else None,
+                        max_concurrency=_clamp_int(payload.get("max_concurrency"), 4, 1, 64),
                     )
                 if path == "/api/keys/verify":
                     return self.verify_one(str(payload.get("id") or payload.get("key") or ""))
