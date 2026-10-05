@@ -398,7 +398,7 @@ class ConsoleState:
                 target = default_account
             else:
                 phone, user, password, key = parts
-                target = user or phone
+                target = self._import_account_for(user, phone)
 
             if key in seen_keys:
                 results.append(row(line_no, parts, "skipped", "重复：本批已出现", _mask(key)))
@@ -416,11 +416,9 @@ class ConsoleState:
                     results.append(row(line_no, parts, "error", "格式错误：用户名或密码为空", _mask(text)))
                     error += 1
                     continue
-                if self.quota is None:
-                    results.append(row(line_no, parts, "error", "未安装 jwcrypto，无法校验凭据", _mask(text)))
-                    error += 1
-                    continue
-                err = self.quota.verify_credentials(user, password)
+                svc = self.quota or QuotaService(self.config)
+                self.quota = svc
+                err = svc.verify_credentials(user, password)
                 if err is not None:
                     results.append(row(line_no, parts, "error", f"凭据无效：{err}", _mask(text)))
                     error += 1
@@ -439,7 +437,15 @@ class ConsoleState:
                     self.store.add_key(key, target, max_concurrency=max_concurrency)
                     if len(parts) == 4:
                         self.store.set_account_credentials(target, user=user, phone=phone, password=password)
-                    item = self.rotator.add_key(key, account=target, max_concurrency=max_concurrency)
+                    try:
+                        item = self.rotator.add_key(key, account=target, max_concurrency=max_concurrency)
+                    except Exception:
+                        # 内存池拒绝 → 回滚刚落进 store 的那一条，保持两边一致（尽力而为）
+                        try:
+                            self.store.remove_key(key)
+                        except Exception:  # noqa: BLE001 - 回滚失败不掩盖原始错误
+                            pass
+                        raise
                     self.store.reload()
                     self.rotator.config.accounts = list(self.store.config.accounts)
                 added.append({"id": item.key_id, "key": item.masked, "account": item.account})
@@ -457,6 +463,18 @@ class ConsoleState:
             "results": results,
             "summary": {"ok": ok, "error": error, "skipped": skipped},
         })
+
+    def _import_account_for(self, user: str, phone: str) -> str:
+        """格式 2 的归属账号：优先复用已有同名 ``user`` 的账号，否则按 ``user or phone`` 新建。
+
+        多行同一 ``user`` 会归入同一个账号（与格式 1 的账号聚合语义一致），
+        已存在同 ``user`` 的账号也不会被重复创建。
+        """
+        if user:
+            for account in self.store.config.accounts:
+                if account.user and account.user == user:
+                    return account.name
+        return user or phone
 
     def verify_one(self, identifier: str) -> UiResponse:
         """体检池中某一把 Key（identifier 可以是 key_id 或明文）。"""

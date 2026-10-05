@@ -2,9 +2,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+from pathlib import Path
 
 from st_rotator import quota
 from st_rotator.config import Config, ConfigStore
+from st_rotator.errors import ConfigError
 from st_rotator.ui import ConsoleState, parse_import_lines
 
 
@@ -38,12 +41,22 @@ class _FakeTransport:
         raise quota.QuotaAuthError("用户名或密码错误")
     def fetch_pools(self, token):
         return []
+class _RejectingRotator(_FakeRotator):
+    """内存池总是拒绝 add_key，用于验证 import_keys 的 store 回滚。"""
+
+    def add_key(self, key, *, account, max_concurrency=4, rpm_limit=None):
+        raise ConfigError("内存池拒绝")
+
+
 
 
 def _store(tmp):
+    return _store_with(tmp, [{"name": "账号1", "api_keys": ["sk-seed1234"]}])
+
+
+def _store_with(tmp, accounts):
     p = Path(tmp) / "config.json"
-    p.write_text(json.dumps({"base_url": "http://127.0.0.1:9/v1",
-                             "accounts": [{"name": "账号1", "api_keys": ["sk-seed1234"]}]}), encoding="utf-8")
+    p.write_text(json.dumps({"base_url": "http://127.0.0.1:9/v1", "accounts": accounts}), encoding="utf-8")
     return ConfigStore.load(p)
 
 
@@ -113,6 +126,54 @@ class ImportKeysTest(unittest.TestCase):
             self.assertEqual(len(set(accounts)), 1)
             created = [a for a in st.store.config.accounts if a.name not in ("账号1",)]
             self.assertEqual(len(created), 1)
+
+    def test_format2_reuses_existing_account_by_user(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store_with(tmp, [
+                {"name": "老账号", "api_keys": ["sk-seed1234"], "user": "u1", "password": "old"}
+            ])
+            fake = _FakeRotator(store.config)
+            st = ConsoleState(store=store, rotator=fake, quota=quota.QuotaService(store.config, transport=_FakeTransport()))  # type: ignore[arg-type]
+            body = st.import_keys("138--u1--right--sk-good7", account=None, max_concurrency=4).payload
+            self.assertEqual(body["summary"]["ok"], 1)
+            self.assertEqual(body["added"][0]["account"], "老账号")
+            self.assertFalse(any(a.name == "u1" for a in st.store.config.accounts))
+
+    def test_format2_lazily_creates_service_when_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            fake = _FakeRotator(store.config)
+            st = ConsoleState(store=store, rotator=fake, quota=None)  # type: ignore[arg-type]
+            made = []
+
+            def factory(config):
+                svc = quota.QuotaService(config, transport=_FakeTransport())
+                made.append(svc)
+                return svc
+
+            with mock.patch("st_rotator.ui.QuotaService", side_effect=factory):
+                body = st.import_keys("138--u1--right--sk-good2", account=None, max_concurrency=4).payload
+            self.assertEqual(body["summary"]["ok"], 1)
+            self.assertEqual(st.quota, made[0])
+
+    def test_format2_without_service_reports_jwcrypto_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            fake = _FakeRotator(store.config)
+            st = ConsoleState(store=store, rotator=fake, quota=None)  # type: ignore[arg-type]
+            with mock.patch.dict("sys.modules", {"jwcrypto": None}):
+                body = st.import_keys("138--u1--right--sk-good8", account=None, max_concurrency=4).payload
+            self.assertEqual(body["summary"]["ok"], 0)
+            self.assertIn("jwcrypto", body["results"][0]["reason"])
+
+    def test_import_rolls_back_store_on_pool_reject(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            fake = _RejectingRotator(store.config)
+            st = ConsoleState(store=store, rotator=fake, quota=quota.QuotaService(store.config, transport=_FakeTransport()))  # type: ignore[arg-type]
+            body = st.import_keys("sk-good5", account=None, max_concurrency=4).payload
+            self.assertEqual(body["summary"]["error"], 1)
+            self.assertNotIn("sk-good5", [k for a in st.store.config.accounts for k in a.api_keys])
 
 
 
