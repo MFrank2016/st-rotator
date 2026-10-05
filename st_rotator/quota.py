@@ -455,8 +455,9 @@ class QuotaService:
                 cached = self._cache.get(name)
                 if (
                     cached is not None
+                    and cached.fetched_at is not None
                     and not force
-                    and self._clock() - (cached.fetched_at or 0) < self._ttl
+                    and self._clock() - cached.fetched_at < self._ttl
                 ):
                     out.append(cached)
                     continue

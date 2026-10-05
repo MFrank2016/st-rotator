@@ -157,6 +157,16 @@ class _FakeTransport:
         return quota.normalize_pools(SAMPLE)
 
 
+class _FailOnceTransport(_FakeTransport):
+    """首次 fetch 抛错、第二次成功（用于验证 error 行不被缓存、下次自动重试）。"""
+
+    def fetch_pools(self, access_token):
+        self.calls["fetch"] += 1
+        if self.calls["fetch"] == 1:
+            raise RuntimeError("boom")
+        return quota.normalize_pools(SAMPLE)
+
+
 def _config_with(accounts):
     return Config.from_dict({"base_url": "http://127.0.0.1:9/v1", "accounts": accounts})
 
@@ -195,6 +205,15 @@ class QuotaServiceTest(unittest.TestCase):
     def test_fetch_failure_marks_error_without_breaking_others(self):
         out = self._svc(_FakeTransport(fail_fetch=True)).snapshot()
         self.assertEqual(next(a for a in out if a.account == "账号1").status, "error")
+
+    def test_error_is_not_cached_and_retried(self):
+        t = _FailOnceTransport()
+        svc = self._svc(t)  # clock=lambda: 0.0：error 若被缓存，第 2 次仍会返回 error
+        first = next(a for a in svc.snapshot() if a.account == "账号1")
+        self.assertEqual(first.status, "error")
+        second = next(a for a in svc.snapshot() if a.account == "账号1")
+        self.assertEqual(second.status, "ok")
+        self.assertEqual(t.calls["fetch"], 2)
 
     def test_verify_credentials(self):
         svc = self._svc(_FakeTransport())
