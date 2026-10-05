@@ -30,3 +30,7 @@ python-path.txt
 .DS_Store
 Thumbs.db
 .workbuddy-ai/
+
+# 隔离工作区（git worktree）与 SDD 工作目录
+.worktrees/
+.superpowers/
