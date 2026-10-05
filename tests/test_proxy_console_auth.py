@@ -212,6 +212,28 @@ class S1HappyPathTest(_ProxyServerTestCase):
         parsed = json.loads(body)
         self.assertIn("summary", parsed)
 
+    def test_api_state_uses_request_host(self) -> None:
+        pair = self.login()
+        resp, body = self.request(
+            "GET",
+            "/api/state",
+            headers={
+                "Cookie": pair,
+                "Host": "st-rotator.061995.xyz",
+                "X-Forwarded-Proto": "https",
+            },
+        )
+        self.assertEqual(resp.status, 200)
+        gw = json.loads(body)["gateway"]
+        self.assertEqual(gw["base_url"], "https://st-rotator.061995.xyz/v1")
+        self.assertEqual(gw["console_url"], "https://st-rotator.061995.xyz/")
+
+    def test_api_state_falls_back_to_listen_addr(self) -> None:
+        pair = self.login()
+        resp, body = self.request("GET", "/api/state", headers={"Cookie": pair})
+        gw = json.loads(body)["gateway"]
+        self.assertTrue(gw["base_url"].startswith("http://127.0.0.1:"))
+
 
 class S2NegativeTest(_ProxyServerTestCase):
     def test_wrong_token_401_static_error_no_cookie(self) -> None:

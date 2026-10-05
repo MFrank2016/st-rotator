@@ -314,9 +314,14 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         reveal_token: bool = False,
     ) -> None:
         """把请求交给控制台处理。控制台内部异常不能把网关带崩。"""
+        # 用访问方看到的对外地址（反代后的域名 + 协议）拼接入信息，而非监听地址
+        host = self.headers.get("Host")
+        proto = self.headers.get("X-Forwarded-Proto") or "http"
+        request_base = f"{proto}://{host}" if host else None
         try:
             result = self.console.handle(  # type: ignore[union-attr]
-                method, path, query=query, body=body, reveal_token=reveal_token
+                method, path, query=query, body=body, reveal_token=reveal_token,
+                request_base=request_base,
             )
         except Exception as exc:  # pragma: no cover - 兜底
             result = ui.UiResponse.error(f"控制台内部错误：{type(exc).__name__}: {exc}", status=500)

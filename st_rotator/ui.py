@@ -202,9 +202,15 @@ class ConsoleState:
     def config(self) -> Config:
         return self.rotator.config
 
-    def gateway_info(self, *, reveal_token: bool = False) -> dict[str, Any]:
-        """给上层应用抄的接入信息。"""
-        base = f"http://{self.host}:{self.port}"
+    def gateway_info(
+        self, *, reveal_token: bool = False, request_base: str | None = None
+    ) -> dict[str, Any]:
+        """给上层应用抄的接入信息。
+
+        ``request_base`` 为访问控制台所用的对外地址（如反代后的 ``https://域名``）；
+        传入时优先用它拼接入信息，否则回退到监听地址。
+        """
+        base = request_base or f"http://{self.host}:{self.port}"
         return {
             "listen": f"{self.host}:{self.port}",
             "base_url": f"{base}/v1",
@@ -218,14 +224,16 @@ class ConsoleState:
             "upstream": self.config.base_url,
         }
 
-    def snapshot(self, *, reveal_token: bool = False) -> dict[str, Any]:
+    def snapshot(
+        self, *, reveal_token: bool = False, request_base: str | None = None
+    ) -> dict[str, Any]:
         """整页刷新所需的全部状态。"""
         rate = self.rotator.limiter.stats()
         metrics = self.metrics.snapshot()
         metrics["upstream_attempts"] = self.rotator.upstream_attempts
         return {
             "version": __version__,
-            "gateway": self.gateway_info(reveal_token=reveal_token),
+            "gateway": self.gateway_info(reveal_token=reveal_token, request_base=request_base),
             "summary": self.rotator.pool.summary(),
             "keys": self.rotator.pool.snapshot(),
             "rate_control": rate,
@@ -642,6 +650,7 @@ class ConsoleState:
         query: Mapping[str, Sequence[str]] | None = None,
         body: Mapping[str, Any] | None = None,
         reveal_token: bool = False,
+        request_base: str | None = None,
     ) -> UiResponse | None:
         """处理控制台请求；路径不属于控制台时返回 None，交回网关处理。"""
         if method == "GET" and path in PAGE_PATHS:
@@ -652,7 +661,7 @@ class ConsoleState:
         try:
             if method == "GET":
                 if path == "/api/state":
-                    return UiResponse.json(self.snapshot(reveal_token=reveal_token))
+                    return UiResponse.json(self.snapshot(reveal_token=reveal_token, request_base=request_base))
                 if path == "/api/logs":
                     cursor = _first_int(query, "cursor", 0)
                     return UiResponse.json(self.logs_since(cursor))
