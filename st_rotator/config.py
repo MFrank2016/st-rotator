@@ -205,6 +205,7 @@ class Config:
     # 而且因为是流式（已经发过 200），错误只能以 SSE error 事件的形式出现，不好排查。
     # 以 GET /v1/models 的返回为准，或用控制台切换。
     default_model: str = "deepseek-v4-flash"
+    console_token: str = ""
     accounts: list[AccountConfig] = field(default_factory=list)
 
     # 重试与超时
