@@ -92,10 +92,11 @@ JWT 的 `exp` 用 base64 解 payload 读取（**不校验签名**，仅用于判
 ### 6.3 余量获取 `fetch_pool_usage(jwt) -> list[QuotaPool]`
 
 `GET https://platform.sensenova.cn/lite/console/v1/tokenplan/pool-usage`
-头：`Authorization: Bearer <jwt>`、`Accept: application/json, text/plain, */*`、
+头：`Authorization: Bearer <jwt>`、`Accept: application/json, text/plain, */*`、`Accept-Language: zh-CN`、
 `Referer: https://platform.sensenova.cn/console`、`User-Agent: <Chrome UA>`。
+（浏览器 curl 里还带 `oauth2_*` Cookie，但**只需 Bearer JWT**即可；参考实现仅用 Bearer 就能成功。）
 
-响应 `{"pools": [...]}`，每个 pool 归一化为：
+响应含顶层 `plan`（本次不用）与 `pools: [...]`；每个 pool 归一化为：
 
 ```python
 @dataclass(frozen=True)
@@ -159,12 +160,13 @@ class AccountQuota:
 
 ### 6.5 池映射（通用 / Flash-Lite 专属）
 
-- **通用池** = `pool_type == "default"` 的池；若无 default 池，则取第一个「不匹配 flash-lite」的池。
-- **Flash-Lite 专属池** = `pool_type != "default"` 且其 `name` 或任一 `model_ids` 匹配正则 `flash[-_ ]?lite`（忽略大小写）；
-  若无匹配但恰好只有一个非 default 池，则取该池（兜底）。
+- **通用池** = `pool_type == "default"` 的池（实测名「通用积分池」）；若无 default 池，则取第一个「不匹配 flash-lite」的池。
+- **Flash-Lite 专属池** = `pool_type != "default"` 且其 `name` 或任一 `model_ids` 匹配正则 `flash[-_ ]?lite`（忽略大小写）。
+  实测该池 `name="Flash-Lite积分池"`、`pool_type="dedicated"`、`model_ids=["sensenova-6.7-flash-lite","sensenova-6.8-flash-lite"]`。
+  ⚠️ 通用池的 `model_ids` **也**包含 flash-lite 模型，所以**必须**先排除 `default` 再匹配，不能只按 `model_ids` 匹配。
+- 若无匹配但恰好只有一个非 default 池，则取该池（兜底）。
 - 每个池映射为 `WindowPair(h5=window_5h, d7=window_7d)`；窗口缺失 -> `None`。
 - 无法确定某类池 -> 对应字段为 `None`，前端显示 `—`。
-- ⚠️ 该映射基于参考实现的 `pool_type`/`model_ids` 语义；**请确认**你的账号里 Flash-Lite 专属池确实在 `model_ids`/`name` 中带 `flash-lite`（或每账号只有一个非 default 池）。
 
 ## 7. 控制台后端（`ui.py` / `proxy.py`）
 
@@ -205,10 +207,11 @@ class AccountQuota:
 
 `通用 5h 余量 | 5h 重置倒计时 | 通用 7d 余量 | 7d 重置倒计时 | FL 专属 5h 余量 | FL 专属 7d 余量`
 
-- 每行按该 Key 所属账号取余量；同一账号的多把 Key 显示相同值（如更希望按账号合并展示，可改为分组行——见 §15 待确认）。
+- 每行按该 Key 所属账号取余量（**按 Key 维度展示**，同一账号的多把 Key 显示相同值）。
 - 未配置凭据的账号：这 6 列显示 `—`（不隐藏整行）。
 - 账号 `status="error"`：对应列显示 `!` + tooltip（错误文案）。
 - 列标题用缩写，`title` 属性给全称（`通用积分 5h 余量` 等）。
+- 「余量」数值按四舍五入取整 + 千分位展示（如 `40,979`）。
 
 ### 8.3 刷新与倒计时
 
@@ -284,5 +287,5 @@ class AccountQuota:
   设计上将其隔离在 `quota.py` 且失败只降级，不影响网关核心。
 - 手写 JWE 依赖 `jwcrypto` 的正确性；因此不自行实现 AES-GCM。
 - 账号级限流风控：频繁登录可能触发上游风控，故默认缓存 + 手动刷新，避免轮询。
-- **待确认（池映射）**：通用池按 `pool_type=="default"` 识别、Flash-Lite 专属池按 `model_ids`/`name` 匹配 `flash-lite`——请确认真实返回是否如此（否则调整 §6.5 规则）。
-- **待确认（展示粒度）**：Key 池表格按每把 Key 重复展示其账号余量；若更希望「按账号合并为一行」，请告知（§8.2）。
+- **池映射（已确认）**：通用池 = `pool_type=="default"`（「通用积分池」）；Flash-Lite 专属池 = `pool_type=="dedicated"` 且名/`model_ids` 含 `flash-lite`（「Flash-Lite积分池」）。
+- **展示粒度（已确认）**：Key 池表格按每把 Key 一行展示其账号余量（不合并）。
