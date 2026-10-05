@@ -6,6 +6,7 @@ import unittest
 from unittest import mock
 
 from st_rotator import quota
+from st_rotator.config import Config
 
 
 def _jwt(exp: int) -> str:
@@ -135,6 +136,71 @@ class FollowUntilTest(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+
+class _FakeTransport:
+    def __init__(self, *, fail_login=False, fail_fetch=False):
+        self.calls = {"login": 0, "fetch": 0}
+        self.fail_login = fail_login
+        self.fail_fetch = fail_fetch
+
+    def login(self, user, password):
+        self.calls["login"] += 1
+        if self.fail_login:
+            raise quota.QuotaAuthError("用户名或密码错误")
+        return quota.TokenBundle("jwt", "", 10800, 0.0)
+
+    def fetch_pools(self, access_token):
+        self.calls["fetch"] += 1
+        if self.fail_fetch:
+            raise RuntimeError("boom")
+        return quota.normalize_pools(SAMPLE)
+
+
+def _config_with(accounts):
+    return Config.from_dict({"base_url": "http://127.0.0.1:9/v1", "accounts": accounts})
+
+
+class QuotaServiceTest(unittest.TestCase):
+    def _svc(self, transport, clock=None):
+        cfg = _config_with([
+            {"name": "账号1", "api_keys": ["k1"], "user": "u1", "password": "p1"},
+            {"name": "账号2", "api_keys": ["k2"]},  # 未配置
+        ])
+        return quota.QuotaService(cfg, ttl=300.0, transport=transport, clock=clock or (lambda: 0.0))
+
+    def test_unconfigured_skips_network(self):
+        t = _FakeTransport()
+        out = self._svc(t).snapshot()
+        self.assertEqual(t.calls, {"login": 1, "fetch": 1})  # 仅账号1（已配置）走网络
+        by = {a.account: a for a in out}
+        self.assertEqual(by["账号2"].status, "unconfigured")
+        self.assertEqual(by["账号1"].status, "ok")
+
+    def test_cache_avoids_repeat_and_force_refreshes(self):
+        t = _FakeTransport()
+        svc = self._svc(t)
+        svc.snapshot()
+        svc.snapshot()
+        self.assertEqual(t.calls["fetch"], 1)
+        svc.snapshot(force=True)
+        self.assertEqual(t.calls["fetch"], 2)
+
+    def test_login_failure_marks_error(self):
+        out = self._svc(_FakeTransport(fail_login=True)).snapshot()
+        aq = next(a for a in out if a.account == "账号1")
+        self.assertEqual(aq.status, "error")
+        self.assertIn("用户名或密码错误", aq.error)
+
+    def test_fetch_failure_marks_error_without_breaking_others(self):
+        out = self._svc(_FakeTransport(fail_fetch=True)).snapshot()
+        self.assertEqual(next(a for a in out if a.account == "账号1").status, "error")
+
+    def test_verify_credentials(self):
+        svc = self._svc(_FakeTransport())
+        self.assertIsNone(svc.verify_credentials("u1", "p1"))
+        bad = self._svc(_FakeTransport(fail_login=True))
+        self.assertIn("用户名或密码错误", bad.verify_credentials("u1", "x"))
 
 
 if __name__ == "__main__":

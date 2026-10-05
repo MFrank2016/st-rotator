@@ -9,11 +9,15 @@ from __future__ import annotations
 import base64
 import json
 import secrets
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol
+
+from .config import Config
 
 # ---------------------------------------------------------------- 常量
 IAM_BASE = "https://iam.sensecoreapi.cn"
@@ -382,3 +386,85 @@ class HttpQuotaTransport:
         )
         resp = opener.open(req, timeout=self.timeout)
         return normalize_pools(json.loads(resp.read().decode("utf-8")))
+
+
+class QuotaService:
+    """按账号查询余量，带缓存与容错。"""
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        ttl: float = 300.0,
+        transport: QuotaTransport | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._config = config
+        self._ttl = ttl
+        self._transport: QuotaTransport = transport or HttpQuotaTransport()
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._cache: dict[str, AccountQuota] = {}
+        self._tokens: dict[str, TokenBundle] = {}
+
+    def _accounts(self) -> list[tuple[str, str, str, str]]:
+        return [(a.name, a.user, a.phone, a.password) for a in self._config.accounts]
+
+    def verify_credentials(self, user: str, password: str) -> str | None:
+        try:
+            self._transport.login(user, password)
+        except QuotaUnavailable as exc:
+            return str(exc)
+        except QuotaAuthError as exc:
+            return str(exc)
+        except Exception as exc:  # noqa: BLE001
+            return f"{type(exc).__name__}: {exc}"
+        return None
+
+    def _fetch_one(self, name: str, user: str, phone: str) -> AccountQuota:
+        try:
+            token = self._tokens.get(name)
+            if token is None:
+                token = self._transport.login(user, self._password_of(name))
+                self._tokens[name] = token
+            pools = self._transport.fetch_pools(token.access_token)
+            return map_account_quota(name, user, phone, pools, fetched_at=self._clock())
+        except QuotaUnavailable as exc:
+            return AccountQuota(name, user, phone, "error", str(exc), None, None, None)
+        except Exception as exc:  # noqa: BLE001 - 单账号失败不影响其它
+            self._tokens.pop(name, None)
+            return AccountQuota(
+                name, user, phone, "error", f"{type(exc).__name__}: {exc}", None, None, None
+            )
+
+    def _password_of(self, name: str) -> str:
+        for a in self._config.accounts:
+            if a.name == name:
+                return a.password
+        return ""
+
+    def snapshot(self, *, force: bool = False) -> list[AccountQuota]:
+        with self._lock:
+            out: list[AccountQuota] = []
+            for name, user, phone, password in self._accounts():
+                if not (user and password):
+                    out.append(
+                        AccountQuota(name, user, phone, "unconfigured", None, None, None, None)
+                    )
+                    continue
+                cached = self._cache.get(name)
+                if (
+                    cached is not None
+                    and not force
+                    and self._clock() - (cached.fetched_at or 0) < self._ttl
+                ):
+                    out.append(cached)
+                    continue
+                aq = self._fetch_one(name, user, phone)
+                self._cache[name] = aq
+                out.append(aq)
+            return out
+
+    def close(self) -> None:
+        self._cache.clear()
+        self._tokens.clear()
