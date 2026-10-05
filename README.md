@@ -111,6 +111,36 @@ resp = client.chat.completions.create(
 | `GET /healthz` | 健康检查（**无需 token**，可接监控探针） |
 | `GET /stats` | 每把 Key 的成功 / 失败 / 429 次数、当前自适应速率 |
 
+## 控制台鉴权
+
+控制台与接口使用一把**固定密钥** `console_token`（配置在 `config.json`，支持 `${ENV}` / `${ENV:-默认值}` 占位符）。命令行 `--token` 会覆盖它，优先级为：
+
+```
+--token  >  config.json 的 console_token  >  托盘模式自动生成的 .tray-token
+```
+
+**浏览器打开控制台页面需要登录。** 未鉴权的页面请求会返回**登录页**；提交正确的密钥后，服务端下发一枚 **HttpOnly + SameSite=Strict** 的会话 Cookie：
+
+- Cookie 值是从密钥派生的 **HMAC**，**从不包含原始密钥**；
+- `Path=/`，`Max-Age=604800`（7 天）。
+
+`POST /logout` 会清除该 Cookie（客户端侧）；轮换 `console_token` 会让所有已下发的会话立即失效。
+
+各路由的鉴权口径不同：
+
+| 路由 | 鉴权方式 |
+|---|---|
+| `/api/*` | 未鉴权返回 **JSON 401**（前端据此显示 token 输入条） |
+| `/v1/*` | **只接受 Bearer**（故意拒绝 Cookie，避免 CSRF） |
+| `/healthz`、`/stats` | **公开**，无需鉴权 |
+
+其它约定：
+
+- `console_token` **永远不会写回配置文件，也不会被显示**。
+- 写 `${CONSOLE_TOKEN}` 且**不带默认值**时是 **fail-closed**：环境变量缺失会导致启动报错。
+- **未内置 TLS**：如果要在 localhost 之外暴露，请放在 TLS 反向代理之后。Cookie 故意不设 `Secure`，因为网关本身说的是明文 HTTP。
+- CLI 打开窗口时会通过 `#token=` URL fragment **自动登录**（fragment 不会发送到服务端）。
+
 ## 命令行
 
 | 命令 | 作用 |
@@ -130,6 +160,7 @@ resp = client.chat.completions.create(
 {
   "base_url": "https://token.sensenova.cn/v1",
   "default_model": "deepseek-v4-flash",
+  "console_token": "",            // 控制台/接口固定密钥；留空=不鉴权，建议设长随机串或 "${CONSOLE_TOKEN}"
 
   "strategy": "round_robin",     // round_robin | least_inflight | least_recent | weighted
   "max_attempts": 8,             // 单个请求最多换几次 Key
@@ -320,11 +351,71 @@ curl -si -H "Authorization: Bearer $KEY" https://<host>/v1/models | head -30
 > 那些白打的 429 不再发生，客户端等待时间大幅下降。
 > 注意这**不提升峰值吞吐** —— 峰值由上游额度决定，任何客户端参数都突破不了。
 
+## Docker 部署
+
+仓库自带 `Dockerfile`、`docker-compose.yml`、`.dockerignore`：镜像基于 `python:3.12-slim`，以非 root 用户（uid **10001**）运行，**零 `pip install`**（项目本身无第三方依赖）。
+
+默认 `CMD` 同时启动控制台与网关：
+
+```
+python -m st_rotator ui -c /data/config.json --host 0.0.0.0 --port 8080 --no-open --log-file /data/rotator.log
+```
+
+`--no-open` 表示容器内不会弹出浏览器窗口；只想跑 API 网关可用 `serve` 子命令替代。
+
+**构建**
+
+```bash
+docker build -t st-rotator:latest .
+```
+
+**准备配置**
+
+创建 `./data/config.json`，把 `console_token` 设为 `${CONSOLE_TOKEN}`，账号密钥同样写成 `${...}` 占位符：
+
+```jsonc
+{
+  "console_token": "${CONSOLE_TOKEN}",
+  "accounts": [
+    { "name": "账号1", "api_keys": ["${SENSENOVA_KEY_1}"], "rpm_limit": 2 }
+  ]
+}
+```
+
+并确保 `./data` 对 uid 10001 可写（挂载卷的属主 / 权限）。
+
+**Compose 启动**
+
+```bash
+CONSOLE_TOKEN=$(openssl rand -hex 24) SENSENOVA_KEY_1=sk-xxx docker compose up -d
+```
+
+也可以用 `.env` 文件提供这些变量。端口默认发布到 `127.0.0.1:8080`；只有把它放在 **TLS 反向代理**之后时，才改成 `0.0.0.0:8080`。
+
+**等价的 `docker run`**
+
+```bash
+docker run -d --name st-rotator \
+  -p 127.0.0.1:8080:8080 \
+  -e CONSOLE_TOKEN="$(openssl rand -hex 24)" \
+  -e SENSENOVA_KEY_1=sk-xxx \
+  -v "$PWD/data:/data" \
+  st-rotator:latest
+```
+
+**健康检查**
+
+镜像的 `HEALTHCHECK` 命中公开的 `/healthz`，无需鉴权。
+
+**关于鉴权**
+
+`${CONSOLE_TOKEN}` 是 **fail-closed** 的：compose 用 `${CONSOLE_TOKEN:?...}` 强制要求该变量存在，配置文件里也写 `${CONSOLE_TOKEN}`（不带默认值），缺失即启动报错。容器内控制台同样由**登录页**保护；API 客户端则把同一个 `console_token` 当作 **Bearer token** 使用。
+
 ## 注意事项
 
 - **默认只监听 `127.0.0.1`。** 改成 `0.0.0.0` 等于同网段任何人都能用你的凭据，
   同时也会构成"许可他人使用"，可能违反你所使用的服务条款。
-- **永远设 `--token`。** 不设口令等于本机任何进程都能白嫖。
+- **永远设置固定密钥。** 首选在 `config.json` 里设 `console_token`（可写 `${ENV}` 占位符，长期不变），临时需要时用 `--token` 覆盖。不设口令等于本机任何进程都能白嫖。
 - **"模型不在套餐"不会被当成 Key 失效。** 上游返回 `model is not available in the
   current token plan` 这类错误时（常见于请求了当前 Key 套餐里没有的模型），
   Key 本身是好的：网关会换下一把 Key 试试，全部不行就把上游错误原样透传，
@@ -333,7 +424,7 @@ curl -si -H "Authorization: Bearer $KEY" https://<host>/v1/models | head -30
   切换默认模型时会顺带复活被误判的失效 Key，切回可用模型即可立即恢复。
 - `config.json` 含明文密钥，已加入 `.gitignore`，**不要提交**。推荐用 `${ENV}` 占位符写法。
 - 日志里的 Key 一律脱敏（`sk-J79...aZuN`），可以安全外发。
-- **控制台页面会明文显示 token**（复制接入片段需要），截图外发前注意避开。
+- **控制台页面需要登录后才能访问**（未鉴权只会看到登录页），但登录后页面仍会**明文显示 token**（复制接入片段需要），截图外发前注意避开。
 - `deepseek-v4-flash` 是推理模型，`reasoning_content` 与 `content` 共用 `max_tokens` 预算，
   **建议不低于 500**，否则 `content` 会返回空串。
 

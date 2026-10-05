@@ -1,6 +1,7 @@
 {
   "base_url": "https://token.sensenova.cn/v1",
   "default_model": "deepseek-v4-flash",
+  "console_token": "",
 
   "strategy": "round_robin",
   "max_attempts": 8,
