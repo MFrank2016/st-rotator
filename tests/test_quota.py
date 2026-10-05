@@ -88,3 +88,20 @@ class PureHelpersTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from unittest import mock
+
+
+class EncryptPasswordTest(unittest.TestCase):
+    def test_missing_jwcrypto_raises_unavailable(self):
+        with mock.patch.dict("sys.modules", {"jwcrypto": None}):
+            with self.assertRaises(quota.QuotaUnavailable):
+                quota.encrypt_password("pw", pubkey=object())
+
+    def test_encrypts_with_jwcrypto_when_present(self):
+        try:
+            __import__("jwcrypto", fromlist=["jwe"])  # noqa: F401
+        except ImportError:
+            pass
+        raise unittest.SkipTest("需要真实 jwcrypto 公钥，仅在有依赖时手动运行")

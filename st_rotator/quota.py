@@ -189,3 +189,190 @@ def map_account_quota(
         flash_lite=_pair(select_flash_lite(pools)),
         fetched_at=fetched_at,
     )
+
+
+import secrets
+import urllib.parse
+import urllib.request
+from typing import Protocol
+
+
+class QuotaTransport(Protocol):
+    def login(self, user: str, password: str) -> TokenBundle: ...
+    def fetch_pools(self, access_token: str) -> list[QuotaPool]: ...
+
+
+def _jwcrypto():
+    """懒加载 jwcrypto；缺失抛 QuotaUnavailable。"""
+    try:
+        from jwcrypto import jwe, jwk  # type: ignore
+        from jwcrypto.common import json_encode  # type: ignore
+    except Exception as exc:  # pragma: no cover - 依赖缺失路径
+        raise QuotaUnavailable("未安装 jwcrypto，无法查询余量") from exc
+    return jwe, jwk, json_encode
+
+
+def _pkce() -> tuple[str, str]:
+    import hashlib
+
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    return verifier, challenge
+
+
+def encrypt_password(password: str, *, pubkey: Any) -> str:
+    """用 RSA-OAEP + A256GCM 加密密码，返回紧凑 JWE。"""
+    jwe, _jwk, json_encode = _jwcrypto()
+    return jwe.JWE(
+        password.encode("utf-8"),
+        recipient=pubkey,
+        protected=json_encode({"alg": "RSA-OAEP", "enc": "A256GCM"}),
+    ).serialize(compact=True)
+
+
+class HttpQuotaTransport:
+    """默认实现：stdlib HTTP + 懒加载 jwcrypto。"""
+
+    def __init__(self, *, timeout: int = REQUEST_TIMEOUT) -> None:
+        self.timeout = timeout
+        self._pubkey = None
+
+    # --- 低层 HTTP（手动跟随重定向） ---
+    def _opener(self):
+        import http.cookiejar
+
+        jar = http.cookiejar.CookieJar()
+        return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+    def _get(self, opener, url, *, params=None, follow=True):
+        if params:
+            url = url + "?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
+        try:
+            return opener.open(req, timeout=self.timeout)
+        except urllib.error.HTTPError as exc:  # 3xx 已由 opener 跟随；4xx/5xx 抛
+            raise
+
+    def _public_key(self):
+        if self._pubkey is not None:
+            return self._pubkey
+        _jwe, jwk, _je = _jwcrypto()
+        opener = self._opener()
+        resp = opener.open(
+            urllib.request.Request(JWKS_URL, headers={"User-Agent": USER_AGENT}), timeout=self.timeout
+        )
+        jwks = json.loads(resp.read().decode("utf-8"))
+        key = next(k for k in jwks["keys"] if k.get("kid") == JWKS_KID)
+        self._pubkey = jwk.JWK(kty="RSA", n=key["n"], e=key["e"])
+        return self._pubkey
+
+    def login(self, user: str, password: str) -> TokenBundle:
+        import time as _time
+
+        _jwe, _jwk, _je = _jwcrypto()
+        opener = self._opener()
+        verifier, challenge = _pkce()
+        state = secrets.token_urlsafe(16)
+        resp = self._get(
+            opener,
+            OIDC_AUTH,
+            params={
+                "client_id": CLIENT_ID,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "redirect_uri": REDIRECT_URI,
+                "response_type": "code",
+                "scope": SCOPE,
+                "state": state,
+            },
+        )
+        challenge_loc = self._follow_until(opener, resp.geturl(), lambda u: "login_challenge=" in u)
+        if not challenge_loc:
+            raise QuotaAuthError("未能获取 login_challenge")
+        import re
+
+        login_challenge = re.search(r"login_challenge=([^&]+)", challenge_loc).group(1)
+        enc = encrypt_password(password, pubkey=self._public_key())
+        body = json.dumps(
+            {"username": user, "password": enc, "challenge": login_challenge, "is_encrypt": True}
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            f"{IAM_BASE}/iam/authn/v1/auth/nova/login",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Origin": "https://platform.sensenova.cn",
+                "Referer": "https://platform.sensenova.cn/",
+                "User-Agent": USER_AGENT,
+            },
+        )
+        resp = opener.open(req, timeout=self.timeout)
+        payload = json.loads(resp.read().decode("utf-8"))
+        redirect = payload.get("redirect")
+        if not redirect:
+            raise QuotaAuthError(str(payload.get("message") or payload.get("error") or "登录失败"))
+        code_loc = self._follow_until(opener, redirect, lambda u: "code=" in u)
+        if not code_loc:
+            raise QuotaAuthError("未能获取 authorization code")
+        code = re.search(r"[?&]code=([^&]+)", code_loc).group(1)
+        token_req = urllib.request.Request(
+            OIDC_TOKEN,
+            data=urllib.parse.urlencode(
+                {
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "code_verifier": verifier,
+                    "client_id": CLIENT_ID,
+                    "redirect_uri": REDIRECT_URI,
+                    "scope": SCOPE,
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": USER_AGENT},
+        )
+        tok = json.loads(opener.open(token_req, timeout=self.timeout).read().decode("utf-8"))
+        access = tok.get("access_token")
+        if not access:
+            raise QuotaAuthError(str(tok.get("error_description") or tok.get("error") or "未返回 access_token"))
+        return TokenBundle(
+            access_token=access,
+            refresh_token=str(tok.get("refresh_token", "")),
+            expires_in=int(tok.get("expires_in", 10800)),
+            acquired_at=_time.time(),
+        )
+
+    def _follow_until(self, opener, location, predicate, *, max_hops: int = 6):
+        import html
+        import re
+
+        for _ in range(max_hops):
+            if not location:
+                return None
+            if predicate(location):
+                return location
+            resp = opener.open(
+                urllib.request.Request(location, headers={"User-Agent": USER_AGENT, "Accept": "*/*"}),
+                timeout=self.timeout,
+            )
+            new_loc = resp.headers.get("Location")
+            if not new_loc:
+                text = resp.read().decode("utf-8", "replace")
+                m = re.search(r"(https?://[^\"'\s<>]+[?&]code=[^&\"'\s<>]+)", text)
+                if m and predicate(m.group(1)):
+                    return m.group(1)
+            location = new_loc
+        return None
+
+    def fetch_pools(self, access_token: str) -> list[QuotaPool]:
+        opener = self._opener()
+        req = urllib.request.Request(
+            USAGE_URL,
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "zh-CN",
+                "Authorization": f"Bearer {access_token}",
+                "Referer": "https://platform.sensenova.cn/console",
+                "User-Agent": USER_AGENT,
+            },
+        )
+        resp = opener.open(req, timeout=self.timeout)
+        return normalize_pools(json.loads(resp.read().decode("utf-8")))
