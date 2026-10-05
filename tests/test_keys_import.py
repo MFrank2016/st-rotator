@@ -104,6 +104,17 @@ class ImportKeysTest(unittest.TestCase):
             body = st.import_keys("a--b--c", account=None, max_concurrency=4).payload
             self.assertEqual(body["summary"]["error"], 1)
             self.assertIn("格式", body["results"][0]["reason"])
+    def test_format1_batch_shares_one_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self._state(tmp)
+            body = st.import_keys("sk-goodA\nsk-goodB", account=None, max_concurrency=4).payload
+            self.assertEqual(body["summary"]["ok"], 2)
+            accounts = [r["account"] for r in body["added"]]
+            self.assertEqual(len(set(accounts)), 1)
+            created = [a for a in st.store.config.accounts if a.name not in ("账号1",)]
+            self.assertEqual(len(created), 1)
+
+
 
 
 if __name__ == "__main__":

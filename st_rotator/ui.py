@@ -383,6 +383,9 @@ class ConsoleState:
         seen_keys: set[str] = set()
         ok = error = skipped = 0
 
+        with self.lock:
+            default_account = account or next_account_name(self.store.account_names())
+
         for line_no, text, parts in rows:
             if len(parts) not in (1, 4):
                 results.append(row(line_no, parts, "error", format_error, _mask(text)))
@@ -392,7 +395,7 @@ class ConsoleState:
             if len(parts) == 1:
                 key = parts[0]
                 phone = user = password = ""
-                target = account
+                target = default_account
             else:
                 phone, user, password, key = parts
                 target = user or phone
@@ -433,12 +436,9 @@ class ConsoleState:
             # 写入：先落配置文件，再进内存池，最后同步内存配置
             try:
                 with self.lock:
+                    self.store.add_key(key, target, max_concurrency=max_concurrency)
                     if len(parts) == 4:
-                        self.store.add_key(key, target, max_concurrency=max_concurrency)
                         self.store.set_account_credentials(target, user=user, phone=phone, password=password)
-                    else:
-                        target = target or next_account_name(self.store.account_names())
-                        self.store.add_key(key, target, max_concurrency=max_concurrency)
                     item = self.rotator.add_key(key, account=target, max_concurrency=max_concurrency)
                     self.store.reload()
                     self.rotator.config.accounts = list(self.store.config.accounts)
