@@ -329,6 +329,8 @@ class Config:
             "accounts": [
                 {
                     "name": a.name,
+                    "user": a.user,
+                    "phone": a.phone,
                     "api_keys": [mask_key(k) for k in a.api_keys] if mask_keys else list(a.api_keys),
                     "rpm_limit": a.rpm_limit,
                     "max_concurrency": a.max_concurrency,

@@ -42,6 +42,14 @@ class AccountCredentialsTest(unittest.TestCase):
         self.assertEqual(d["phone"], "138")
         self.assertNotIn("password", d)
 
+    def test_config_to_dict_includes_user_phone_not_password(self):
+        cfg = Config.from_dict(_cfg(user="u1", phone="138", password="secret"))
+        d = cfg.to_dict()
+        acct = d["accounts"][0]
+        self.assertEqual(acct["user"], "u1")
+        self.assertEqual(acct["phone"], "138")
+        self.assertNotIn("password", json.dumps(d, ensure_ascii=False))
+
 
 class SetAccountCredentialsTest(unittest.TestCase):
     def _store(self, tmp: str) -> ConfigStore:
