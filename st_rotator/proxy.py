@@ -451,8 +451,12 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json(413, error_payload(str(exc), "invalid_request_error"))
             return
+        params = parse_qs(raw.decode("utf-8", "replace"))
+        # 登录成功 / 免鉴权后回到来源页；仅允许控制台页面路径，防开放重定向
+        nxt = (params.get("next") or [""])[0]
+        target = nxt if nxt in ui.PAGE_PATHS else "/"
         if not self.token:
-            self._send_redirect(303, "/")
+            self._send_redirect(303, target)
             return
         key = self.client_address[0]
         wait = self.login_throttle.retry_after(key)
@@ -463,7 +467,6 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
                 retry_after=wait,
             )
             return
-        params = parse_qs(raw.decode("utf-8", "replace"))
         supplied = (params.get("token") or [""])[0]
         if _constant_time_equals(supplied, self.token):
             self.login_throttle.reset(key)
@@ -471,7 +474,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
                 f"{SESSION_COOKIE}={_session_value(self.token)}"
                 "; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800"
             )
-            self._send_redirect(303, "/", {"Set-Cookie": cookie})
+            self._send_redirect(303, target, {"Set-Cookie": cookie})
             return
         self.login_throttle.record_failure(key)
         self._send_raw(401, ui.LOGIN_HTML_INVALID, "text/html; charset=utf-8")

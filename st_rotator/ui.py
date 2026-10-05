@@ -53,7 +53,7 @@ from .quota import QuotaService, QuotaWindow, WindowPair
 from .version import __version__
 
 # 控制台页面路径（免鉴权，内容只是空壳）
-PAGE_PATHS = frozenset({"/", "/ui", "/ui/"})
+PAGE_PATHS = frozenset({"/", "/ui", "/ui/", "/admin", "/admin/"})
 # 控制台接口前缀（需要鉴权）
 API_PREFIX = "/api/"
 

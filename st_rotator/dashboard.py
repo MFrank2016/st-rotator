@@ -1077,6 +1077,7 @@ _LOGIN_TEMPLATE = r"""<!DOCTYPE html>
       <span>访问 Token</span>
       <input type="password" name="token" class="mono" placeholder="Bearer Token" autocomplete="current-password" autofocus required>
     </label>
+    <input type="hidden" name="next" id="login-next" value="">
     <button type="submit">登录</button>
   </form>
 <script>
@@ -1085,6 +1086,8 @@ _LOGIN_TEMPLATE = r"""<!DOCTYPE html>
    读出来填进输入框（用 .value 赋值，绝不拼接标记），抹掉地址栏 fragment，再提交。
    没有 fragment 时绝不自动提交，交给用户手输。 */
 (function () {
+  var nextEl = document.getElementById("login-next");
+  if (nextEl) nextEl.value = location.pathname;
   var match = /(?:^|[#&])token=([^&]+)/.exec(location.hash || "");
   if (!match) return;
   var input = document.querySelector('input[name="token"]');

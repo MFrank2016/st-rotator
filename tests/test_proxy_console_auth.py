@@ -465,5 +465,41 @@ class KeepAliveTest(_ProxyServerTestCase):
         self.assertEqual(second, 200)
 
 
+class AdminPathTest(_ProxyServerTestCase):
+    """/admin 作为控制台入口；登录后回到安全的来源页（防开放重定向）。"""
+
+    def test_admin_unauth_returns_login(self) -> None:
+        resp, body = self.request("GET", "/admin")
+        text = body.decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertIn('action="/login"', text)
+
+    def test_admin_with_cookie_returns_dashboard(self) -> None:
+        pair = self.login()
+        resp, body = self.request("GET", "/admin", headers={"Cookie": pair})
+        self.assertEqual(resp.status, 200)
+        self.assertIn('id="kpis"', body.decode("utf-8"))
+
+    def test_login_redirects_to_safe_next(self) -> None:
+        resp, _ = self.request(
+            "POST",
+            "/login",
+            body=f"token={self.token}&next=/admin",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(resp.status, 303)
+        self.assertEqual(resp.getheader("Location"), "/admin")
+
+    def test_login_ignores_unsafe_next(self) -> None:
+        for bad in ("//evil.com", "/v1/models", "/api/state", "http://evil.com"):
+            resp, _ = self.request(
+                "POST",
+                "/login",
+                body=f"token={self.token}&next={bad}",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            self.assertEqual(resp.status, 303)
+            self.assertEqual(resp.getheader("Location"), "/", f"next={bad} 应回退到 /")
+
 if __name__ == "__main__":
     unittest.main()
