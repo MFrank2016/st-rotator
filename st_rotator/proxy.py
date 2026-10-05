@@ -24,6 +24,7 @@ WorkBuddy / 各类 Agent 框架只认「OpenAI 兼容端点 + API Key」，没�
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import sys
@@ -46,6 +47,19 @@ HEALTH_PATHS = ("/healthz", "/health")
 STATS_PATH = "/stats"
 
 MAX_BODY_BYTES = 32 * 1024 * 1024
+
+SESSION_COOKIE = "st_rotator_session"
+
+
+def _session_value(token: str) -> str:
+    return hmac.new(token.encode("utf-8"), b"st-rotator-console-session", hashlib.sha256).hexdigest()
+
+
+def _constant_time_equals(supplied: str, expected: str) -> bool:
+    """常量时间比较；统一编码为 UTF-8 字节，避免非 ASCII 输入抛 TypeError。"""
+    return hmac.compare_digest(
+        supplied.encode("utf-8", "replace"), expected.encode("utf-8", "replace")
+    )
 
 
 def error_payload(message: str, err_type: str = "upstream_error", code: str | None = None) -> dict:
@@ -116,19 +130,33 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
                 chunks.append(self.rfile.read(size))
                 self.rfile.read(2)  # CRLF
             return b"".join(chunks)
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError as exc:
+            raise ValueError("Content-Length 非法") from exc
         if length <= 0:
             return b""
         if length > MAX_BODY_BYTES:
             raise ValueError("请求体过大")
         return self.rfile.read(length)
 
-    def _authorized(self) -> bool:
+    def _authorized(self, *, allow_cookie: bool = False) -> bool:
         if not self.token:
             return True
         header = self.headers.get("Authorization") or ""
         supplied = header[7:].strip() if header.lower().startswith("bearer ") else header.strip()
-        return hmac.compare_digest(supplied, self.token)
+        if _constant_time_equals(supplied, self.token):
+            return True
+        if not allow_cookie:
+            return False
+        expected = _session_value(self.token)
+        for pair in (self.headers.get("Cookie") or "").split(";"):
+            name, sep, value = pair.partition("=")
+            if not sep:
+                continue
+            if name.strip() == SESSION_COOKIE and _constant_time_equals(value.strip(), expected):
+                return True
+        return False
 
     def _send_json(self, status: int, payload: Mapping[str, Any], *, retry_after: float | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -152,6 +180,20 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def _send_redirect(
+        self, status: int, location: str, extra_headers: Mapping[str, str] | None = None
+    ) -> None:
+        try:
+            self.send_response(status)
+            self.send_header("Location", location)
+            self.send_header("Cache-Control", "no-store")
+            for key, value in (extra_headers or {}).items():
+                self.send_header(key, value)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
@@ -237,9 +279,22 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         if path == STATS_PATH:
             self._send_json(200, self.rotator.status())
             return
-        # 控制台：页面免鉴权（空壳，不含密钥），接口要鉴权
-        if self.console is not None and self.console.is_console_path(path):
-            if path.startswith(ui.API_PREFIX) and not self._authorized():
+        if path == "/login":
+            if self.token:
+                self._send_raw(200, ui.LOGIN_HTML, "text/html; charset=utf-8")
+            else:
+                self._send_redirect(303, "/")
+            return
+        # 控制台页面：未鉴权时返回登录页（空壳，不含密钥）
+        if self.console is not None and path in ui.PAGE_PATHS:
+            if not self._authorized(allow_cookie=True):
+                self._send_raw(200, ui.LOGIN_HTML, "text/html; charset=utf-8")
+                return
+            self._dispatch_console("GET", path, query=parse_qs(parsed.query))
+            return
+        # 控制台接口：未鉴权返回 JSON 401（前端 authbar 依赖它）
+        if self.console is not None and path.startswith(ui.API_PREFIX):
+            if not self._authorized(allow_cookie=True):
                 self._send_json(401, error_payload("invalid console token", "authentication_error"))
                 return
             self._dispatch_console("GET", path, query=parse_qs(parsed.query))
@@ -262,8 +317,19 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
-        if not self._authorized():
-            self._send_json(401, error_payload("invalid proxy token", "authentication_error"))
+        # 登录 / 登出必须在任何鉴权之前处理
+        if path == "/login":
+            self._handle_login()
+            return
+        if path == "/logout":
+            self._handle_logout()
+            return
+        console_api = self.console is not None and path.startswith(ui.API_PREFIX)
+        if not self._authorized(allow_cookie=console_api):
+            self._send_json(401, error_payload(
+                "invalid console token" if console_api else "invalid proxy token",
+                "authentication_error",
+            ))
             return
         try:
             raw = self._read_body()
@@ -271,7 +337,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             self._send_json(413, error_payload(str(exc), "invalid_request_error"))
             return
 
-        if self.console is not None and path.startswith(ui.API_PREFIX):
+        if console_api:
             try:
                 body = json.loads(raw or b"{}")
             except json.JSONDecodeError as exc:
@@ -290,6 +356,30 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         self._send_json(404, error_payload(f"unknown path {path}", "invalid_request_error"))
 
     # ------------------------------------------------------------ 具体处理
+
+    def _handle_login(self) -> None:
+        try:
+            raw = self._read_body()
+        except ValueError as exc:
+            self._send_json(413, error_payload(str(exc), "invalid_request_error"))
+            return
+        if not self.token:
+            self._send_redirect(303, "/")
+            return
+        params = parse_qs(raw.decode("utf-8", "replace"))
+        supplied = (params.get("token") or [""])[0]
+        if _constant_time_equals(supplied, self.token):
+            cookie = (
+                f"{SESSION_COOKIE}={_session_value(self.token)}"
+                "; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800"
+            )
+            self._send_redirect(303, "/", {"Set-Cookie": cookie})
+            return
+        self._send_raw(401, ui.LOGIN_HTML_INVALID, "text/html; charset=utf-8")
+
+    def _handle_logout(self) -> None:
+        cookie = f"{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+        self._send_redirect(303, "/login", {"Set-Cookie": cookie})
 
     def _handle_chat(self, raw: bytes) -> None:
         if self._paused:
