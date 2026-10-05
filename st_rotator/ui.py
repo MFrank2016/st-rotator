@@ -90,6 +90,53 @@ def parse_import_lines(raw: str) -> list[tuple[int, str, tuple[str, ...]]]:
 # ---------------------------------------------------------------- 指标
 
 
+class UsageTracker:
+    """按小时分桶的 token 用量统计（线程安全，只保留最近 N 小时）。"""
+
+    def __init__(self, *, hours: int = 720, clock: Callable[[], float] = time.time) -> None:
+        self._hours = max(1, int(hours))
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._buckets: dict[int, dict[str, int]] = {}
+
+    @staticmethod
+    def _hour_of(ts: float) -> int:
+        return int(ts // 3600) * 3600
+
+    def note(self, *, prompt_tokens: int = 0, completion_tokens: int = 0, requests: int = 1) -> None:
+        hour = self._hour_of(self._clock())
+        with self._lock:
+            bucket = self._buckets.get(hour)
+            if bucket is None:
+                bucket = {"prompt": 0, "completion": 0, "total": 0, "requests": 0}
+                self._buckets[hour] = bucket
+            bucket["prompt"] += int(prompt_tokens or 0)
+            bucket["completion"] += int(completion_tokens or 0)
+            bucket["total"] = bucket["prompt"] + bucket["completion"]
+            bucket["requests"] += int(requests or 0)
+            cutoff = hour - (self._hours - 1) * 3600
+            for old in [h for h in self._buckets if h < cutoff]:
+                del self._buckets[old]
+
+    def series(self, *, hours: int = 24) -> list[dict[str, int]]:
+        hours = max(1, min(int(hours), self._hours))
+        now_hour = self._hour_of(self._clock())
+        start = now_hour - (hours - 1) * 3600
+        out: list[dict[str, int]] = []
+        with self._lock:
+            for i in range(hours):
+                h = start + i * 3600
+                b = self._buckets.get(h)
+                out.append({
+                    "hour": h,
+                    "prompt": b["prompt"] if b else 0,
+                    "completion": b["completion"] if b else 0,
+                    "total": b["total"] if b else 0,
+                    "requests": b["requests"] if b else 0,
+                })
+        return out
+
+
 class GatewayMetrics:
     """网关侧计数。线程安全，读多写少。
 
@@ -104,6 +151,7 @@ class GatewayMetrics:
         self.stream_requests = 0
         self.errors = 0
         self.paused = False
+        self.usage = UsageTracker()
 
     def note_request(self, *, stream: bool = False) -> None:
         with self._lock:
@@ -114,6 +162,9 @@ class GatewayMetrics:
     def note_error(self) -> None:
         with self._lock:
             self.errors += 1
+
+    def note_usage(self, *, prompt_tokens: int = 0, completion_tokens: int = 0, requests: int = 1) -> None:
+        self.usage.note(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, requests=requests)
 
     def set_paused(self, paused: bool) -> bool:
         with self._lock:
@@ -223,6 +274,10 @@ class ConsoleState:
             "model": self.config.default_model,
             "upstream": self.config.base_url,
         }
+
+    def usage_payload(self, *, hours: int = 24) -> dict[str, Any]:
+        """近 N 小时的 token 用量（按小时分桶，最多保留 30 天）。"""
+        return {"hours": hours, "buckets": self.metrics.usage.series(hours=hours)}
 
     def snapshot(
         self, *, reveal_token: bool = False, request_base: str | None = None
@@ -662,6 +717,9 @@ class ConsoleState:
             if method == "GET":
                 if path == "/api/state":
                     return UiResponse.json(self.snapshot(reveal_token=reveal_token, request_base=request_base))
+                if path == "/api/usage":
+                    hours = _clamp_int(_first_int(query, "hours", 24), 24, 1, 720)
+                    return UiResponse.json(self.usage_payload(hours=hours))
                 if path == "/api/logs":
                     cursor = _first_int(query, "cursor", 0)
                     return UiResponse.json(self.logs_since(cursor))

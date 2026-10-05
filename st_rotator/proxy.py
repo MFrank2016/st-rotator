@@ -513,6 +513,19 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             self._send_json(400, error_payload("'messages' is required", "invalid_request_error"))
             return
 
+        # max_tokens 下限：推理模型思考模式需要额外预算（SenseNova 建议 ≥2048），
+        # 客户端给得过小时抬到下限，避免 content 被 reasoning_content 吃空。
+        floor = self.rotator.config.min_max_tokens
+        current_mt = params.get("max_tokens")
+        if floor > 0 and isinstance(current_mt, int) and not isinstance(current_mt, bool) and current_mt < floor:
+            params["max_tokens"] = floor
+
+        # 流式统计 token 用量：注入 include_usage 让上游在末尾回一个 usage 块。
+        if stream and self.rotator.config.track_stream_usage:
+            stream_options = dict(params.get("stream_options") or {})
+            stream_options["include_usage"] = True
+            params["stream_options"] = stream_options
+
         if self.console is not None:
             self.console.metrics.note_request(stream=stream)
 
@@ -521,6 +534,15 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             self._chat_stream(messages, model, params, headers=headers)
         else:
             self._chat_complete(messages, model, params, headers=headers)
+
+    def _note_usage(self, usage: Any) -> None:
+        """记录一次上游响应的 token 用量（非流式结果 / 流式 usage 块）。"""
+        if self.console is None or not isinstance(usage, Mapping):
+            return
+        self.console.metrics.note_usage(
+            prompt_tokens=int(usage.get("prompt_tokens") or 0),
+            completion_tokens=int(usage.get("completion_tokens") or 0),
+        )
 
     def _chat_complete(
         self, messages: Any, model: str | None, params: dict, headers: Mapping[str, str] | None = None
@@ -544,6 +566,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         except RotatorError as exc:
             self._send_json(502, error_payload(str(exc), "upstream_error", "502"))
             return
+        self._note_usage(result.get("usage"))
         self._send_json(200, result)
 
     def _chat_stream(
@@ -583,8 +606,10 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         self._begin_stream()
         try:
             if has_first:
+                self._note_usage(first_chunk.get("usage"))
                 self._write_chunk(self._sse(first_chunk))
             for chunk in stream:
+                self._note_usage(chunk.get("usage"))
                 self._write_chunk(self._sse(chunk))
         except RotatorError as exc:
             # 已经发出 200 了，改不了状态码，只能补一条 error 事件收尾

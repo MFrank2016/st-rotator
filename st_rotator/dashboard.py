@@ -235,6 +235,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div style="display:flex;justify-content:flex-end;margin-bottom:6px"><button class="tiny" id="btn-refresh-quota">刷新余量</button></div>
   <div class="grid kpis" id="kpis"></div>
 
+  <div class="card" style="margin-bottom:14px">
+    <h2>Token 消耗（近 24 小时）<span class="spacer"></span><span class="muted" id="usage-note" style="text-transform:none;letter-spacing:0"></span></h2>
+    <div id="usage-chart"></div>
+  </div>
+
   <div class="grid two" style="margin-bottom:14px">
     <div class="card">
       <h2>网关接入信息 <span class="spacer"></span><button class="tiny" id="btn-copy-base">复制地址</button></h2>
@@ -365,10 +370,12 @@ var S = {
   tab: "python",
   models: [],
   quota: [],
+  usage: [],
   timerState: null,
   timerLog: null,
   timerCountdown: null,
-  timerQuota: null
+  timerQuota: null,
+  timerUsage: null
 };
 
 /* 窗口是带 #token=xxx 打开的（fragment 不会发给服务端，也不进 Referer）。
@@ -450,7 +457,7 @@ function quotaAggregate() {
 }
 
 /* 没有任何可用账号贡献时聚合值显示 —（而非误导性的 0）。 */
-function aggText(agg, key) { return agg.ok ? fmtInt(agg[key]) : "—"; }
+function aggText(agg, key) { return agg.ok ? fmtInt(Math.round(agg[key])) : "—"; }
 
 function quotaFor(account) {
   var list = S.quota || [];
@@ -461,7 +468,7 @@ function quotaFor(account) {
 function quotaRemaining(pair, window) {
   if (!pair || !pair[window]) return "—";
   var remaining = pair[window].remaining;
-  return remaining == null ? "—" : fmtInt(remaining);
+  return remaining == null ? "—" : fmtInt(Math.round(remaining));
 }
 
 function quotaResetAt(pair, window) {
@@ -484,6 +491,46 @@ async function refreshQuota(force) {
   await fetchQuota(force);
   renderKpis(lastState);
   renderPool(lastState);
+}
+
+async function fetchUsage() {
+  try { S.usage = (await api("/api/usage?hours=24")).buckets || []; }
+  catch (e) { S.usage = []; }
+}
+
+async function refreshUsage() {
+  await fetchUsage();
+  renderUsage();
+}
+
+/* 近 24 小时 token 消耗柱状图（内联 SVG，无 CDN）：每根柱按 输入/输出 堆叠。 */
+function renderUsage() {
+  var host = $("usage-chart");
+  if (!host) return;
+  var data = S.usage || [];
+  var note = $("usage-note");
+  if (!data.length) { host.innerHTML = '<div class="empty">暂无数据</div>'; if (note) note.textContent = ""; return; }
+  var max = 0;
+  data.forEach(function (b) { if (b.total > max) max = b.total; });
+  if (max <= 0) { host.innerHTML = '<div class="empty">近 24 小时暂无 token 消耗</div>'; if (note) note.textContent = ""; return; }
+  var W = 960, H = 150, pad = 22, n = data.length, bw = (W - pad * 2) / n;
+  var bars = data.map(function (b, i) {
+    var x = pad + i * bw;
+    var totalH = (H - pad * 2) * (b.total / max);
+    var promptH = b.total > 0 ? totalH * (b.prompt / b.total) : 0;
+    var completionH = totalH - promptH;
+    var yBase = H - pad;
+    var t = new Date(b.hour * 1000);
+    var hh = ("0" + t.getHours()).slice(-2);
+    var title = hh + ":00 合计 " + fmtInt(b.total) + "（输入 " + fmtInt(b.prompt) + " / 输出 " + fmtInt(b.completion) + "）";
+    return '<g><title>' + esc(title) + '</title>' +
+      '<rect x="' + x.toFixed(1) + '" y="' + (yBase - promptH - completionH).toFixed(1) + '" width="' + (bw * 0.8).toFixed(1) + '" height="' + Math.max(0, completionH).toFixed(1) + '" fill="#5b93ff"/>' +
+      '<rect x="' + x.toFixed(1) + '" y="' + (yBase - promptH).toFixed(1) + '" width="' + (bw * 0.8).toFixed(1) + '" height="' + Math.max(0, promptH).toFixed(1) + '" fill="#3a4456"/></g>';
+  }).join("");
+  host.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" style="width:100%;height:150px;display:block">' +
+    '<line x1="' + pad + '" y1="' + (H - pad) + '" x2="' + (W - pad) + '" y2="' + (H - pad) + '" stroke="#2a3240"/>' + bars + '</svg>';
+  var sum = data.reduce(function (a, b) { return a + b.total; }, 0);
+  if (note) note.textContent = "合计 " + fmtInt(sum) + " tokens（蓝=输出，灰=输入）";
 }
 
 /* ------------------------------------------------------------------ 请求 */
@@ -968,7 +1015,7 @@ function tickCountdowns() {
 
 function bind() {
   $("btn-refresh").onclick = function () { refreshState(); toast("已刷新"); };
-  $("btn-refresh-quota").onclick = async function () { await fetchQuota(true); renderKpis(lastState); renderPool(lastState); toast("余量已刷新", "ok"); };
+  $("btn-refresh-quota").onclick = async function () { await fetchQuota(true); renderKpis(lastState); renderPool(lastState); await refreshUsage(); toast("余量已刷新", "ok"); };
   $("btn-pause").onclick = onTogglePause;
   $("btn-add").onclick = onAddKeys;
   $("btn-import").onclick = function () { $("import-dialog").showModal(); };
@@ -1000,12 +1047,13 @@ function bind() {
 }
 
 bind();
-refreshState().then(function () { refreshQuota(false); });
+refreshState().then(function () { refreshQuota(false); refreshUsage(); });
 pollLogs();
 S.timerState = setInterval(refreshState, 2000);
 S.timerLog = setInterval(pollLogs, 1200);
 S.timerCountdown = setInterval(tickCountdowns, 1000);
-S.timerQuota = setInterval(function () { refreshQuota(false); }, 60000);
+  S.timerQuota = setInterval(function () { refreshQuota(false); }, 60000);
+  S.timerUsage = setInterval(refreshUsage, 60000);
 </script>
 </body>
 </html>

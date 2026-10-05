@@ -21,7 +21,7 @@ class DashboardQuotaTest(unittest.TestCase):
         self.assertIn(
             "S.timerQuota = setInterval(function () { refreshQuota(false); }, 60000);", DASHBOARD_HTML
         )
-        self.assertIn("refreshState().then(function () { refreshQuota(false); });", DASHBOARD_HTML)
+        self.assertIn("refreshState().then(function () { refreshQuota(false); refreshUsage(); });", DASHBOARD_HTML)
 
     def test_countdown_formats_match_window(self):
         # 5h 窗口用短格式（X h Y m），7d 窗口用长格式（X d Y h Z m）。
@@ -47,6 +47,17 @@ class DashboardImportTest(unittest.TestCase):
     def test_import_ui_present(self):
         for text in ["批量新增", 'id="import-dialog"', "/api/keys/import", "手机--用户名--密码--apikey"]:
             self.assertIn(text, DASHBOARD_HTML)
+
+
+class DashboardUsageTest(unittest.TestCase):
+    def test_usage_chart_present(self):
+        for text in ["Token 消耗（近 24 小时）", 'id="usage-chart"', "/api/usage?hours=24", "function renderUsage"]:
+            self.assertIn(text, DASHBOARD_HTML)
+
+    def test_kpi_values_rounded(self):
+        # 聚合卡片与余量列取整，不显示小数。
+        self.assertIn("fmtInt(Math.round(agg[key]))", DASHBOARD_HTML)
+        self.assertIn("fmtInt(Math.round(remaining))", DASHBOARD_HTML)
 
 
 if __name__ == "__main__":

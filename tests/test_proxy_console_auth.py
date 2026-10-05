@@ -106,14 +106,20 @@ class _ProxyServerTestCase(unittest.TestCase):
     auto_start = True
     login_throttle = None
 
+    def raw_config(self) -> dict:
+        return _minimal_config()
+
+    def make_rotator(self, config: Config):
+        return FakeRotator(config)
+
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         cfg_path = os.path.join(self._tmp.name, "config.json")
-        raw = _minimal_config()
+        raw = self.raw_config()
         with open(cfg_path, "w", encoding="utf-8") as handle:
             json.dump(raw, handle)
         self.store = ConfigStore.load(cfg_path)
-        self.fake = FakeRotator(Config.from_dict(raw))
+        self.fake = self.make_rotator(Config.from_dict(raw))
         self.console = ConsoleState(
             store=self.store,
             rotator=self.fake,
@@ -522,6 +528,72 @@ class AdminPathTest(_ProxyServerTestCase):
             )
             self.assertEqual(resp.status, 303)
             self.assertEqual(resp.getheader("Location"), "/", f"next={bad} 应回退到 /")
+
+
+class _RecordingRotator(FakeRotator):
+    """记录最近一次 chat / chat_stream_raw 的入参，并返回带 usage 的响应。"""
+
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        self.last_chat_params: dict | None = None
+        self.last_stream_params: dict | None = None
+
+    def chat(self, messages, model=None, **kwargs) -> dict:
+        self.last_chat_params = kwargs
+        return {"choices": [], "usage": {"prompt_tokens": 30, "completion_tokens": 12}}
+
+    def chat_stream_raw(self, messages, model=None, **kwargs):
+        self.last_stream_params = kwargs
+        yield {"choices": [{"delta": {"content": "hi"}}]}
+        yield {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 7}}
+
+
+class ParamsAndUsageTest(_ProxyServerTestCase):
+    """min_max_tokens 下限、流式 include_usage 注入、token 用量统计与 /api/usage。"""
+
+    def raw_config(self) -> dict:
+        cfg = _minimal_config()
+        cfg["min_max_tokens"] = 2048
+        return cfg
+
+    def make_rotator(self, config: Config):
+        self.rec = _RecordingRotator(config)
+        return self.rec
+
+    def _chat(self, body: dict, headers: dict | None = None):
+        h = {"Content-Type": "application/json", "Authorization": f"Bearer {self.token}"}
+        if headers:
+            h.update(headers)
+        return self.request("POST", "/v1/chat/completions", body=json.dumps(body), headers=h)
+
+    def test_min_max_tokens_floor_raises_small(self) -> None:
+        resp, _ = self._chat({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self.rec.last_chat_params.get("max_tokens"), 2048)
+
+    def test_min_max_tokens_keeps_larger(self) -> None:
+        resp, _ = self._chat({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 9000})
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self.rec.last_chat_params.get("max_tokens"), 9000)
+
+    def test_usage_recorded_non_stream(self) -> None:
+        pair = self.login()
+        self._chat({"messages": [{"role": "user", "content": "hi"}]})
+        resp, body = self.request("GET", "/api/usage?hours=1", headers={"Cookie": pair})
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(json.loads(body)["buckets"][-1]["total"], 42)
+
+    def test_stream_injects_include_usage_and_records(self) -> None:
+        pair = self.login()
+        resp, _ = self._chat({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+        self.assertEqual(resp.status, 200)
+        self.assertTrue(self.rec.last_stream_params.get("stream_options", {}).get("include_usage"))
+        resp2, body = self.request("GET", "/api/usage?hours=1", headers={"Cookie": pair})
+        self.assertEqual(json.loads(body)["buckets"][-1]["total"], 12)
+
+    def test_api_usage_requires_auth(self) -> None:
+        resp, _ = self.request("GET", "/api/usage")
+        self.assertEqual(resp.status, 401)
 
 if __name__ == "__main__":
     unittest.main()

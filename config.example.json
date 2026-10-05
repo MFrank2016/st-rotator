@@ -11,6 +11,8 @@
   "max_total_wait": 120,
   "retry_backoff": 0.5,
   "max_retry_backoff": 8,
+  "min_max_tokens": 2048,
+  "track_stream_usage": true,
 
   "rate_control": {
     "mode": "fixed",

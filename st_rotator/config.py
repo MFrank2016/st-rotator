@@ -254,6 +254,10 @@ class Config:
 
     extra_headers: dict[str, str] = field(default_factory=dict)
 
+    # 网关行为
+    min_max_tokens: int = 0          # >0 时把请求的 max_tokens 抬到不低于此值（推理模型建议 ≥2048）
+    track_stream_usage: bool = True  # 流式请求注入 stream_options.include_usage 以统计 token 用量
+
     # ---------------------------------------------------------------- 校验
 
     def __post_init__(self) -> None:
@@ -267,6 +271,8 @@ class Config:
             raise ConfigError("timeout / connect_timeout 必须 > 0")
         if self.max_total_wait < 0:
             raise ConfigError("max_total_wait 不能为负")
+        if self.min_max_tokens < 0:
+            raise ConfigError("min_max_tokens 不能为负")
         if not self.base_url.startswith(("http://", "https://")):
             raise ConfigError(f"base_url 必须以 http(s):// 开头，当前为 {self.base_url!r}")
         self.base_url = self.base_url.rstrip("/")
