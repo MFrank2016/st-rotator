@@ -142,6 +142,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   input.mono { font-family: var(--mono); font-size: 12px; }
   label.field { display: block; margin-bottom: 9px; }
   label.field > span { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 4px; }
+  dialog {
+    background: var(--card); color: var(--text); border: 1px solid var(--border-strong);
+    border-radius: 12px; padding: 18px; max-width: 560px; width: 90%;
+  }
+  dialog::backdrop { background: rgba(0, 0, 0, .45); }
+  dialog textarea {
+    width: 100%; box-sizing: border-box; font-family: var(--mono); font-size: 12px;
+    color: var(--text); background: var(--bg); border: 1px solid var(--border-strong);
+    border-radius: 7px; padding: 8px 10px; resize: vertical; margin-bottom: 10px;
+  }
+  dialog textarea:focus { outline: none; border-color: var(--accent); }
   .row { display: flex; gap: 9px; align-items: flex-end; }
   .row > * { min-width: 0; }
   .row .grow { flex: 1; }
@@ -250,7 +261,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="card" style="margin-bottom:14px">
-    <h2>Key 池 <span class="spacer"></span><span class="muted" id="pool-note" style="text-transform:none;letter-spacing:0"></span></h2>
+    <h2>Key 池 <span class="spacer"></span><span class="muted" id="pool-note" style="text-transform:none;letter-spacing:0"></span><button class="primary" id="btn-import">批量新增</button></h2>
     <div id="pool"></div>
 
     <div style="margin-top:15px;padding-top:14px;border-top:1px solid var(--border)">
@@ -330,6 +341,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 <div class="toast" id="toast"></div>
+
+<dialog id="import-dialog">
+  <h2>批量新增 Key</h2>
+  <p class="muted" style="font-size:11.5px">每行一条，支持两种格式：<br>
+    1) 纯 apikey：<code>sk-xxxx</code><br>
+    2) 手机--用户名--密码--apikey：<code>13800000000--user--pass--sk-xxxx</code></p>
+  <textarea id="import-lines" rows="8" class="mono" placeholder="sk-xxxx&#10;13800000000--user--pass--sk-yyyy"></textarea>
+  <label class="field"><span>归属账号（仅格式 1，留空自动命名）</span><input id="import-account" placeholder="留空自动命名"></label>
+  <div class="row"><button class="primary" id="btn-import-run">导入</button>
+    <button id="btn-import-close">关闭</button></div>
+  <div id="import-result"></div>
+</dialog>
 
 <script>
 "use strict";
@@ -828,6 +851,24 @@ async function onAddKeys() {
   }
 }
 
+async function onImportKeys() {
+  var lines = $("import-lines").value;
+  if (!lines.trim()) { toast("请先粘贴内容", "err"); return; }
+  var btn = $("btn-import-run"); btn.disabled = true; btn.innerHTML = '<span class="spin">◌</span> 校验中…';
+  try {
+    var result = await api("/api/keys/import", { method: "POST", body: JSON.stringify({
+      lines: lines, account: $("import-account").value.trim(), max_concurrency: 4 }) });
+    var s = result.summary || {};
+    $("import-result").innerHTML = "<table><tr><th>行</th><th>输入</th><th>判定</th><th>原因</th></tr>" +
+      (result.results || []).map(function (r) {
+        return "<tr><td>" + r.line + "</td><td class='mono'>" + esc(r.input_masked) + "</td><td>" +
+          esc(r.status) + "</td><td>" + esc(r.reason) + "</td></tr>"; }).join("") + "</table>";
+    toast("导入完成：成功 " + (s.ok||0) + "，失败 " + (s.error||0) + "，跳过 " + (s.skipped||0), (s.ok ? "ok" : "err"));
+    await refreshState();
+  } catch (err) { toast(err.message, "err"); }
+  finally { btn.disabled = false; btn.textContent = "导入"; }
+}
+
 async function onApplyModel() {
   var model = $("model-select").value;
   if (!model) return;
@@ -917,6 +958,9 @@ function bind() {
   $("btn-refresh").onclick = function () { refreshState(); toast("已刷新"); };
   $("btn-pause").onclick = onTogglePause;
   $("btn-add").onclick = onAddKeys;
+  $("btn-import").onclick = function () { $("import-dialog").showModal(); };
+  $("btn-import-close").onclick = function () { $("import-dialog").close(); };
+  $("btn-import-run").onclick = onImportKeys;
   $("btn-apply-model").onclick = onApplyModel;
   $("btn-apply-options").onclick = onApplyOptions;
   $("btn-models").onclick = async function () {

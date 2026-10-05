@@ -30,5 +30,11 @@ class DashboardQuotaTest(unittest.TestCase):
             self.assertIn('aggText(agg, "%s")' % key, DASHBOARD_HTML)
 
 
+class DashboardImportTest(unittest.TestCase):
+    def test_import_ui_present(self):
+        for text in ["批量新增", 'id="import-dialog"', "/api/keys/import", "手机--用户名--密码--apikey"]:
+            self.assertIn(text, DASHBOARD_HTML)
+
+
 if __name__ == "__main__":
     unittest.main()
