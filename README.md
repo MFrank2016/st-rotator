@@ -9,7 +9,7 @@
 > 本项目与任何服务商均无关联，仅供你使用**本人有权使用**的凭据。
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](#)
+[![Dependencies](https://img.shields.io/badge/dependencies-core%20zero-brightgreen.svg)](#)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#)
 
 ![控制台](docs/console.png)
@@ -44,7 +44,7 @@
 
 ## 特性
 
-- **零第三方依赖** —— 纯 Python 标准库实现，`clone` 完就能跑，内网 / 容器 / 离线机器都不挑
+- **核心零依赖（余量功能为可选 `jwcrypto`）** —— 纯 Python 标准库实现，`clone` 完就能跑，内网 / 容器 / 离线机器都不挑
 - **本地 OpenAI 兼容网关** —— 上层只看到一个稳定端点，限流、冷却、Key 轮换全部在内部消化
 - **图形控制台** —— 看池子状态、加 / 删 / 体检 Key、切换模型、复制接入片段、看实时日志
 - **系统托盘（Windows）** —— 图标颜色即健康度，双击开控制台，右键可操作

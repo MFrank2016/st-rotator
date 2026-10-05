@@ -6,12 +6,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# 核心零第三方依赖：源码本身无需 pip install（余量功能的可选依赖见下）
-COPY st_rotator ./st_rotator
-COPY config.example.json ./config.example.json
 # 余量功能所需的可选依赖（核心仍零依赖；不配置账号凭据时不会用到）
+# 放在 COPY 源码之前：源码改动不会失效这层慢速 pip 安装
 COPY requirements-quota.txt ./requirements-quota.txt
 RUN pip install --no-cache-dir -r requirements-quota.txt
+
+# 核心零第三方依赖：源码本身无需 pip install
+COPY st_rotator ./st_rotator
+COPY config.example.json ./config.example.json
 
 # 非 root 运行；/data 用于挂载配置与日志
 RUN groupadd --gid 10001 app \
