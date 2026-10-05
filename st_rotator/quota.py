@@ -401,6 +401,64 @@ class HttpQuotaTransport:
         return normalize_pools(json.loads(resp.read().decode("utf-8")))
 
 
+class CreditTracker:
+    """按小时累计「积分消耗」：每 5 分钟采样一次池的 ``used``，与上次做差。
+
+    差值口径为 ``window_7d.used``（7 天才复位一次，30 天累计误差最小）。
+    窗口滚动复位处理：``reset_at`` 变化或 ``used`` 变小 → 视为新窗口，消耗 = 当前 ``used``（不取负）。
+    线程安全；按池（general / flash_lite）分桶，只保留最近 N 小时。
+    """
+
+    def __init__(self, *, hours: int = 720, clock: Callable[[], float] = time.time) -> None:
+        self._hours = max(1, int(hours))
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._last: dict[tuple[str, str], tuple[int, float]] = {}
+        self._buckets: dict[int, dict[str, float]] = {}
+
+    @staticmethod
+    def _hour_of(ts: float) -> int:
+        return int(ts // 3600) * 3600
+
+    def note(self, account: str, pool_type: str, *, reset_at: int | None, used: float) -> None:
+        """记录一次采样：算出本次消耗增量并计入当前小时。"""
+        key = (account, pool_type)
+        now_hour = self._hour_of(self._clock())
+        with self._lock:
+            prev = self._last.get(key)
+            self._last[key] = (int(reset_at or 0), float(used))
+            if prev is None:
+                return
+            prev_reset, prev_used = prev
+            if int(reset_at or 0) == prev_reset and used >= prev_used:
+                delta = used - prev_used
+            else:
+                delta = used  # 窗口复位或回退 → 新窗口，消耗即当前 used
+            if delta <= 0:
+                return
+            bucket = self._buckets.get(now_hour)
+            if bucket is None:
+                bucket = {"general": 0.0, "flash_lite": 0.0}
+                self._buckets[now_hour] = bucket
+            bucket[pool_type] = bucket.get(pool_type, 0.0) + delta
+            cutoff = now_hour - (self._hours - 1) * 3600
+            for old in [h for h in self._buckets if h < cutoff]:
+                del self._buckets[old]
+
+    def snapshot(self) -> dict[str, dict[str, float]]:
+        """返回各窗口（h1/h5/h24/d7/d30）按池的消耗合计。"""
+        now_hour = self._hour_of(self._clock())
+        windows = (("h1", 1), ("h5", 5), ("h24", 24), ("d7", 168), ("d30", 720))
+        with self._lock:
+            buckets = list(self._buckets.items())
+        result: dict[str, dict[str, float]] = {"general": {}, "flash_lite": {}}
+        for pool in ("general", "flash_lite"):
+            for label, hours in windows:
+                start = now_hour - (hours - 1) * 3600
+                result[pool][label] = sum(b.get(pool, 0.0) for h, b in buckets if h >= start)
+        return result
+
+
 class QuotaService:
     """按账号查询余量，带缓存与容错。"""
 
@@ -412,6 +470,7 @@ class QuotaService:
         error_ttl: float = 60.0,
         transport: QuotaTransport | None = None,
         clock: Callable[[], float] = time.monotonic,
+        sampler_interval: float | None = None,
     ) -> None:
         self._config = config
         self._ttl = ttl
@@ -421,6 +480,17 @@ class QuotaService:
         self._lock = threading.Lock()
         self._cache: dict[str, AccountQuota] = {}
         self._tokens: dict[str, TokenBundle] = {}
+        self.credits = CreditTracker()
+        self._stop = threading.Event()
+        self._sampler: threading.Thread | None = None
+        if sampler_interval and sampler_interval > 0:
+            self._sampler = threading.Thread(
+                target=self._sample_loop,
+                args=(float(sampler_interval),),
+                name="quota-sampler",
+                daemon=True,
+            )
+            self._sampler.start()
 
     def _accounts(self) -> list[tuple[str, str, str, str]]:
         return [(a.name, a.user, a.phone, a.password) for a in self._config.accounts]
@@ -455,7 +525,9 @@ class QuotaService:
                 token = self._transport.login(user, self._password_of(name))
                 self._tokens[name] = token
                 pools = self._transport.fetch_pools(token.access_token)
-            return map_account_quota(name, user, phone, pools, fetched_at=self._clock())
+            aq = map_account_quota(name, user, phone, pools, fetched_at=self._clock())
+            self._note_credits(name, aq)
+            return aq
         except QuotaUnavailable as exc:
             return AccountQuota(name, user, phone, "error", str(exc), None, None, self._clock())
         except Exception as exc:  # noqa: BLE001 - 单账号失败不影响其它
@@ -483,6 +555,21 @@ class QuotaService:
                 return a.password
         return ""
 
+    def _note_credits(self, name: str, aq: AccountQuota) -> None:
+        """把本次采样到的池 used 交给 CreditTracker 算消耗增量。"""
+        for pool_type, pair in (("general", aq.general), ("flash_lite", aq.flash_lite)):
+            if pair is None or pair.d7 is None:
+                continue
+            self.credits.note(name, pool_type, reset_at=pair.d7.reset_at, used=pair.d7.used)
+
+    def _sample_loop(self, interval: float) -> None:
+        """后台每 interval 秒强制采样一次，保证无浏览器时也持续统计。"""
+        while not self._stop.wait(interval):
+            try:
+                self.snapshot(force=True)
+            except Exception:  # noqa: BLE001 - 采样失败不影响主流程
+                pass
+
     def snapshot(self, *, force: bool = False) -> list[AccountQuota]:
         with self._lock:
             out: list[AccountQuota] = []
@@ -504,5 +591,6 @@ class QuotaService:
             return out
 
     def close(self) -> None:
+        self._stop.set()
         self._cache.clear()
         self._tokens.clear()

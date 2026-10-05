@@ -60,5 +60,19 @@ class DashboardUsageTest(unittest.TestCase):
         self.assertIn("fmtInt(Math.round(remaining))", DASHBOARD_HTML)
 
 
+class DashboardCreditsTest(unittest.TestCase):
+    def test_consumption_cards_present(self):
+        for text in [
+            "近1h 通用积分消耗", "近5h 通用积分消耗", "近24h 通用积分消耗", "近7d 通用积分消耗", "近30d 通用积分消耗",
+            "近1h 专属积分消耗", "近5h 专属积分消耗", "近24h 专属积分消耗", "近7d 专属积分消耗", "近30d 专属积分消耗",
+        ]:
+            self.assertIn(text, DASHBOARD_HTML)
+
+    def test_chart_beautified(self):
+        # 输入=蓝、输出=橙；自定义悬停 tooltip；横坐标小时标签。
+        for text in ['fill="#5b93ff"', 'fill="#f0a429"', 'id="usage-tip"', 'closest("g[data-tip]")']:
+            self.assertIn(text, DASHBOARD_HTML)
+
+
 if __name__ == "__main__":
     unittest.main()

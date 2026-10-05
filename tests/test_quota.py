@@ -277,6 +277,27 @@ class QuotaServiceTest(unittest.TestCase):
         bad = self._svc(_FakeTransport(fail_login=True))
         self.assertIn("用户名或密码错误", bad.verify_credentials("u1", "x"))
 
+    def test_credits_tracked_from_pool_used_deltas(self):
+        class _MutableTransport:
+            def __init__(self):
+                self.used = 10.0
+            def login(self, user, password):
+                return quota.TokenBundle("jwt", "", 10800, 0.0)
+            def fetch_pools(self, access_token):
+                return quota.normalize_pools({"pools": [
+                    {"name": "通用积分池", "pool_type": "default", "model_ids": ["m"],
+                     "window_7d": {"used": str(self.used), "reset_at": "100"}},
+                ]})
+
+        t = _MutableTransport()
+        cfg = _config_with([{"name": "账号1", "api_keys": ["k1"], "user": "u1", "password": "p1"}])
+        svc = quota.QuotaService(cfg, ttl=0.0, transport=t, clock=lambda: 0.0)
+        svc.snapshot(force=True)  # 首次采样：无差值
+        t.used = 25.0
+        svc.snapshot(force=True)  # 差值 15
+        self.assertEqual(svc.credits.snapshot()["general"]["h1"], 15.0)
+        svc.close()
+
 
 if __name__ == "__main__":
     unittest.main()

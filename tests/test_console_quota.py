@@ -46,11 +46,12 @@ class ConsoleQuotaTest(unittest.TestCase):
         self.assertAlmostEqual(acct["general"]["h5"]["remaining"], 40979.0)
         self.assertAlmostEqual(acct["flash_lite"]["d7"]["remaining"], 600000.0)
         self.assertNotIn("password", str(payload))
+        self.assertIn("consumption", payload)
 
     def test_no_service_returns_empty(self):
         cfg = Config.from_dict({"base_url": "http://127.0.0.1:9/v1", "accounts": [{"name": "a", "api_keys": ["k"]}]})
         st = ConsoleState(store=None, rotator=_FakeRotator(cfg), quota=None)  # type: ignore[arg-type]
-        self.assertEqual(st.quota_payload(force=False), {"accounts": []})
+        self.assertEqual(st.quota_payload(force=False)["accounts"], [])
 
 
 if __name__ == "__main__":

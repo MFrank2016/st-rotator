@@ -194,6 +194,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .toast div.err { border-left-color: var(--red); }
   .toast div.ok { border-left-color: var(--green); }
   @keyframes pop { from { opacity: 0; transform: translateY(6px); } }
+  .chart-tip {
+    position: fixed; display: none; z-index: 60; pointer-events: none;
+    background: var(--card); border: 1px solid var(--border-strong); border-radius: 6px;
+    padding: 5px 9px; font-size: 11.5px; color: var(--text); white-space: nowrap;
+    box-shadow: 0 6px 22px rgba(20,30,50,.14);
+  }
 
   .banner {
     display: none; align-items: center; gap: 10px; margin-bottom: 14px;
@@ -347,6 +353,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 <div class="toast" id="toast"></div>
+<div class="chart-tip" id="usage-tip"></div>
 
 <dialog id="import-dialog">
   <h2>批量新增 Key</h2>
@@ -482,8 +489,11 @@ function countdownCell(resetAt, longForm) {
 }
 
 async function fetchQuota(force) {
-  try { S.quota = (await api("/api/quota" + (force ? "?refresh=1" : ""))).accounts || []; }
-  catch (e) { S.quota = []; }
+  try {
+    var data = await api("/api/quota" + (force ? "?refresh=1" : ""));
+    S.quota = data.accounts || [];
+    S.consumption = data.consumption || null;
+  } catch (e) { S.quota = []; }
 }
 
 /* 余量单独按 ~60s 节奏刷新：避免 2s 轮询对失败账号反复重登（C1）。 */
@@ -503,7 +513,7 @@ async function refreshUsage() {
   renderUsage();
 }
 
-/* 近 24 小时 token 消耗柱状图（内联 SVG，无 CDN）：每根柱按 输入/输出 堆叠。 */
+/* 近 24 小时 token 消耗柱状图（内联 SVG，无 CDN）：输入=蓝、输出=橙，堆叠；横坐标标小时。 */
 function renderUsage() {
   var host = $("usage-chart");
   if (!host) return;
@@ -513,24 +523,42 @@ function renderUsage() {
   var max = 0;
   data.forEach(function (b) { if (b.total > max) max = b.total; });
   if (max <= 0) { host.innerHTML = '<div class="empty">近 24 小时暂无 token 消耗</div>'; if (note) note.textContent = ""; return; }
-  var W = 960, H = 150, pad = 22, n = data.length, bw = (W - pad * 2) / n;
-  var bars = data.map(function (b, i) {
-    var x = pad + i * bw;
-    var totalH = (H - pad * 2) * (b.total / max);
+  var W = 960, H = 176, padL = 8, padR = 8, padT = 10, baseY = 146, n = data.length;
+  var bw = (W - padL - padR) / n;
+  var bars = "", labels = "";
+  data.forEach(function (b, i) {
+    var x = padL + i * bw;
+    var totalH = (baseY - padT) * (b.total / max);
     var promptH = b.total > 0 ? totalH * (b.prompt / b.total) : 0;
     var completionH = totalH - promptH;
-    var yBase = H - pad;
     var t = new Date(b.hour * 1000);
     var hh = ("0" + t.getHours()).slice(-2);
-    var title = hh + ":00 合计 " + fmtInt(b.total) + "（输入 " + fmtInt(b.prompt) + " / 输出 " + fmtInt(b.completion) + "）";
-    return '<g><title>' + esc(title) + '</title>' +
-      '<rect x="' + x.toFixed(1) + '" y="' + (yBase - promptH - completionH).toFixed(1) + '" width="' + (bw * 0.8).toFixed(1) + '" height="' + Math.max(0, completionH).toFixed(1) + '" fill="#5b93ff"/>' +
-      '<rect x="' + x.toFixed(1) + '" y="' + (yBase - promptH).toFixed(1) + '" width="' + (bw * 0.8).toFixed(1) + '" height="' + Math.max(0, promptH).toFixed(1) + '" fill="#3a4456"/></g>';
-  }).join("");
-  host.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" style="width:100%;height:150px;display:block">' +
-    '<line x1="' + pad + '" y1="' + (H - pad) + '" x2="' + (W - pad) + '" y2="' + (H - pad) + '" stroke="#2a3240"/>' + bars + '</svg>';
+    var tip = hh + ":00　输入 " + fmtInt(b.prompt) + " / 输出 " + fmtInt(b.completion) + " / 合计 " + fmtInt(b.total);
+    bars += '<g data-tip="' + esc(tip) + '">' +
+      '<rect x="' + (x + bw * 0.1).toFixed(1) + '" y="' + (baseY - promptH - completionH).toFixed(1) + '" width="' + (bw * 0.8).toFixed(1) + '" height="' + Math.max(0, completionH).toFixed(1) + '" fill="#f0a429"/>' +
+      '<rect x="' + (x + bw * 0.1).toFixed(1) + '" y="' + (baseY - promptH).toFixed(1) + '" width="' + (bw * 0.8).toFixed(1) + '" height="' + Math.max(0, promptH).toFixed(1) + '" fill="#5b93ff"/></g>';
+    if (t.getHours() % 3 === 0) {
+      labels += '<text x="' + (x + bw / 2).toFixed(1) + '" y="' + (baseY + 18) + '" fill="#93a0b4" font-size="11" text-anchor="middle">' + hh + '</text>';
+    }
+  });
+  host.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:auto;display:block">' +
+    '<line x1="' + padL + '" y1="' + baseY + '" x2="' + (W - padR) + '" y2="' + baseY + '" stroke="#2a3240"/>' + bars + labels + '</svg>';
   var sum = data.reduce(function (a, b) { return a + b.total; }, 0);
-  if (note) note.textContent = "合计 " + fmtInt(sum) + " tokens（蓝=输出，灰=输入）";
+  if (note) note.textContent = "合计 " + fmtInt(sum) + " tokens（蓝=输入，橙=输出）";
+  host.onmousemove = function (e) {
+    var tip = $("usage-tip");
+    if (!tip) return;
+    var g = e.target && e.target.closest ? e.target.closest("g[data-tip]") : null;
+    if (g) {
+      tip.textContent = g.getAttribute("data-tip");
+      tip.style.display = "block";
+      tip.style.left = (e.clientX + 12) + "px";
+      tip.style.top = (e.clientY + 12) + "px";
+    } else {
+      tip.style.display = "none";
+    }
+  };
+  host.onmouseleave = function () { var tip = $("usage-tip"); if (tip) tip.style.display = "none"; };
 }
 
 /* ------------------------------------------------------------------ 请求 */
@@ -559,6 +587,13 @@ async function api(path, options) {
 }
 
 /* ------------------------------------------------------------------ 渲染 */
+
+function consText(pool, win) {
+  var c = S.consumption;
+  if (!c || !c[pool] || c[pool][win] == null) return "—";
+  return fmtInt(Math.round(c[pool][win]));
+}
+
 
 function renderKpis(state) {
   var s = state.summary || {};
@@ -592,7 +627,17 @@ function renderKpis(state) {
     ["Flash-Lite 专属积分 5h 累计余量", aggText(agg, "f5"), agg.f5 ? "green" : "", "所有可用账号合计"],
     ["Flash-Lite 专属积分 7d 累计余量", aggText(agg, "f7"), agg.f7 ? "green" : "", "所有可用账号合计"],
     ["5h 重置倒计时", fmtCountdown(agg.reset5, false), "", "最早到期窗口", agg.reset5, false],
-    ["7d 重置倒计时", fmtCountdown(agg.reset7, true), "", "最早到期窗口", agg.reset7, true]
+    ["7d 重置倒计时", fmtCountdown(agg.reset7, true), "", "最早到期窗口", agg.reset7, true],
+    ["近1h 通用积分消耗", consText("general", "h1"), "", "采样差值合计"],
+    ["近5h 通用积分消耗", consText("general", "h5"), "", "采样差值合计"],
+    ["近24h 通用积分消耗", consText("general", "h24"), "", "采样差值合计"],
+    ["近7d 通用积分消耗", consText("general", "d7"), "", "采样差值合计"],
+    ["近30d 通用积分消耗", consText("general", "d30"), "", "采样差值合计"],
+    ["近1h 专属积分消耗", consText("flash_lite", "h1"), "", "采样差值合计"],
+    ["近5h 专属积分消耗", consText("flash_lite", "h5"), "", "采样差值合计"],
+    ["近24h 专属积分消耗", consText("flash_lite", "h24"), "", "采样差值合计"],
+    ["近7d 专属积分消耗", consText("flash_lite", "d7"), "", "采样差值合计"],
+    ["近30d 专属积分消耗", consText("flash_lite", "d30"), "", "采样差值合计"]
   ];
   $("kpis").innerHTML = cards.map(function (c) {
     var attr = c[4] ? ' data-reset-at="' + esc(c[4]) + '"' + (c[5] ? ' data-long="1"' : "") : "";

@@ -316,7 +316,7 @@ class ConsoleState:
     def quota_payload(self, *, force: bool) -> dict[str, Any]:
         """把余量快照转成 JSON（不含任何密钥）。"""
         if self.quota is None:
-            return {"accounts": []}
+            return {"accounts": [], "consumption": _empty_consumption()}
         accounts: list[dict[str, Any]] = []
         for aq in self.quota.snapshot(force=force):
             accounts.append({
@@ -329,7 +329,7 @@ class ConsoleState:
                 "general": _pair_payload(aq.general),
                 "flash_lite": _pair_payload(aq.flash_lite),
             })
-        return {"accounts": accounts}
+        return {"accounts": accounts, "consumption": self.quota.credits.snapshot()}
 
     # ------------------------------------------------------------ 写操作
 
@@ -809,6 +809,12 @@ def _pair_payload(pair: WindowPair | None) -> dict[str, Any] | None:
     if pair is None:
         return None
     return {"h5": _window_payload(pair.h5), "d7": _window_payload(pair.d7)}
+
+
+def _empty_consumption() -> dict[str, dict[str, float]]:
+    """没有配额服务时返回全 0 的消耗结构，保持前端字段稳定。"""
+    zeros = {k: 0.0 for k in ("h1", "h5", "h24", "d7", "d30")}
+    return {"general": dict(zeros), "flash_lite": dict(zeros)}
 
 
 # ---------------------------------------------------------------- 开窗

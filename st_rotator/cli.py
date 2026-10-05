@@ -375,7 +375,7 @@ def build_quota_service(config: Config) -> QuotaService | None:
 
     if not any(a.user and a.password for a in config.accounts):
         return None
-    return QuotaService(config)
+    return QuotaService(config, sampler_interval=300.0)
 
 
 def cmd_ui(args: argparse.Namespace) -> int:
