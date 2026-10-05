@@ -162,6 +162,11 @@ class AccountConfig:
 
     name: str
     api_keys: list[str] = field(default_factory=list)
+    # 可选的登录凭据，用于账号余量查询等需要登录态的场景；支持 ${ENV} 占位符。
+    # password 属于敏感信息，绝不写入日志、绝不回显（见 to_dict）。
+    user: str = ""
+    phone: str = ""
+    password: str = ""
     rpm_limit: int | None = None
     max_concurrency: int = 4
     weight: float = 1.0
@@ -188,12 +193,31 @@ class AccountConfig:
         if isinstance(keys, str):
             keys = [keys]
         name = data.pop("name", None) or "default"
-        known = {"rpm_limit", "max_concurrency", "weight", "tags"}
+        for field_name in ("user", "phone", "password"):
+            if field_name in data and data[field_name] is not None:
+                data[field_name] = expand_env(str(data[field_name])).strip()
+        known = set(cls.__dataclass_fields__) - {"api_keys"}
         unknown = set(data) - known
         if unknown:
             raise ConfigError(f"账号 {name} 存在未知字段: {sorted(unknown)}")
         keys = [expand_env(str(k)).strip() for k in (keys or []) if str(k).strip()]
         return cls(name=name, api_keys=keys, **data)
+
+    def to_dict(self) -> dict[str, Any]:
+        """导出为可序列化字典。
+
+        **不包含 password**：凭据绝不落到日志 / 前端，避免泄漏。
+        """
+        return {
+            "name": self.name,
+            "api_keys": list(self.api_keys),
+            "user": self.user,
+            "phone": self.phone,
+            # 注意：绝不输出 password
+            "rpm_limit": self.rpm_limit,
+            "max_concurrency": self.max_concurrency,
+            "weight": self.weight,
+        }
 
 
 @dataclass
