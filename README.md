@@ -144,6 +144,54 @@ resp = client.chat.completions.create(
 - **未内置 TLS**：如果要在 localhost 之外暴露，请放在 TLS 反向代理之后。Cookie 故意不设 `Secure`，因为网关本身说的是明文 HTTP。
 - CLI 打开窗口时会通过 `#token=` URL fragment **自动登录**（fragment 不会发送到服务端）。
 
+## 账号余量
+
+控制台可以展示每个**已配置凭据**账号的 5 小时 / 7 天余量：顶部 KPI 卡片做累计聚合，Key 池表格按账号逐行展示余量，并带重置倒计时。余量来自账号的登录凭据，因此需要在账号对象里额外填三个**可选**字段：
+
+```jsonc
+{
+  "name": "账号1",
+  "api_keys": ["${SENSENOVA_KEY_1}"],
+  "user": "${SENSENOVA_USER_1}",          // 登录用户名，支持 ${ENV}
+  "phone": "13800000000",                 // 仅作展示标签，不参与登录
+  "password": "${SENSENOVA_PASSWORD_1}"   // 登录密码，支持 ${ENV}
+}
+```
+
+- **`user` / `password`**：两个都非空时该账号才参与余量查询；只填其中一个视为「未配置」，**不发起任何网络请求**，控制台该行显示 `—`。
+- **`phone`**：纯展示字段，用于区分同名账号，不参与登录，也不影响是否查询。
+- 三个字段都支持 `${ENV}` / `${ENV:-默认值}` 占位符；**推荐用环境变量提供 `password`**，不要写明文。
+
+余量查询依赖可选的第三方库 `jwcrypto`（用于加密登录密码），它**不是**核心依赖：缺失时余量面板降级为「未安装 jwcrypto」错误文案，网关推理与其它功能不受影响。
+
+```bash
+pip install -r requirements-quota.txt     # 即 jwcrypto>=1.5
+```
+
+> ⚠️ **配置了 `user` / `password` 后，网关会主动向商汤登录端点发起真实网络请求**（换取 JWT 以查询用量）。
+> 密码只在服务端内存中使用，**绝不回显、绝不写入日志**；未配置凭据的账号不会有任何凭据相关网络行为。
+> 余量结果服务端缓存约 300 秒，并提供手动「刷新余量」，避免频繁登录触发上游风控。
+
+**Docker 镜像已默认安装 `jwcrypto`**（构建时执行 `pip install -r requirements-quota.txt`），容器里账号余量开箱即用；源码运行则按上面的命令按需安装。
+
+## 批量新增 Key
+
+控制台 Key 池面板的「批量新增」按钮可一次粘贴多行导入（单次最多 **50 行**）。每行**独立解析、独立校验、独立判定**，异常行只影响自己，不会中断整批。支持两种格式（分隔符固定为 `--`，各段自动去首尾空白，空行跳过）：
+
+| 格式 | 写法 | 校验与归属 |
+|---|---|---|
+| **格式 1** | `sk-xxxx`（1 段） | 逐把 `probe_key` 探测；可指定「归属账号」（留空自动命名，整批共用同一个账号） |
+| **格式 2** | `手机--用户名--密码--apikey`（4 段） | 先用**用户名 + 密码**做真实登录校验，再探测 apikey；两者都通过才导入 |
+
+- **段数不是 1 或 4 的行**直接判为「格式错误」（如 `a--b--c`、`手机----密码--key`），并给出明确原因。
+- **逐行校验**：格式 1 调 `probe_key`（401/403 → 无效；429 → 视为有效；未知 → 警告放行）；格式 2 先 `login(用户名, 密码)`（失败 → `凭据无效：…`，**绝不回显密码**），再探测 apikey（无效 → `Key 无效：…`）。
+- **去重**：同一批内重复、或已在池中的 apikey → 该行标「重复，已跳过」。
+- 未安装 `jwcrypto` 时格式 2 无法登录校验 → 该行报「未安装 jwcrypto，无法校验凭据」。
+- **写入**：格式 1 归入指定账号；格式 2 按 `用户名` 分组，每组一个账号，并把 `user` / `phone` / `password` 写回 `config.json`（密码不回显）。
+- 弹窗内以表格逐行展示 `行号 | 输入(脱敏) | 判定 | 原因`，底部汇总成功 / 失败 / 跳过数量。
+
+> ⚠️ 导入会触发**真实网络请求**（登录校验 + key 探测），弹窗内会提示「校验中…」。请只导入你本人有权使用的凭据。
+
 ## 命令行
 
 | 命令 | 作用 |
@@ -192,6 +240,9 @@ resp = client.chat.completions.create(
     {
       "name": "账号1",
       "api_keys": ["${SENSENOVA_KEY_1}"],   // 支持 ${ENV} 占位符
+      "user": "${SENSENOVA_USER_1}",        // 登录用户名（可选，账号余量用，支持 ${ENV}）
+      "phone": "13800000000",               // 仅展示（可选）
+      "password": "${SENSENOVA_PASSWORD_1}", // 登录密码（可选，账号余量用，支持 ${ENV}）
       "rpm_limit": 2,                       // ★ 该账号每分钟最多几次，按实测额度填
       "max_concurrency": 4,
       "weight": 1
@@ -356,7 +407,7 @@ curl -si -H "Authorization: Bearer $KEY" https://<host>/v1/models | head -30
 
 ## Docker 部署
 
-仓库自带 `Dockerfile`、`docker-compose.yml`、`.dockerignore`：镜像基于 `python:3.12-slim`，以非 root 用户（uid **10001**）运行，**零 `pip install`**（项目本身无第三方依赖）。
+仓库自带 `Dockerfile`、`docker-compose.yml`、`.dockerignore`：镜像基于 `python:3.12-slim`，以非 root 用户（uid **10001**）运行。核心代码**零第三方依赖**；镜像在构建时**默认安装**余量功能所需的可选依赖 `jwcrypto`（`pip install -r requirements-quota.txt`），因此容器里账号余量开箱即用。
 
 默认 `CMD` 同时启动控制台与网关：
 
@@ -429,6 +480,8 @@ docker run -d --name st-rotator \
   切换默认模型时会顺带复活被误判的失效 Key，切回可用模型即可立即恢复。
 - `config.json` 含明文密钥，已加入 `.gitignore`，**不要提交**。推荐用 `${ENV}` 占位符写法。
 - 日志里的 Key 一律脱敏（`sk-J79...aZuN`），可以安全外发。
+- **账号余量凭据会触发真实登录请求。** 账号里配置了 `user` / `password` 后，控制台查询余量时会主动向商汤登录端点发起请求；密码只在内存中使用、**绝不回显也不写入日志**，推荐用 `${ENV}` 提供。余量功能依赖可选的 `jwcrypto`（`pip install -r requirements-quota.txt`），缺失时仅该功能降级，不影响网关。
+- **批量导入会做真实网络校验。** 「批量新增 Key」的格式 2 会先用用户名密码登录、再探测 apikey；导入的凭据（含明文 `password`）只写入 `config.json`，请勿提交，且只使用你本人有权使用的凭据。
 - **控制台页面需要登录后才能访问**（未鉴权只会看到登录页）。以 `#token=` 打开（Bearer 鉴权）时页面会**明文显示 token**（复制接入片段需要），截图外发前注意避开；用 Cookie 登录的会话不会回显明文 token。
 - `deepseek-v4-flash` 是推理模型，`reasoning_content` 与 `content` 共用 `max_tokens` 预算，
   **建议不低于 500**，否则 `content` 会返回空串。
@@ -478,7 +531,7 @@ st_rotator/
 ## 环境要求
 
 - Python **3.10+**（用到了 `X | Y` 类型语法）
-- 无任何第三方依赖，无需 `pip install`
+- 核心无第三方依赖，无需 `pip install`；**账号余量**为可选功能，需要 `pip install -r requirements-quota.txt`（Docker 镜像已默认安装）
 
 ## License
 
