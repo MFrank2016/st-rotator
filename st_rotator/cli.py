@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from .client import StRotator
 from .config import Config, ConfigStore, RateControlConfig
@@ -307,11 +307,29 @@ def _build_runtime(
     return store, config, sink, rotator, buffer
 
 
+def resolve_console_token(
+    explicit: str | None,
+    configured: str,
+    *,
+    fallback: str | None = None,
+) -> str | None:
+    """按 CLI --token > config.console_token > fallback 的优先级解析本地口令。"""
+    return explicit or configured or fallback or None
+
+
+def _warn_short_token(token: str | None, sink: Callable[[str], None]) -> None:
+    """口令过短时提醒用户；空口令由调用方自行决定是否放行。"""
+    if token and len(token) < 16:
+        sink("[警告] 控制台 Token 长度不足 16，建议改用更长的随机口令")
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """起一个本地 OpenAI 兼容网关（无界面），供 WorkBuddy 等上层应用接入。"""
     from .proxy import serve
 
     _store, config, sink, rotator, _buffer = _build_runtime(args)
+    token = resolve_console_token(args.token, config.console_token)
+    _warn_short_token(token, sink)
     sink(
         f"启动网关 host={args.host} port={args.port} keys={config.total_keys} "
         f"限速={config.rate_control.mode} 模型={config.default_model}"
@@ -321,7 +339,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             rotator,
             host=args.host,
             port=args.port,
-            token=args.token,
+            token=token,
             verbose=args.verbose,
             log_sink=sink,
         )
@@ -337,12 +355,14 @@ def cmd_ui(args: argparse.Namespace) -> int:
 
     default_log = str(Path(args.config).resolve().parent / "rotator.log")
     store, config, sink, rotator, buffer = _build_runtime(args, default_log_file=default_log)
+    token = resolve_console_token(args.token, config.console_token)
+    _warn_short_token(token, sink)
     console = ConsoleState(
         store=store,
         rotator=rotator,
         host=args.host,
         port=args.port,
-        token=args.token,
+        token=token,
         buffer=buffer,
         log_file=args.log_file or default_log,
     )
@@ -351,7 +371,7 @@ def cmd_ui(args: argparse.Namespace) -> int:
         f"启动控制台 host={args.host} port={args.port} keys={config.total_keys} "
         f"模型={config.default_model} 限速={config.rate_control.mode}"
     )
-    if args.token:
+    if token:
         sink("[控制台] 已启用本地鉴权；窗口会自动带入 Token，无需手输")
 
     def on_ready(server: Any) -> None:
@@ -361,7 +381,7 @@ def cmd_ui(args: argparse.Namespace) -> int:
             sink(f"[控制台] 已就绪（--no-open 未开窗）：{url}")
             return
         # Token 放 URL fragment：fragment 不会发给服务端，也不进 Referer
-        target = f"{url}#token={args.token}" if args.token else url
+        target = f"{url}#token={token}" if token else url
         ok, note = open_console_window(target, browser=args.browser, size=args.window_size)
         if not ok:
             sink(f"[警告] {note}")
@@ -375,7 +395,7 @@ def cmd_ui(args: argparse.Namespace) -> int:
             rotator,
             host=args.host,
             port=args.port,
-            token=args.token,
+            token=token,
             verbose=args.verbose,
             log_sink=sink,
             console=console,
@@ -420,7 +440,10 @@ def cmd_tray(args: argparse.Namespace) -> int:
     config_path = Path(args.config).resolve()
     default_log = str(config_path.parent / "rotator.log")
     store, config, sink, rotator, buffer = _build_runtime(args, default_log_file=default_log)
-    token = args.token or _load_or_create_token(config_path.parent)
+    token = resolve_console_token(
+        args.token, config.console_token, fallback=_load_or_create_token(config_path.parent)
+    )
+    _warn_short_token(token, sink)
 
     url_base = f"http://{args.host}:{args.port}/"
 
