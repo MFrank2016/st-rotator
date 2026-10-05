@@ -49,6 +49,7 @@ from .config import STRATEGIES, Config, ConfigStore, RateControlConfig, next_acc
 from .dashboard import DASHBOARD_HTML, LOGIN_HTML, LOGIN_HTML_INVALID
 from .errors import ConfigError, RotatorError
 from .logs import LogBuffer
+from .quota import QuotaService, QuotaWindow, WindowPair
 from .version import __version__
 
 # 控制台页面路径（免鉴权，内容只是空壳）
@@ -179,6 +180,7 @@ class ConsoleState:
     buffer: LogBuffer = field(default_factory=LogBuffer)
     log_file: str | None = None
     metrics: GatewayMetrics = field(default_factory=GatewayMetrics)
+    quota: QuotaService | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     # ------------------------------------------------------------ 只读
@@ -234,6 +236,24 @@ class ConsoleState:
     def logs_since(self, cursor: int) -> dict[str, Any]:
         new_cursor, items = self.buffer.since(cursor)
         return {"cursor": new_cursor, "items": items}
+
+    def quota_payload(self, *, force: bool) -> dict[str, Any]:
+        """把余量快照转成 JSON（不含任何密钥）。"""
+        if self.quota is None:
+            return {"accounts": []}
+        accounts: list[dict[str, Any]] = []
+        for aq in self.quota.snapshot(force=force):
+            accounts.append({
+                "account": aq.account,
+                "user": aq.user,
+                "phone": aq.phone,
+                "status": aq.status,
+                "error": aq.error,
+                "fetched_at": aq.fetched_at,
+                "general": _pair_payload(aq.general),
+                "flash_lite": _pair_payload(aq.flash_lite),
+            })
+        return {"accounts": accounts}
 
     # ------------------------------------------------------------ 写操作
 
@@ -500,6 +520,9 @@ class ConsoleState:
                 if path == "/api/logs":
                     cursor = _first_int(query, "cursor", 0)
                     return UiResponse.json(self.logs_since(cursor))
+                if path == "/api/quota":
+                    force = bool(_first_int(query, "refresh", 0))
+                    return UiResponse.json(self.quota_payload(force=force))
                 return UiResponse.error(f"未知接口 {path}", status=404)
 
             if method == "POST":
@@ -565,6 +588,18 @@ def _clamp_int(value: Any, default: int, low: int, high: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(low, min(high, number))
+
+
+def _window_payload(window: QuotaWindow | None) -> dict[str, Any] | None:
+    if window is None:
+        return None
+    return {"remaining": window.remaining, "reset_at": window.reset_at}
+
+
+def _pair_payload(pair: WindowPair | None) -> dict[str, Any] | None:
+    if pair is None:
+        return None
+    return {"h5": _window_payload(pair.h5), "d7": _window_payload(pair.d7)}
 
 
 # ---------------------------------------------------------------- 开窗
