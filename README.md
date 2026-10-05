@@ -84,7 +84,7 @@ python install_shortcut.py --desktop
 | 配置项 | 值 |
 |---|---|
 | Base URL | `http://127.0.0.1:8899/v1` |
-| API Key | 启动时 `--token` 指定的本地口令 |
+| API Key | `config.json` 的 `console_token`（或启动时的 `--token`） |
 | 模型名 | `deepseek-v4-flash`（或其他已支持的模型） |
 
 ```python
@@ -136,8 +136,11 @@ resp = client.chat.completions.create(
 
 其它约定：
 
-- `console_token` **永远不会写回配置文件，也不会被显示**。
-- 写 `${CONSOLE_TOKEN}` 且**不带默认值**时是 **fail-closed**：环境变量缺失会导致启动报错。
+- `console_token` **不会写回配置文件**。`/api/state` 只对以 **Bearer** 鉴权的调用方回显明文 token；用 Cookie 登录的会话**不回显**，避免会话 Cookie 泄露后被直接换取明文口令。
+- **口令长度要求 ≥ 16 位**：`--token` / `console_token` 非空但短于 16 位时**启动报错退出**（留空表示关闭鉴权；托盘模式会自动生成强口令）。
+- **登录失败限流**：按**直连对端 IP** 计数，60 秒窗口内失败 8 次后，登录接口返回 `429` + `Retry-After`，直到失败记录滑出窗口。⚠️ 若前置反向代理，所有请求同源，等于**全局锁**（任何人的错误尝试都会短暂锁住所有人，包括持正确口令的管理员）。
+- **会话无状态、不可单独吊销**：Cookie 值由密钥派生，轮换 `console_token` 会让所有已下发会话立即失效 —— 这是唯一的吊销手段。
+- 写 `${CONSOLE_TOKEN}` 且**不带默认值**时是 **fail-closed**：环境变量缺失会导致启动报错。该约束取决于配置文件里**确实写了** `${CONSOLE_TOKEN}`；若写成 `"console_token": ""`，即使传了环境变量也不会开启鉴权。
 - **未内置 TLS**：如果要在 localhost 之外暴露，请放在 TLS 反向代理之后。Cookie 故意不设 `Secure`，因为网关本身说的是明文 HTTP。
 - CLI 打开窗口时会通过 `#token=` URL fragment **自动登录**（fragment 不会发送到服务端）。
 
@@ -411,11 +414,13 @@ docker run -d --name st-rotator \
 
 `${CONSOLE_TOKEN}` 是 **fail-closed** 的：compose 用 `${CONSOLE_TOKEN:?...}` 强制要求该变量存在，配置文件里也写 `${CONSOLE_TOKEN}`（不带默认值），缺失即启动报错。容器内控制台同样由**登录页**保护；API 客户端则把同一个 `console_token` 当作 **Bearer token** 使用。
 
+> ⚠️ 注意这条约束取决于 `config.json` 里**确实写了** `${CONSOLE_TOKEN}`；若写成 `"console_token": ""`，即使 compose 传了环境变量也不会启用鉴权。
+
 ## 注意事项
 
 - **默认只监听 `127.0.0.1`。** 改成 `0.0.0.0` 等于同网段任何人都能用你的凭据，
   同时也会构成"许可他人使用"，可能违反你所使用的服务条款。
-- **永远设置固定密钥。** 首选在 `config.json` 里设 `console_token`（可写 `${ENV}` 占位符，长期不变），临时需要时用 `--token` 覆盖。不设口令等于本机任何进程都能白嫖。
+- **永远设置固定密钥。** 首选在 `config.json` 里设 `console_token`（可写 `${ENV}` 占位符，长期不变；长度需 **≥ 16 位**，否则启动报错），临时需要时用 `--token` 覆盖。不设口令等于本机任何进程都能白嫖。
 - **"模型不在套餐"不会被当成 Key 失效。** 上游返回 `model is not available in the
   current token plan` 这类错误时（常见于请求了当前 Key 套餐里没有的模型），
   Key 本身是好的：网关会换下一把 Key 试试，全部不行就把上游错误原样透传，
@@ -424,7 +429,7 @@ docker run -d --name st-rotator \
   切换默认模型时会顺带复活被误判的失效 Key，切回可用模型即可立即恢复。
 - `config.json` 含明文密钥，已加入 `.gitignore`，**不要提交**。推荐用 `${ENV}` 占位符写法。
 - 日志里的 Key 一律脱敏（`sk-J79...aZuN`），可以安全外发。
-- **控制台页面需要登录后才能访问**（未鉴权只会看到登录页），但登录后页面仍会**明文显示 token**（复制接入片段需要），截图外发前注意避开。
+- **控制台页面需要登录后才能访问**（未鉴权只会看到登录页）。以 `#token=` 打开（Bearer 鉴权）时页面会**明文显示 token**（复制接入片段需要），截图外发前注意避开；用 Cookie 登录的会话不会回显明文 token。
 - `deepseek-v4-flash` 是推理模型，`reasoning_content` 与 `content` 共用 `max_tokens` 预算，
   **建议不低于 500**，否则 `content` 会返回空串。
 
