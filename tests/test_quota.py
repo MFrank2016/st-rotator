@@ -1,6 +1,9 @@
 import base64
+import http.server
 import json
+import threading
 import unittest
+from unittest import mock
 
 from st_rotator import quota
 
@@ -86,13 +89,6 @@ class PureHelpersTest(unittest.TestCase):
         self.assertAlmostEqual(aq.flash_lite.d7.remaining, 600000.0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-from unittest import mock
-
-
 class EncryptPasswordTest(unittest.TestCase):
     def test_missing_jwcrypto_raises_unavailable(self):
         with mock.patch.dict("sys.modules", {"jwcrypto": None}):
@@ -105,3 +101,41 @@ class EncryptPasswordTest(unittest.TestCase):
         except ImportError:
             pass
         raise unittest.SkipTest("需要真实 jwcrypto 公钥，仅在有依赖时手动运行")
+
+
+class FollowUntilTest(unittest.TestCase):
+    def test_follow_until_sees_code_in_effective_url(self):
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path.startswith("/start"):
+                    self.send_response(302)
+                    self.send_header("Location", "/next?code=ABC123")
+                    self.end_headers()
+                else:
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"ok")
+
+            def log_message(self, *args) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            transport = quota.HttpQuotaTransport()
+            opener = transport._opener()
+            url = transport._follow_until(
+                opener, f"http://127.0.0.1:{port}/start", lambda u: "code=" in u
+            )
+            self.assertIsNotNone(url)
+            self.assertIn("code=ABC123", url)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+
+if __name__ == "__main__":
+    unittest.main()

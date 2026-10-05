@@ -8,8 +8,12 @@ from __future__ import annotations
 
 import base64
 import json
+import secrets
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, Protocol
 
 # ---------------------------------------------------------------- 常量
 IAM_BASE = "https://iam.sensecoreapi.cn"
@@ -191,18 +195,12 @@ def map_account_quota(
     )
 
 
-import secrets
-import urllib.parse
-import urllib.request
-from typing import Protocol
-
-
 class QuotaTransport(Protocol):
     def login(self, user: str, password: str) -> TokenBundle: ...
     def fetch_pools(self, access_token: str) -> list[QuotaPool]: ...
 
 
-def _jwcrypto():
+def _jwcrypto() -> tuple[Any, Any, Any]:
     """懒加载 jwcrypto；缺失抛 QuotaUnavailable。"""
     try:
         from jwcrypto import jwe, jwk  # type: ignore
@@ -238,22 +236,21 @@ class HttpQuotaTransport:
         self._pubkey = None
 
     # --- 低层 HTTP（手动跟随重定向） ---
-    def _opener(self):
+    def _opener(self) -> Any:
         import http.cookiejar
 
         jar = http.cookiejar.CookieJar()
         return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
-    def _get(self, opener, url, *, params=None, follow=True):
+    def _get(
+        self, opener: Any, url: str, *, params: Mapping[str, Any] | None = None
+    ) -> Any:
         if params:
             url = url + "?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
-        try:
-            return opener.open(req, timeout=self.timeout)
-        except urllib.error.HTTPError as exc:  # 3xx 已由 opener 跟随；4xx/5xx 抛
-            raise
+        return opener.open(req, timeout=self.timeout)
 
-    def _public_key(self):
+    def _public_key(self) -> Any:
         if self._pubkey is not None:
             return self._pubkey
         _jwe, jwk, _je = _jwcrypto()
@@ -340,8 +337,14 @@ class HttpQuotaTransport:
             acquired_at=_time.time(),
         )
 
-    def _follow_until(self, opener, location, predicate, *, max_hops: int = 6):
-        import html
+    def _follow_until(
+        self,
+        opener: Any,
+        location: str | None,
+        predicate: Callable[[str], bool],
+        *,
+        max_hops: int = 6,
+    ) -> str | None:
         import re
 
         for _ in range(max_hops):
@@ -353,6 +356,9 @@ class HttpQuotaTransport:
                 urllib.request.Request(location, headers={"User-Agent": USER_AGENT, "Accept": "*/*"}),
                 timeout=self.timeout,
             )
+            final_url = resp.geturl()
+            if final_url and predicate(final_url):
+                return final_url
             new_loc = resp.headers.get("Location")
             if not new_loc:
                 text = resp.read().decode("utf-8", "replace")
