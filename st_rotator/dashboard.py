@@ -232,6 +232,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <button class="primary tiny" id="btn-token">确认</button>
   </div>
 
+  <div style="display:flex;justify-content:flex-end;margin-bottom:6px"><button class="tiny" id="btn-refresh-quota">刷新余量</button></div>
   <div class="grid kpis" id="kpis"></div>
 
   <div class="grid two" style="margin-bottom:14px">
@@ -963,6 +964,7 @@ function tickCountdowns() {
 
 function bind() {
   $("btn-refresh").onclick = function () { refreshState(); toast("已刷新"); };
+  $("btn-refresh-quota").onclick = async function () { await fetchQuota(true); renderKpis(lastState); renderPool(lastState); toast("余量已刷新", "ok"); };
   $("btn-pause").onclick = onTogglePause;
   $("btn-add").onclick = onAddKeys;
   $("btn-import").onclick = function () { $("import-dialog").showModal(); };

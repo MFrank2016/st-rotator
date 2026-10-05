@@ -36,6 +36,12 @@ class DashboardQuotaTest(unittest.TestCase):
         for key in ("g5", "g7", "f5", "f7"):
             self.assertIn('aggText(agg, "%s")' % key, DASHBOARD_HTML)
 
+    def test_manual_refresh_quota_button_present_and_wired(self):
+        # spec §8.3 手动「刷新余量」按钮存在，且强制刷新（?refresh=1）。
+        self.assertIn('id="btn-refresh-quota"', DASHBOARD_HTML)
+        self.assertIn("刷新余量", DASHBOARD_HTML)
+        self.assertIn("fetchQuota(true)", DASHBOARD_HTML)
+
 
 class DashboardImportTest(unittest.TestCase):
     def test_import_ui_present(self):
