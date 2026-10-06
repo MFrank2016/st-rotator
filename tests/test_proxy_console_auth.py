@@ -547,6 +547,10 @@ class _RecordingRotator(FakeRotator):
         yield {"choices": [{"delta": {"content": "hi"}}]}
         yield {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 7}}
 
+    def request(self, path, method="GET", json_body=None, headers=None) -> dict:
+        self.request_calls += 1
+        return {"object": "list", "data": [], "usage": {"prompt_tokens": 4, "completion_tokens": 6}}
+
 
 class ParamsAndUsageTest(_ProxyServerTestCase):
     """min_max_tokens 下限、流式 include_usage 注入、token 用量统计与 /api/usage。"""
@@ -592,6 +596,26 @@ class ParamsAndUsageTest(_ProxyServerTestCase):
         self.assertEqual(json.loads(body)["buckets"][-1]["total"], 12)
 
     def test_api_usage_requires_auth(self) -> None:
+        resp, _ = self.request("GET", "/api/usage")
+        self.assertEqual(resp.status, 401)
+
+    def test_forward_simple_counts_usage(self) -> None:
+        pair = self.login()
+        resp, _ = self.request(
+            "POST",
+            "/v1/embeddings",
+            body=json.dumps({"input": "x", "model": "m"}),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.token}"},
+        )
+        self.assertEqual(resp.status, 200)
+        resp2, body = self.request("GET", "/api/usage?hours=1", headers={"Cookie": pair})
+        self.assertEqual(json.loads(body)["buckets"][-1]["total"], 10)
+
+    def test_credits_samples_endpoint(self) -> None:
+        pair = self.login()
+        resp, body = self.request("GET", "/api/credits/samples", headers={"Cookie": pair})
+        self.assertEqual(resp.status, 200)
+        self.assertIn("samples", json.loads(body))
         resp, _ = self.request("GET", "/api/usage")
         self.assertEqual(resp.status, 401)
 

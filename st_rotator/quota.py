@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol
 
@@ -415,25 +416,35 @@ class CreditTracker:
         self._lock = threading.Lock()
         self._last: dict[tuple[str, str], tuple[int, float]] = {}
         self._buckets: dict[int, dict[str, float]] = {}
+        self._samples: deque[dict[str, Any]] = deque(maxlen=500)
 
     @staticmethod
     def _hour_of(ts: float) -> int:
         return int(ts // 3600) * 3600
 
     def note(self, account: str, pool_type: str, *, reset_at: int | None, used: float) -> None:
-        """记录一次采样：算出本次消耗增量并计入当前小时。"""
+        """记录一次采样：算出本次消耗增量并计入当前小时；原始采样也留档（供排查）。"""
         key = (account, pool_type)
-        now_hour = self._hour_of(self._clock())
+        ts = self._clock()
+        now_hour = self._hour_of(ts)
         with self._lock:
             prev = self._last.get(key)
             self._last[key] = (int(reset_at or 0), float(used))
-            if prev is None:
-                return
-            prev_reset, prev_used = prev
-            if int(reset_at or 0) == prev_reset and used >= prev_used:
-                delta = used - prev_used
-            else:
-                delta = used  # 窗口复位或回退 → 新窗口，消耗即当前 used
+            delta = 0.0
+            if prev is not None:
+                prev_reset, prev_used = prev
+                if int(reset_at or 0) == prev_reset and used >= prev_used:
+                    delta = used - prev_used
+                else:
+                    delta = used  # 窗口复位或回退 → 新窗口，消耗即当前 used
+            self._samples.append({
+                "ts": ts,
+                "account": account,
+                "pool": pool_type,
+                "reset_at": int(reset_at or 0),
+                "used": float(used),
+                "delta": delta,
+            })
             if delta <= 0:
                 return
             bucket = self._buckets.get(now_hour)
@@ -475,6 +486,12 @@ class CreditTracker:
                 "flash_lite": b.get("flash_lite", 0.0),
             })
         return out
+
+    def samples(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        """最近若干条原始采样（含本次算出的消耗增量），用于排查尖峰来源。"""
+        limit = max(1, min(int(limit), 2000))
+        with self._lock:
+            return list(self._samples)[-limit:]
 
 
 class QuotaService:

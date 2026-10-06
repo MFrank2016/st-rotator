@@ -91,6 +91,19 @@ class CreditTrackerTest(unittest.TestCase):
         self.assertEqual(series[-1]["general"], 30.0)
         self.assertEqual(series[-1]["flash_lite"], 0.0)
 
+    def test_samples_recorded(self) -> None:
+        clock = _Clock(0.0)
+        tracker = CreditTracker(hours=48, clock=clock)
+        tracker.note("a", "general", reset_at=100, used=10.0)
+        clock.t = 300.0
+        tracker.note("a", "general", reset_at=100, used=25.0)
+        samples = tracker.samples()
+        self.assertEqual(len(samples), 2)
+        self.assertEqual(samples[0]["delta"], 0.0)  # 首次采样无差值
+        self.assertEqual(samples[-1]["account"], "a")
+        self.assertEqual(samples[-1]["delta"], 15.0)
+        self.assertEqual(samples[-1]["used"], 25.0)
+
 
 if __name__ == "__main__":
     unittest.main()

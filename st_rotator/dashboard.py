@@ -514,7 +514,7 @@ async function refreshUsage() {
   renderUsage();
 }
 
-/* 近 24 小时：柱=token（蓝输入/橙输出），线=积分消耗（绿=通用/紫=专属，右轴）。 */
+/* 近 24 小时：柱=token（本网关 chat 请求，蓝输入/橙输出），线=上游池额度消耗（绿=通用/紫=专属，整账号口径，右轴）。 */
 function tipText(hh, b, gv, fv) {
   return hh + ":00　token 输入 " + fmtInt(b.prompt) + " / 输出 " + fmtInt(b.completion) + " / 合计 " + fmtInt(b.total) +
     "　·　积分 通用 " + fmtInt(Math.round(gv)) + " / 专属 " + fmtInt(Math.round(fv));
@@ -573,7 +573,7 @@ function renderUsage() {
     '<line x1="' + padL + '" y1="' + baseY + '" x2="' + (W - padR) + '" y2="' + baseY + '" stroke="#2a3240"/>' +
     bars + lines + labels + '</svg>';
   var sum = data.reduce(function (a, b) { return a + b.total; }, 0);
-  if (note) note.textContent = "柱=token 合计 " + fmtInt(sum) + "（蓝=输入，橙=输出） · 线=积分消耗（绿=通用，紫=专属，右轴）";
+  if (note) note.textContent = "柱=token 合计 " + fmtInt(sum) + "（本网关 chat，蓝=输入/橙=输出） · 线=上游池额度消耗（整账号口径、含非本网关用量、上游结算有延迟；绿=通用/紫=专属，右轴）";
   host.onmousemove = function (e) {
     var tip = $("usage-tip");
     if (!tip) return;
@@ -657,16 +657,16 @@ function renderKpis(state) {
     ["Flash-Lite 专属积分 7d 累计余量", aggText(agg, "f7"), agg.f7 ? "green" : "", "所有可用账号合计"],
     ["5h 重置倒计时", fmtCountdown(agg.reset5, false), "", "最早到期窗口", agg.reset5, false],
     ["7d 重置倒计时", fmtCountdown(agg.reset7, true), "", "最早到期窗口", agg.reset7, true],
-    ["近1h 通用积分消耗", consText("general", "h1"), "", "采样差值合计"],
-    ["近5h 通用积分消耗", consText("general", "h5"), "", "采样差值合计"],
-    ["近24h 通用积分消耗", consText("general", "h24"), "", "采样差值合计"],
-    ["近7d 通用积分消耗", consText("general", "d7"), "", "采样差值合计"],
-    ["近30d 通用积分消耗", consText("general", "d30"), "", "采样差值合计"],
-    ["近1h 专属积分消耗", consText("flash_lite", "h1"), "", "采样差值合计"],
-    ["近5h 专属积分消耗", consText("flash_lite", "h5"), "", "采样差值合计"],
-    ["近24h 专属积分消耗", consText("flash_lite", "h24"), "", "采样差值合计"],
-    ["近7d 专属积分消耗", consText("flash_lite", "d7"), "", "采样差值合计"],
-    ["近30d 专属积分消耗", consText("flash_lite", "d30"), "", "采样差值合计"]
+    ["近1h 通用积分消耗", consText("general", "h1"), "", "上游池额度差值（整账号口径）"],
+    ["近5h 通用积分消耗", consText("general", "h5"), "", "上游池额度差值（整账号口径）"],
+    ["近24h 通用积分消耗", consText("general", "h24"), "", "上游池额度差值（整账号口径）"],
+    ["近7d 通用积分消耗", consText("general", "d7"), "", "上游池额度差值（整账号口径）"],
+    ["近30d 通用积分消耗", consText("general", "d30"), "", "上游池额度差值（整账号口径）"],
+    ["近1h 专属积分消耗", consText("flash_lite", "h1"), "", "上游池额度差值（整账号口径）"],
+    ["近5h 专属积分消耗", consText("flash_lite", "h5"), "", "上游池额度差值（整账号口径）"],
+    ["近24h 专属积分消耗", consText("flash_lite", "h24"), "", "上游池额度差值（整账号口径）"],
+    ["近7d 专属积分消耗", consText("flash_lite", "d7"), "", "上游池额度差值（整账号口径）"],
+    ["近30d 专属积分消耗", consText("flash_lite", "d30"), "", "上游池额度差值（整账号口径）"]
   ];
   $("kpis").innerHTML = cards.map(function (c) {
     var attr = c[4] ? ' data-reset-at="' + esc(c[4]) + '"' + (c[5] ? ' data-long="1"' : "") : "";

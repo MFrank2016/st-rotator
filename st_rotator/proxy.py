@@ -660,6 +660,8 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         except RotatorError as exc:
             self._send_json(502, error_payload(str(exc), "upstream_error", "502"))
             return
+        if isinstance(result, Mapping):
+            self._note_usage(result.get("usage"))
         self._send_json(200, result)
 
 
