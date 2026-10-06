@@ -21,7 +21,7 @@ class DashboardQuotaTest(unittest.TestCase):
         self.assertIn(
             "S.timerQuota = setInterval(function () { refreshQuota(false); }, 60000);", DASHBOARD_HTML
         )
-        self.assertIn("refreshState().then(function () { refreshQuota(false); refreshUsage(); });", DASHBOARD_HTML)
+        self.assertIn("refreshState().then(function () { refreshQuota(false); refreshUsage(); refreshSamples(); });", DASHBOARD_HTML)
 
     def test_countdown_formats_match_window(self):
         # 5h 窗口用短格式（X h Y m），7d 窗口用长格式（X d Y h Z m）。
@@ -72,6 +72,12 @@ class DashboardCreditsTest(unittest.TestCase):
         # 输入=蓝、输出=橙；自定义悬停 tooltip；横坐标小时标签。
         for text in ['fill="#5b93ff"', 'fill="#f0a429"', 'id="usage-tip"', 'closest("g[data-tip]")',
                      '"#34d399"', '"#a78bfa"', "function tipText"]:
+            self.assertIn(text, DASHBOARD_HTML)
+
+
+class DashboardSamplesTest(unittest.TestCase):
+    def test_samples_panel_present(self):
+        for text in ["积分采样明细（仅有差异）", 'id="samples"', "/api/credits/samples?nonzero=1", "function renderSamples"]:
             self.assertIn(text, DASHBOARD_HTML)
 
 

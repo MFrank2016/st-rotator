@@ -487,11 +487,14 @@ class CreditTracker:
             })
         return out
 
-    def samples(self, *, limit: int = 200) -> list[dict[str, Any]]:
-        """最近若干条原始采样（含本次算出的消耗增量），用于排查尖峰来源。"""
+    def samples(self, *, limit: int = 200, nonzero: bool = False) -> list[dict[str, Any]]:
+        """最近若干条原始采样；``nonzero=True`` 时只返回有消耗差异（delta>0）的。"""
         limit = max(1, min(int(limit), 2000))
         with self._lock:
-            return list(self._samples)[-limit:]
+            items = list(self._samples)
+        if nonzero:
+            items = [s for s in items if s["delta"] > 0]
+        return items[-limit:]
 
 
 class QuotaService:

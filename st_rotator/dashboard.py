@@ -246,6 +246,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div id="usage-chart"></div>
   </div>
 
+  <div class="card" style="margin-bottom:14px">
+    <h2>积分采样明细（仅有差异）<span class="spacer"></span><span class="muted" id="samples-note" style="text-transform:none;letter-spacing:0"></span></h2>
+    <div id="samples"></div>
+  </div>
+
   <div class="grid two" style="margin-bottom:14px">
     <div class="card">
       <h2>网关接入信息 <span class="spacer"></span><button class="tiny" id="btn-copy-base">复制地址</button></h2>
@@ -378,11 +383,13 @@ var S = {
   models: [],
   quota: [],
   usage: [],
+  samples: [],
   timerState: null,
   timerLog: null,
   timerCountdown: null,
   timerQuota: null,
-  timerUsage: null
+  timerUsage: null,
+  timerSamples: null
 };
 
 /* 窗口是带 #token=xxx 打开的（fragment 不会发给服务端，也不进 Referer）。
@@ -512,6 +519,34 @@ async function fetchUsage() {
 async function refreshUsage() {
   await fetchUsage();
   renderUsage();
+}
+
+async function fetchSamples() {
+  try { S.samples = (await api("/api/credits/samples?nonzero=1&limit=200")).samples || []; }
+  catch (e) { S.samples = []; }
+}
+
+async function refreshSamples() {
+  await fetchSamples();
+  renderSamples();
+}
+
+/* 积分采样明细：只展示有差异（delta>0）的账号采样，按时间倒序。 */
+function renderSamples() {
+  var host = $("samples");
+  if (!host) return;
+  var data = (S.samples || []).slice().reverse();
+  var note = $("samples-note");
+  if (!data.length) { host.innerHTML = '<div class="empty">暂无差异（采样每 5 分钟一次）</div>'; if (note) note.textContent = ""; return; }
+  var head = "<tr><th>时间</th><th>账号</th><th>池</th><th class='num'>used</th><th class='num'>消耗 Δ</th></tr>";
+  var body = data.map(function (s) {
+    var t = new Date(s.ts * 1000);
+    var hh = ("0" + t.getHours()).slice(-2) + ":" + ("0" + t.getMinutes()).slice(-2) + ":" + ("0" + t.getSeconds()).slice(-2);
+    var pool = s.pool === "general" ? "通用" : "专属";
+    return "<tr><td class='mono'>" + hh + "</td><td>" + esc(s.account) + "</td><td>" + pool + "</td><td class='num'>" + fmtInt(Math.round(s.used)) + "</td><td class='num'>+" + fmtInt(Math.round(s.delta)) + "</td></tr>";
+  }).join("");
+  host.innerHTML = "<table>" + head + body + "</table>";
+  if (note) note.textContent = "共 " + data.length + " 条差异采样";
 }
 
 /* 近 24 小时：柱=token（本网关 chat 请求，蓝输入/橙输出），线=上游池额度消耗（绿=通用/紫=专属，整账号口径，右轴）。 */
@@ -1089,7 +1124,7 @@ function tickCountdowns() {
 
 function bind() {
   $("btn-refresh").onclick = function () { refreshState(); toast("已刷新"); };
-  $("btn-refresh-quota").onclick = async function () { await fetchQuota(true); renderKpis(lastState); renderPool(lastState); await refreshUsage(); toast("余量已刷新", "ok"); };
+  $("btn-refresh-quota").onclick = async function () { await fetchQuota(true); renderKpis(lastState); renderPool(lastState); await refreshUsage(); await refreshSamples(); toast("余量已刷新", "ok"); };
   $("btn-pause").onclick = onTogglePause;
   $("btn-add").onclick = onAddKeys;
   $("btn-import").onclick = function () { $("import-dialog").showModal(); };
@@ -1121,13 +1156,14 @@ function bind() {
 }
 
 bind();
-refreshState().then(function () { refreshQuota(false); refreshUsage(); });
+refreshState().then(function () { refreshQuota(false); refreshUsage(); refreshSamples(); });
 pollLogs();
 S.timerState = setInterval(refreshState, 2000);
 S.timerLog = setInterval(pollLogs, 1200);
 S.timerCountdown = setInterval(tickCountdowns, 1000);
   S.timerQuota = setInterval(function () { refreshQuota(false); }, 60000);
   S.timerUsage = setInterval(refreshUsage, 60000);
+  S.timerSamples = setInterval(refreshSamples, 60000);
 </script>
 </body>
 </html>

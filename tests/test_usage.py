@@ -104,6 +104,17 @@ class CreditTrackerTest(unittest.TestCase):
         self.assertEqual(samples[-1]["delta"], 15.0)
         self.assertEqual(samples[-1]["used"], 25.0)
 
+    def test_samples_nonzero_filter(self) -> None:
+        clock = _Clock(0.0)
+        tracker = CreditTracker(hours=48, clock=clock)
+        tracker.note("a", "general", reset_at=100, used=10.0)
+        clock.t = 300.0
+        tracker.note("a", "general", reset_at=100, used=25.0)
+        self.assertEqual(len(tracker.samples()), 2)
+        nz = tracker.samples(nonzero=True)
+        self.assertEqual(len(nz), 1)
+        self.assertEqual(nz[0]["delta"], 15.0)
+
 
 if __name__ == "__main__":
     unittest.main()

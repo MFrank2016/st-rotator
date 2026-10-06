@@ -333,11 +333,11 @@ class ConsoleState:
         cons["series"] = self.quota.credits.series(hours=24)
         return {"accounts": accounts, "consumption": cons}
 
-    def credits_samples_payload(self, *, limit: int = 200) -> dict[str, Any]:
+    def credits_samples_payload(self, *, limit: int = 200, nonzero: bool = False) -> dict[str, Any]:
         """最近的积分采样原始值（含消耗增量），用于排查尖峰来源。"""
         if self.quota is None:
             return {"samples": []}
-        return {"samples": self.quota.credits.samples(limit=limit)}
+        return {"samples": self.quota.credits.samples(limit=limit, nonzero=nonzero)}
 
     # ------------------------------------------------------------ 写操作
 
@@ -730,9 +730,8 @@ class ConsoleState:
                     return UiResponse.json(self.usage_payload(hours=hours))
                 if path == "/api/credits/samples":
                     limit = _clamp_int(_first_int(query, "limit", 200), 200, 1, 2000)
-                    return UiResponse.json(self.credits_samples_payload(limit=limit))
-                    hours = _clamp_int(_first_int(query, "hours", 24), 24, 1, 720)
-                    return UiResponse.json(self.usage_payload(hours=hours))
+                    nonzero = bool(_first_int(query, "nonzero", 0))
+                    return UiResponse.json(self.credits_samples_payload(limit=limit, nonzero=nonzero))
                 if path == "/api/logs":
                     cursor = _first_int(query, "cursor", 0)
                     return UiResponse.json(self.logs_since(cursor))
