@@ -458,6 +458,24 @@ class CreditTracker:
                 result[pool][label] = sum(b.get(pool, 0.0) for h, b in buckets if h >= start)
         return result
 
+    def series(self, *, hours: int = 24) -> list[dict[str, Any]]:
+        """返回最近 N 小时按池的消耗序列（用于图表曲线）。"""
+        hours = max(1, min(int(hours), self._hours))
+        now_hour = self._hour_of(self._clock())
+        start = now_hour - (hours - 1) * 3600
+        with self._lock:
+            buckets = dict(self._buckets)
+        out: list[dict[str, Any]] = []
+        for i in range(hours):
+            h = start + i * 3600
+            b = buckets.get(h) or {}
+            out.append({
+                "hour": h,
+                "general": b.get("general", 0.0),
+                "flash_lite": b.get("flash_lite", 0.0),
+            })
+        return out
+
 
 class QuotaService:
     """按账号查询余量，带缓存与容错。"""

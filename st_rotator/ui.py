@@ -329,7 +329,9 @@ class ConsoleState:
                 "general": _pair_payload(aq.general),
                 "flash_lite": _pair_payload(aq.flash_lite),
             })
-        return {"accounts": accounts, "consumption": self.quota.credits.snapshot()}
+        cons = dict(self.quota.credits.snapshot())
+        cons["series"] = self.quota.credits.series(hours=24)
+        return {"accounts": accounts, "consumption": cons}
 
     # ------------------------------------------------------------ 写操作
 
@@ -811,10 +813,10 @@ def _pair_payload(pair: WindowPair | None) -> dict[str, Any] | None:
     return {"h5": _window_payload(pair.h5), "d7": _window_payload(pair.d7)}
 
 
-def _empty_consumption() -> dict[str, dict[str, float]]:
+def _empty_consumption() -> dict[str, Any]:
     """没有配额服务时返回全 0 的消耗结构，保持前端字段稳定。"""
     zeros = {k: 0.0 for k in ("h1", "h5", "h24", "d7", "d30")}
-    return {"general": dict(zeros), "flash_lite": dict(zeros)}
+    return {"general": dict(zeros), "flash_lite": dict(zeros), "series": []}
 
 
 # ---------------------------------------------------------------- 开窗

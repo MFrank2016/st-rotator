@@ -70,7 +70,8 @@ class DashboardCreditsTest(unittest.TestCase):
 
     def test_chart_beautified(self):
         # 输入=蓝、输出=橙；自定义悬停 tooltip；横坐标小时标签。
-        for text in ['fill="#5b93ff"', 'fill="#f0a429"', 'id="usage-tip"', 'closest("g[data-tip]")']:
+        for text in ['fill="#5b93ff"', 'fill="#f0a429"', 'id="usage-tip"', 'closest("g[data-tip]")',
+                     '"#34d399"', '"#a78bfa"', "function tipText"]:
             self.assertIn(text, DASHBOARD_HTML)
 
 

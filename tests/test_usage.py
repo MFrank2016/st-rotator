@@ -80,6 +80,17 @@ class CreditTrackerTest(unittest.TestCase):
         self.assertEqual(snap["flash_lite"]["d7"], 100.0)
         self.assertEqual(snap["flash_lite"]["d30"], 100.0)
 
+    def test_series_by_hour(self) -> None:
+        clock = _Clock(0.0)
+        tracker = CreditTracker(hours=48, clock=clock)
+        tracker.note("a", "general", reset_at=1, used=0.0)
+        clock.t = 3600.0
+        tracker.note("a", "general", reset_at=1, used=30.0)  # 小时 1 差值 30
+        series = tracker.series(hours=2)
+        self.assertEqual(len(series), 2)
+        self.assertEqual(series[-1]["general"], 30.0)
+        self.assertEqual(series[-1]["flash_lite"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

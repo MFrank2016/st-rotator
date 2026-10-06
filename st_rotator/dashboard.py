@@ -501,6 +501,7 @@ async function refreshQuota(force) {
   await fetchQuota(force);
   renderKpis(lastState);
   renderPool(lastState);
+  renderUsage();
 }
 
 async function fetchUsage() {
@@ -513,7 +514,12 @@ async function refreshUsage() {
   renderUsage();
 }
 
-/* 近 24 小时 token 消耗柱状图（内联 SVG，无 CDN）：输入=蓝、输出=橙，堆叠；横坐标标小时。 */
+/* 近 24 小时：柱=token（蓝输入/橙输出），线=积分消耗（绿=通用/紫=专属，右轴）。 */
+function tipText(hh, b, gv, fv) {
+  return hh + ":00　token 输入 " + fmtInt(b.prompt) + " / 输出 " + fmtInt(b.completion) + " / 合计 " + fmtInt(b.total) +
+    "　·　积分 通用 " + fmtInt(Math.round(gv)) + " / 专属 " + fmtInt(Math.round(fv));
+}
+
 function renderUsage() {
   var host = $("usage-chart");
   if (!host) return;
@@ -522,29 +528,52 @@ function renderUsage() {
   if (!data.length) { host.innerHTML = '<div class="empty">暂无数据</div>'; if (note) note.textContent = ""; return; }
   var max = 0;
   data.forEach(function (b) { if (b.total > max) max = b.total; });
-  if (max <= 0) { host.innerHTML = '<div class="empty">近 24 小时暂无 token 消耗</div>'; if (note) note.textContent = ""; return; }
+  var consSeries = (S.consumption && S.consumption.series) || [];
+  var consByHour = {};
+  consSeries.forEach(function (c) { consByHour[c.hour] = c; });
+  var creditMax = 0;
+  data.forEach(function (b) {
+    var c = consByHour[b.hour];
+    if (c) creditMax = Math.max(creditMax, c.general || 0, c.flash_lite || 0);
+  });
+  if (max <= 0 && creditMax <= 0) { host.innerHTML = '<div class="empty">近 24 小时暂无数据</div>'; if (note) note.textContent = ""; return; }
   var W = 960, H = 176, padL = 8, padR = 8, padT = 10, baseY = 146, n = data.length;
   var bw = (W - padL - padR) / n;
-  var bars = "", labels = "";
+  var bars = "", labels = "", ptsG = [], ptsF = [];
   data.forEach(function (b, i) {
     var x = padL + i * bw;
-    var totalH = (baseY - padT) * (b.total / max);
-    var promptH = b.total > 0 ? totalH * (b.prompt / b.total) : 0;
-    var completionH = totalH - promptH;
     var t = new Date(b.hour * 1000);
     var hh = ("0" + t.getHours()).slice(-2);
-    var tip = hh + ":00　输入 " + fmtInt(b.prompt) + " / 输出 " + fmtInt(b.completion) + " / 合计 " + fmtInt(b.total);
-    bars += '<g data-tip="' + esc(tip) + '">' +
+    var c = consByHour[b.hour];
+    var gv = c ? (c.general || 0) : 0;
+    var fv = c ? (c.flash_lite || 0) : 0;
+    var totalH = max > 0 ? (baseY - padT) * (b.total / max) : 0;
+    var promptH = b.total > 0 ? totalH * (b.prompt / b.total) : 0;
+    var completionH = totalH - promptH;
+    bars += '<g data-tip="' + esc(tipText(hh, b, gv, fv)) + '">' +
+      '<rect x="' + x.toFixed(1) + '" y="' + padT + '" width="' + bw.toFixed(1) + '" height="' + (baseY - padT) + '" fill="transparent"/>' +
       '<rect x="' + (x + bw * 0.1).toFixed(1) + '" y="' + (baseY - promptH - completionH).toFixed(1) + '" width="' + (bw * 0.8).toFixed(1) + '" height="' + Math.max(0, completionH).toFixed(1) + '" fill="#f0a429"/>' +
       '<rect x="' + (x + bw * 0.1).toFixed(1) + '" y="' + (baseY - promptH).toFixed(1) + '" width="' + (bw * 0.8).toFixed(1) + '" height="' + Math.max(0, promptH).toFixed(1) + '" fill="#5b93ff"/></g>';
+    if (creditMax > 0) {
+      var cx = x + bw / 2;
+      ptsG.push([cx, baseY - (gv / creditMax) * (baseY - padT)]);
+      ptsF.push([cx, baseY - (fv / creditMax) * (baseY - padT)]);
+    }
     if (t.getHours() % 3 === 0) {
       labels += '<text x="' + (x + bw / 2).toFixed(1) + '" y="' + (baseY + 18) + '" fill="#93a0b4" font-size="11" text-anchor="middle">' + hh + '</text>';
     }
   });
+  function poly(pts, color) {
+    if (pts.length < 2) return "";
+    return '<polyline fill="none" stroke="' + color + '" stroke-width="2" style="pointer-events:none" points="' +
+      pts.map(function (p) { return p[0].toFixed(1) + "," + p[1].toFixed(1); }).join(" ") + '"/>';
+  }
+  var lines = creditMax > 0 ? poly(ptsG, "#34d399") + poly(ptsF, "#a78bfa") : "";
   host.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:auto;display:block">' +
-    '<line x1="' + padL + '" y1="' + baseY + '" x2="' + (W - padR) + '" y2="' + baseY + '" stroke="#2a3240"/>' + bars + labels + '</svg>';
+    '<line x1="' + padL + '" y1="' + baseY + '" x2="' + (W - padR) + '" y2="' + baseY + '" stroke="#2a3240"/>' +
+    bars + lines + labels + '</svg>';
   var sum = data.reduce(function (a, b) { return a + b.total; }, 0);
-  if (note) note.textContent = "合计 " + fmtInt(sum) + " tokens（蓝=输入，橙=输出）";
+  if (note) note.textContent = "柱=token 合计 " + fmtInt(sum) + "（蓝=输入，橙=输出） · 线=积分消耗（绿=通用，紫=专属，右轴）";
   host.onmousemove = function (e) {
     var tip = $("usage-tip");
     if (!tip) return;

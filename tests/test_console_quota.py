@@ -47,6 +47,7 @@ class ConsoleQuotaTest(unittest.TestCase):
         self.assertAlmostEqual(acct["flash_lite"]["d7"]["remaining"], 600000.0)
         self.assertNotIn("password", str(payload))
         self.assertIn("consumption", payload)
+        self.assertIn("series", payload["consumption"])
 
     def test_no_service_returns_empty(self):
         cfg = Config.from_dict({"base_url": "http://127.0.0.1:9/v1", "accounts": [{"name": "a", "api_keys": ["k"]}]})
