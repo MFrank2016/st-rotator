@@ -452,7 +452,8 @@ function fmtCountdown(resetAt, longForm) {
   return longForm ? (d + " d " + h + " h " + m + " m") : (h + " h " + m + " m");
 }
 
-function minReset(a, b) { if (!b) return a; return a ? Math.min(a, b) : b; }
+/* 只取“未来”的重置时间：个别账号窗口刚过期时 reset_at 会短暂落在过去，若计入会把倒计时显示成 —。 */
+function minReset(a, b) { var now = Math.floor(Date.now() / 1000); if (!b || b <= now) return a; return a ? Math.min(a, b) : b; }
 
 function quotaAggregate() {
   var agg = {g5: 0, g7: 0, f5: 0, f7: 0, reset5: null, reset7: null, ok: 0};

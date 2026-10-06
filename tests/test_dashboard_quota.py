@@ -80,6 +80,11 @@ class DashboardSamplesTest(unittest.TestCase):
         for text in ["积分采样明细（仅有差异）", 'id="samples"', "/api/credits/samples?nonzero=1", "function renderSamples"]:
             self.assertIn(text, DASHBOARD_HTML)
 
+    def test_reset_countdown_ignores_past(self):
+        # 倒计时只统计“未来”的 reset_at，避免个别账号窗口刚过期时整张卡显示成 —。
+        self.assertIn("function minReset(a, b)", DASHBOARD_HTML)
+        self.assertIn("b <= now", DASHBOARD_HTML)
+
 
 if __name__ == "__main__":
     unittest.main()
