@@ -8,6 +8,7 @@
   "connect_timeout": 10,
   "acquire_timeout": 120,
   "max_total_wait": 120,
+  "acquire_fail_fast": 15,
   "retry_backoff": 0.5,
   "max_retry_backoff": 8,
 

@@ -311,48 +311,6 @@ def _parse_model_list(payload: Any) -> list[dict[str, Any]]:
     return models
 
 
-# ------------------------------------------------------------ 智能一换一
-# 触发条件：账号因「套餐额度耗尽」(model 类错误且报文含 entitlement/quota/exhausted/额度)
-# 被判冷却。此时该账号的推广池（如 sensenova-6.8-flash-lite）通常还有余量，
-# 并发烧推广池（长文 + 大图），按官方活动 1 积分推广池换 1 积分通用池，
-# 推动额度回补，比干等恢复窗口更快让账号复活。
-_FX_KEYWORDS = ("entitlement", "exhausted", "quota", "额度", "耗尽")
-_FX_LOCK = threading.Lock()
-_FX_LAST: dict[str, float] = {}   # account -> 上次触发时刻（time.time）
-_FX_ACTIVE = 0                    # 进行中烧点任务数（全局护栏）
-
-
-def fx_keyword_hit(detail: str) -> bool:
-    """报文里确实在说「额度耗尽」才触发；只是模型不在套餐列表则不烧钱。"""
-    low = (detail or "").lower()
-    return any(k in low for k in _FX_KEYWORDS)
-
-
-def _noise_png_b64(size: int) -> str:
-    """纯标准库生成 size×size 随机噪声 PNG 的 base64。噪声几乎不可压缩，图够"大"。"""
-    import base64
-    import os
-    import struct
-    import zlib
-
-    def chunk(tag: bytes, data: bytes) -> bytes:
-        return (
-            struct.pack(">I", len(data))
-            + tag
-            + data
-            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-        )
-
-    raw = b"".join(b"\x00" + os.urandom(size * 3) for _ in range(size))
-    png = (
-        b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
-        + chunk(b"IDAT", zlib.compress(raw, 1))
-        + chunk(b"IEND", b"")
-    )
-    return base64.b64encode(png).decode("ascii")
-
-
 class StRotator:
     """带多 Key 轮换与限流自愈的 OpenAI 兼容客户端。
 
