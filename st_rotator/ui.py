@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from .client import StRotator
-from .config import STRATEGIES, Config, ConfigStore, RateControlConfig, next_account_name
+from .config import STRATEGIES, Config, ConfigStore, FlashLiteExchangeConfig, RateControlConfig, next_account_name
 from .dashboard import DASHBOARD_HTML
 from .errors import ConfigError, RotatorError
 from .logs import LogBuffer
@@ -228,6 +228,19 @@ class ConsoleState:
                 "max_attempts": self.config.max_attempts,
                 "strategies": list(STRATEGIES),
                 "rate_modes": list(RateControlConfig.MODES),
+                "flash_lite": {
+                    "enabled": self.config.flash_lite_exchange.enabled,
+                    "model": self.config.flash_lite_exchange.model,
+                    "concurrency": self.config.flash_lite_exchange.concurrency,
+                    "requests_per_trigger": self.config.flash_lite_exchange.requests_per_trigger,
+                    "min_interval_s": self.config.flash_lite_exchange.min_interval_s,
+                    "long_text_max_tokens": self.config.flash_lite_exchange.long_text_max_tokens,
+                    "image_enabled": self.config.flash_lite_exchange.image_enabled,
+                    "image_size": self.config.flash_lite_exchange.image_size,
+                    "multi_image_count": self.config.flash_lite_exchange.multi_image_count,
+                    "yield_to_serve": self.config.flash_lite_exchange.yield_to_serve,
+                    "min_available_mb": self.config.flash_lite_exchange.min_available_mb,
+                },
             },
         }
 
@@ -426,6 +439,49 @@ class ConsoleState:
                 setattr(self.config, field_name, converted)
                 self.store.set_scalar(field_name, converted)
             changes.append(f"{label}={converted}")
+
+        fx_payload = payload.get("flash_lite")
+        if fx_payload is not None:
+            if not isinstance(fx_payload, dict):
+                return UiResponse.error("flash_lite 必须是对象")
+            fx_cfg = self.config.flash_lite_exchange
+            fx_changes: dict[str, Any] = {}
+            for f in ("enabled", "image_enabled", "yield_to_serve"):
+                if f in fx_payload:
+                    fx_changes[f] = bool(fx_payload[f])
+            fx_num_fields = (
+                ("concurrency", int, 1, 64, "一换一并发"),
+                ("requests_per_trigger", int, 1, 2048, "一换一单轮上限"),
+                ("min_interval_s", float, 60.0, 86400.0, "一换一触发间隔"),
+                ("long_text_max_tokens", int, 128, 16384, "一换一长文预算"),
+                ("image_size", int, 256, 2048, "一换一大图边长"),
+                ("multi_image_count", int, 1, 9, "一换一每请求图片数"),
+                ("min_available_mb", float, 0.0, 8192.0, "一换一内存下限(MB)"),
+            )
+            for f, typ, lo, hi, label in fx_num_fields:
+                if f not in fx_payload:
+                    continue
+                try:
+                    v = typ(fx_payload[f])
+                except (TypeError, ValueError):
+                    return UiResponse.error(f"{label}不是合法数字：{fx_payload[f]!r}")
+                if not lo <= v <= hi:
+                    return UiResponse.error(f"{label}需在 {lo:g}~{hi:g} 之间")
+                fx_changes[f] = v
+            fx_changes = {k: v for k, v in fx_changes.items() if getattr(fx_cfg, k) != v}
+            if fx_changes:
+                # 先在纯数据上整体校验（不改内存态），通过后再落盘 + 生效
+                candidate = {f: getattr(fx_cfg, f) for f in FlashLiteExchangeConfig.__dataclass_fields__}
+                candidate.update(fx_changes)
+                try:
+                    FlashLiteExchangeConfig.from_dict(candidate)
+                except ConfigError as exc:
+                    return UiResponse.error(str(exc))
+                with self.lock:
+                    for k, v in fx_changes.items():
+                        setattr(fx_cfg, k, v)
+                    self.store.set_section("flash_lite_exchange", fx_changes)
+                changes.append("一换一 " + "，".join(f"{k}:{v}" for k, v in fx_changes.items()))
 
         if not changes:
             return UiResponse.json({"ok": True, "message": "没有需要改动的参数"})
