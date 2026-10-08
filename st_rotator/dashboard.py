@@ -1031,10 +1031,9 @@ function onModelTestEvent(name, obj) {
       modelTestMuted(card, (obj.latency_ms == null ? "—" : obj.latency_ms) + " ms");
     }
   } else if (name === "error") {
-    if (card) {
-      modelTestPill(card, "invalid", "失败");
-      modelTestMuted(card, obj.message || "未知错误");
-    }
+    card = card || modelTestCard(obj.account);
+    modelTestPill(card, "invalid", "失败");
+    modelTestMuted(card, obj.message || "未知错误");
   } else if (name === "complete") {
     var run = $("modeltest-run");
     run.disabled = false;

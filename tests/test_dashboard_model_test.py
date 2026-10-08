@@ -49,6 +49,11 @@ class DashboardModelTestTest(unittest.TestCase):
         # 面板绝不渲染明文 api_keys（防误把真实 Key 拼进页面）。
         self.assertNotIn("api_keys", DASHBOARD_HTML)
 
+    def test_error_event_creates_card_when_missing(self):
+        # 账号在首个 token 前就失败（如 401/网络错误）时没有 start 事件，
+        # error 分支必须兜底建卡，否则该账号在结果区完全不显示。
+        self.assertIn("card = card || modelTestCard(obj.account);", DASHBOARD_HTML)
+
 
 if __name__ == "__main__":
     unittest.main()
