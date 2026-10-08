@@ -873,6 +873,7 @@ function updateModelMeta() {
 
 function renderPool(state) {
   var keys = state.keys || [];
+  var as = (state.account_status) || {};
   if (!keys.length) {
     $("pool").innerHTML = '<div class="empty">池里还没有 Key。在下面添加至少一把才能对外提供服务。</div>';
   } else {
@@ -892,7 +893,11 @@ function renderPool(state) {
       var general = q && q.status === "ok" ? q.general : null;
       var flash = q && q.status === "ok" ? q.flash_lite : null;
       return "<tr>" +
-        "<td>" + esc(k.account) + "</td>" +
+        "<td>" + esc(k.account) +
+          (as[k.account] && as[k.account].status === "password_error"
+            ? ' <span class="pill invalid" title="' + esc(as[k.account].message || "登录失败：密码错误") + '">密码错误</span>'
+            : "") +
+        "</td>" +
         '<td class="mono">' + esc(k.key) + "</td>" +
         '<td><span class="pill ' + esc(k.status) + '">' + esc(statusText) + "</span></td>" +
         '<td class="num">' + esc(cooldown) + "</td>" +

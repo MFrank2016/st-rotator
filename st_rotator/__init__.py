@@ -19,7 +19,14 @@
 """
 
 from .client import StRotator, classify, extract_error, parse_retry_after
-from .config import AccountConfig, Config, ConfigStore, CooldownConfig, RateControlConfig
+from .config import (
+    AccountConfig,
+    AutoRenewConfig,
+    Config,
+    ConfigStore,
+    CooldownConfig,
+    RateControlConfig,
+)
 from .errors import (
     AllKeysInvalid,
     ApiError,
@@ -43,6 +50,7 @@ __all__ = [
     "AllKeysInvalid",
     "ApiError",
     "ApiKey",
+    "AutoRenewConfig",
     "Config",
     "ConfigError",
     "ConfigStore",

@@ -35,6 +35,13 @@
     "server_error": 2
   },
 
+  "auto_renew": {
+    "enabled": false,
+    "interval_seconds": 3600,
+    "key_name": "auto",
+    "key_type": "API_KEY_TYPE_TOKEN_PLAN"
+  },
+
   "accounts": [
     {
       "name": "账号1",

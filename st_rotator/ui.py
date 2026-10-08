@@ -49,6 +49,7 @@ from .config import STRATEGIES, Config, ConfigStore, RateControlConfig, next_acc
 from .dashboard import DASHBOARD_HTML, LOGIN_HTML, LOGIN_HTML_INVALID
 from .errors import ConfigError, RotatorError
 from .logs import LogBuffer
+from .autorenew import AutoRenewWorker
 from .quota import QuotaService, QuotaWindow, WindowPair
 from .version import __version__
 
@@ -245,6 +246,7 @@ class ConsoleState:
     log_file: str | None = None
     metrics: GatewayMetrics = field(default_factory=GatewayMetrics)
     quota: QuotaService | None = None
+    auto_renew: AutoRenewWorker | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     # ------------------------------------------------------------ 只读
@@ -296,6 +298,9 @@ class ConsoleState:
             "models": self.rotator.available_models(),
             "default_model": self.config.default_model,
             "log_file": self.log_file,
+            "account_status": self.auto_renew.account_status()
+            if self.auto_renew
+            else {},
             "options": {
                 "strategy": self.config.strategy,
                 "rate_mode": self.config.rate_control.mode,

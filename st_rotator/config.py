@@ -150,6 +150,76 @@ class CooldownConfig:
 
 
 @dataclass
+class AutoRenewConfig:
+    """定时检测 Key 失效并自动续期（轮换）的配置。
+
+    Attributes:
+        enabled: 是否启用定时检测。
+        interval_seconds: 两次检测之间的间隔秒数。
+        key_name: 续期创建的新 Key 名称（仅允许中文、字母、数字、连字符，≤64）。
+        key_type: 续期 API 对应的 Key 类型（Token Plan / 按量计费）。
+    """
+
+    enabled: bool = False
+    interval_seconds: float = 3600.0
+    key_name: str = "auto"
+    key_type: str = "API_KEY_TYPE_TOKEN_PLAN"
+
+    KEY_TYPES = ("API_KEY_TYPE_TOKEN_PLAN", "API_KEY_TYPE_METERED")
+    _KEY_NAME_PATTERN = re.compile(r"^[A-Za-z0-9\u4e00-\u9fa5-]+$")
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigError(
+                f"auto_renew.enabled 必须是布尔值，当前为 {self.enabled!r}"
+            )
+        if isinstance(self.interval_seconds, bool) or not isinstance(
+            self.interval_seconds, (int, float)
+        ):
+            raise ConfigError(
+                f"auto_renew.interval_seconds 必须是数值，当前为 {self.interval_seconds!r}"
+            )
+        if self.interval_seconds <= 0:
+            raise ConfigError("auto_renew.interval_seconds 必须 > 0")
+        if not isinstance(self.key_name, str):
+            raise ConfigError(
+                f"auto_renew.key_name 必须是字符串，当前为 {self.key_name!r}"
+            )
+        self.key_name = self.key_name.strip()
+        if not self.key_name:
+            raise ConfigError("auto_renew.key_name 不能为空")
+        if len(self.key_name) > 64:
+            raise ConfigError("auto_renew.key_name 长度不能超过 64")
+        if not self._KEY_NAME_PATTERN.match(self.key_name):
+            raise ConfigError("auto_renew.key_name 仅允许中文、字母、数字与连字符")
+        if not isinstance(self.key_type, str):
+            raise ConfigError(
+                f"auto_renew.key_type 必须是字符串，当前为 {self.key_type!r}"
+            )
+        if self.key_type not in self.KEY_TYPES:
+            raise ConfigError(
+                f"auto_renew.key_type 必须是 {self.KEY_TYPES} 之一，当前为 {self.key_type!r}"
+            )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any] | None) -> "AutoRenewConfig":
+        data = dict(data or {})
+        unknown = set(data) - set(cls.__dataclass_fields__)
+        if unknown:
+            raise ConfigError(f"auto_renew 存在未知字段: {sorted(unknown)}")
+        return cls(**data)
+
+    def to_dict(self) -> dict[str, Any]:
+        """导出为可序列化字典。"""
+        return {
+            "enabled": self.enabled,
+            "interval_seconds": self.interval_seconds,
+            "key_name": self.key_name,
+            "key_type": self.key_type,
+        }
+
+
+@dataclass
 class AccountConfig:
     """一个账号（可含多把 Key）。
 
@@ -248,6 +318,9 @@ class Config:
     strategy: str = "round_robin"
     cooldown: CooldownConfig = field(default_factory=CooldownConfig)
 
+    # 定时检测 Key 失效并自动续期（轮换）
+    auto_renew: AutoRenewConfig = field(default_factory=AutoRenewConfig)
+
     # 连接池
     max_connections: int = 100
     max_keepalive: int = 20
@@ -291,8 +364,9 @@ class Config:
             raise ConfigError("配置缺少 accounts 字段")
         cooldown = CooldownConfig.from_dict(data.pop("cooldown", None))
         rate_control = RateControlConfig.from_dict(data.pop("rate_control", None))
+        auto_renew = AutoRenewConfig.from_dict(data.pop("auto_renew", None))
         headers = {str(k): expand_env(str(v)) for k, v in (data.pop("extra_headers", None) or {}).items()}
-        known = set(cls.__dataclass_fields__) - {"accounts", "cooldown", "rate_control", "extra_headers"}
+        known = set(cls.__dataclass_fields__) - {"accounts", "cooldown", "rate_control", "extra_headers", "auto_renew"}
         unknown = set(data) - known
         if unknown:
             raise ConfigError(f"配置存在未知字段: {sorted(unknown)}")
@@ -301,6 +375,7 @@ class Config:
             accounts=accounts,
             cooldown=cooldown,
             rate_control=rate_control,
+            auto_renew=auto_renew,
             extra_headers=headers,
             **{k: expand_env(v) if isinstance(v, str) else v for k, v in data.items()},
         )
@@ -332,6 +407,7 @@ class Config:
                 "mode": self.rate_control.mode,
                 "qps": self.rate_control.qps,
             },
+            "auto_renew": self.auto_renew.to_dict(),
             "accounts": [
                 {
                     "name": a.name,
@@ -473,6 +549,19 @@ class ConfigStore:
                 item["user"] = user
                 item["phone"] = phone
                 item["password"] = password
+                self.reload()
+                return
+        raise ConfigError(f"账号 {name} 不存在")
+
+    def replace_account_keys(self, name: str, keys: Sequence[str]) -> None:
+        """把某账号的 api_keys 整体替换为指定列表（凭据/占位符/其余字段原样保留），然后 reload。"""
+        cleaned = [k.strip() for k in (keys or []) if k.strip()]
+        if not cleaned:
+            raise ConfigError(f"账号 {name} 的 api_keys 不能为空")
+        accounts = self._accounts_raw()
+        for item in accounts:
+            if isinstance(item, dict) and item.get("name") == name:
+                item["api_keys"] = cleaned
                 self.reload()
                 return
         raise ConfigError(f"账号 {name} 不存在")

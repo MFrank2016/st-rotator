@@ -19,12 +19,15 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from .client import StRotator
 from .config import Config, ConfigStore, RateControlConfig
 from .errors import ApiError, NoAvailableKey, RotationExhausted, RotatorError, StreamInterrupted
 from .keypool import mask_key
+
+if TYPE_CHECKING:  # 仅类型标注用，运行时走函数内 lazy import
+    from .autorenew import AutoRenewWorker
 
 # ---------------------------------------------------------------- 输出工具
 
@@ -378,6 +381,66 @@ def build_quota_service(config: Config) -> QuotaService | None:
     return QuotaService(config, sampler_interval=300.0)
 
 
+def build_auto_renew_persist(
+    store: ConfigStore, rotator: StRotator, *, lock: threading.Lock
+) -> Callable[[str, Sequence[str], str], None]:
+    """构造「轮换成功后落池 + 落盘」的 persist 回调。
+
+    铁律顺序（勿改）：先在内存池加入新 Key → 再移除旧 Key → 整体替换 store 里该账号的
+    Key 列表 → 把 reload 后的内存配置拷回 ``rotator.config.accounts`` → 最后落盘保存。
+    顺序反了会出现「池里有两套 Key」或「配置与池脱节」的中间态。
+    """
+
+    def persist(account_name: str, old_keys: Sequence[str], new_key: str) -> None:
+        with lock:
+            acct = next(a for a in rotator.config.accounts if a.name == account_name)
+            rotator.pool.add_key(
+                new_key,
+                account=account_name,
+                rpm_limit=acct.rpm_limit,
+                max_concurrency=acct.max_concurrency,
+                weight=acct.weight,
+            )
+            for old in old_keys:
+                rotator.pool.remove_key(old)
+            store.replace_account_keys(account_name, [new_key])
+            rotator.config.accounts = list(store.config.accounts)
+            store.save()
+
+    return persist
+
+
+def build_auto_renew(
+    config: Config,
+    store: ConfigStore,
+    rotator: StRotator,
+    *,
+    lock: threading.Lock,
+    sink: Callable[[str], None],
+) -> AutoRenewWorker | None:
+    """仅当 auto_renew.enabled 且存在配置了 user+password 的账号时，创建并启动 AutoRenewWorker。"""
+    from .autorenew import AutoRenewWorker, HttpKeyManager
+    from .quota import HttpQuotaTransport
+
+    if not config.auto_renew.enabled:
+        return None
+    if not any(a.user and a.password for a in config.accounts):
+        return None
+    worker = AutoRenewWorker(
+        accounts=lambda: rotator.config.accounts,
+        probe=rotator.probe_key,
+        login=HttpQuotaTransport().login,
+        keys=HttpKeyManager(),
+        persist=build_auto_renew_persist(store, rotator, lock=lock),
+        key_name=config.auto_renew.key_name,
+        key_type=config.auto_renew.key_type,
+        interval=config.auto_renew.interval_seconds,
+        log=sink,
+    )
+    worker.start()
+    return worker
+
+
 def cmd_ui(args: argparse.Namespace) -> int:
     """启动网关 + 图形控制台，并自动开一个无地址栏的应用窗口。"""
     from .proxy import serve
@@ -397,6 +460,9 @@ def cmd_ui(args: argparse.Namespace) -> int:
         buffer=buffer,
         log_file=args.log_file or default_log,
         quota=build_quota_service(config),
+    )
+    console.auto_renew = build_auto_renew(
+        config, store, rotator, lock=console.lock, sink=sink
     )
 
     sink(
@@ -434,6 +500,8 @@ def cmd_ui(args: argparse.Namespace) -> int:
             on_ready=on_ready,
         )
     finally:
+        if console.auto_renew:
+            console.auto_renew.stop()
         rotator.close()
     return 0
 
@@ -498,6 +566,9 @@ def cmd_tray(args: argparse.Namespace) -> int:
         log_file=args.log_file or default_log,
         quota=build_quota_service(config),
     )
+    console.auto_renew = build_auto_renew(
+        config, store, rotator, lock=console.lock, sink=sink
+    )
 
     try:
         server = create_server(
@@ -538,6 +609,8 @@ def cmd_tray(args: argparse.Namespace) -> int:
         sink("[托盘] 收到中断信号")
     finally:
         sink("[托盘] 正在停止网关…")
+        if console.auto_renew:
+            console.auto_renew.stop()
         server.shutdown()
         server.server_close()
         gateway.join(timeout=5)

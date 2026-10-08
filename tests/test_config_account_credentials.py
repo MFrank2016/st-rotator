@@ -76,5 +76,57 @@ class SetAccountCredentialsTest(unittest.TestCase):
                 store.set_account_credentials("不存在", user="u", phone="", password="p")
 
 
+class ReplaceAccountKeysTest(unittest.TestCase):
+    ENV = {"SN_KEY_1": "sk-abc12345", "SN_USER": "u1", "SN_PW": "p1"}
+
+    def _write_env_cfg(self, tmp: str) -> Path:
+        path = Path(tmp) / "config.json"
+        path.write_text(
+            json.dumps(
+                _cfg(
+                    api_keys=["${SN_KEY_1}"],
+                    user="${SN_USER}",
+                    phone="138",
+                    password="${SN_PW}",
+                )
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_replaces_keys_and_persists(self):
+        with mock.patch.dict(os.environ, self.ENV):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = self._write_env_cfg(tmp)
+                store = ConfigStore.load(path)
+                before = json.loads(path.read_text(encoding="utf-8"))
+                store.replace_account_keys("账号1", [" sk-new ", "", "  "])
+                store.save()
+                reloaded = json.loads(path.read_text(encoding="utf-8"))
+                acct = reloaded["accounts"][0]
+                self.assertEqual(acct["api_keys"], ["sk-new"])
+                self.assertEqual(acct["user"], "${SN_USER}")
+                self.assertEqual(acct["password"], "${SN_PW}")
+                self.assertEqual(store.config.accounts[0].api_keys, ["sk-new"])
+                expected = {**before["accounts"][0], "api_keys": ["sk-new"]}
+                self.assertEqual(reloaded["accounts"][0], expected)
+
+    def test_unknown_account_raises(self):
+        with mock.patch.dict(os.environ, self.ENV):
+            with tempfile.TemporaryDirectory() as tmp:
+                store = ConfigStore.load(self._write_env_cfg(tmp))
+                with self.assertRaises(ConfigError):
+                    store.replace_account_keys("不存在", ["sk-new"])
+
+    def test_empty_keys_raises(self):
+        with mock.patch.dict(os.environ, self.ENV):
+            with tempfile.TemporaryDirectory() as tmp:
+                store = ConfigStore.load(self._write_env_cfg(tmp))
+                with self.assertRaises(ConfigError):
+                    store.replace_account_keys("账号1", [])
+                with self.assertRaises(ConfigError):
+                    store.replace_account_keys("账号1", ["", "  "])
+
+
 if __name__ == "__main__":
     unittest.main()
