@@ -24,6 +24,7 @@ WorkBuddy / 各类 Agent 框架只认「OpenAI 兼容端点 + API Key」，没�
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -35,7 +36,14 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .client import StRotator, note_serve_begin, note_serve_end
-from .errors import AllKeysInvalid, ApiError, NoAvailableKey, RotationExhausted, RotatorError
+from .errors import (
+    AllKeysInvalid,
+    ApiError,
+    NoAvailableKey,
+    RotationExhausted,
+    RotatorError,
+)
+from . import modeltest
 from . import ui
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -46,6 +54,7 @@ CHAT_PATH = "/v1/chat/completions"
 MODELS_PATH = "/v1/models"
 HEALTH_PATHS = ("/healthz", "/health")
 STATS_PATH = "/stats"
+MODEL_TEST_PATH = "/api/model-test"
 
 MAX_BODY_BYTES = 32 * 1024 * 1024
 
@@ -53,7 +62,9 @@ SESSION_COOKIE = "st_rotator_session"
 
 
 def _session_value(token: str) -> str:
-    return hmac.new(token.encode("utf-8"), b"st-rotator-console-session", hashlib.sha256).hexdigest()
+    return hmac.new(
+        token.encode("utf-8"), b"st-rotator-console-session", hashlib.sha256
+    ).hexdigest()
 
 
 def _constant_time_equals(supplied: str, expected: str) -> bool:
@@ -65,6 +76,7 @@ def _constant_time_equals(supplied: str, expected: str) -> bool:
 
 class LoginThrottle:
     """登录失败限流：同一来源在窗口内失败次数过多时暂时拒绝。"""
+
     _MAX_TRACKED_KEYS = 4096
 
     def __init__(
@@ -137,9 +149,13 @@ def _has_parent_segment(path: str) -> bool:
     return any(seg == ".." for seg in decoded.replace("\\", "/").split("/"))
 
 
-def error_payload(message: str, err_type: str = "upstream_error", code: str | None = None) -> dict:
+def error_payload(
+    message: str, err_type: str = "upstream_error", code: str | None = None
+) -> dict:
     """OpenAI 风格的错误结构。"""
-    return {"error": {"message": message, "type": err_type, "code": code, "param": None}}
+    return {
+        "error": {"message": message, "type": err_type, "code": code, "param": None}
+    }
 
 
 def _passthrough_error(status: int, body: str) -> dict:
@@ -221,7 +237,11 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         if not self.token:
             return "open"
         header = self.headers.get("Authorization") or ""
-        supplied = header[7:].strip() if header.lower().startswith("bearer ") else header.strip()
+        supplied = (
+            header[7:].strip()
+            if header.lower().startswith("bearer ")
+            else header.strip()
+        )
         if _constant_time_equals(supplied, self.token):
             return "bearer"
         if not allow_cookie:
@@ -231,14 +251,22 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             name, sep, value = pair.partition("=")
             if not sep:
                 continue
-            if name.strip() == SESSION_COOKIE and _constant_time_equals(value.strip(), expected):
+            if name.strip() == SESSION_COOKIE and _constant_time_equals(
+                value.strip(), expected
+            ):
                 return "cookie"
         return None
 
     def _authorized(self, *, allow_cookie: bool = False) -> bool:
         return self._auth_kind(allow_cookie=allow_cookie) is not None
 
-    def _send_json(self, status: int, payload: Mapping[str, Any], *, retry_after: float | None = None) -> None:
+    def _send_json(
+        self,
+        status: int,
+        payload: Mapping[str, Any],
+        *,
+        retry_after: float | None = None,
+    ) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         try:
             self.send_response(status)
@@ -293,7 +321,8 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             k_lower = key.lower()
             if k_lower in allowed_specific or (
                 k_lower.startswith("x-")
-                and k_lower not in ("x-forwarded-for", "x-forwarded-proto", "x-forwarded-host")
+                and k_lower
+                not in ("x-forwarded-for", "x-forwarded-proto", "x-forwarded-host")
             ):
                 forward_headers[key] = val
         return forward_headers
@@ -320,13 +349,21 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         request_base = f"{proto}://{host}" if host else None
         try:
             result = self.console.handle(  # type: ignore[union-attr]
-                method, path, query=query, body=body, reveal_token=reveal_token,
+                method,
+                path,
+                query=query,
+                body=body,
+                reveal_token=reveal_token,
                 request_base=request_base,
             )
         except Exception as exc:  # pragma: no cover - 兜底
-            result = ui.UiResponse.error(f"控制台内部错误：{type(exc).__name__}: {exc}", status=500)
+            result = ui.UiResponse.error(
+                f"控制台内部错误：{type(exc).__name__}: {exc}", status=500
+            )
         if result is None:
-            self._send_json(404, error_payload(f"unknown path {path}", "invalid_request_error"))
+            self._send_json(
+                404, error_payload(f"unknown path {path}", "invalid_request_error")
+            )
             return
         if result.raw is not None:
             self._send_raw(result.status, result.raw, result.content_type)
@@ -354,6 +391,11 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
 
     def _sse(self, obj: Mapping[str, Any]) -> bytes:
         return ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8")
+
+    def _sse_event(self, name: str, payload: Mapping[str, Any]) -> bytes:
+        return (
+            f"event: {name}\ndata: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+        ).encode("utf-8")
 
     # ------------------------------------------------------------ 路由
 
@@ -384,17 +426,29 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         if self.console is not None and path.startswith(ui.API_PREFIX):
             kind = self._auth_kind(allow_cookie=True)
             if kind is None:
-                self._send_json(401, error_payload("invalid console token", "authentication_error"))
+                self._send_json(
+                    401, error_payload("invalid console token", "authentication_error")
+                )
                 return
             self._dispatch_console(
-                "GET", path, query=parse_qs(parsed.query), reveal_token=(kind == "bearer")
+                "GET",
+                path,
+                query=parse_qs(parsed.query),
+                reveal_token=(kind == "bearer"),
             )
             return
         if not self._authorized():
-            self._send_json(401, error_payload("invalid proxy token", "authentication_error"))
+            self._send_json(
+                401, error_payload("invalid proxy token", "authentication_error")
+            )
             return
         if self._paused:
-            self._send_json(503, error_payload("gateway paused from console", "service_unavailable", "503"))
+            self._send_json(
+                503,
+                error_payload(
+                    "gateway paused from console", "service_unavailable", "503"
+                ),
+            )
             return
         query_suffix = f"?{parsed.query}" if parsed.query else ""
         if path == MODELS_PATH:
@@ -403,7 +457,9 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         if path.startswith("/v1/"):
             self._forward_simple("GET", f"{path[4:]}{query_suffix}")
             return
-        self._send_json(404, error_payload(f"unknown path {path}", "invalid_request_error"))
+        self._send_json(
+            404, error_payload(f"unknown path {path}", "invalid_request_error")
+        )
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -417,10 +473,13 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             return
         console_api = self.console is not None and path.startswith(ui.API_PREFIX)
         if not self._authorized(allow_cookie=console_api):
-            self._send_json(401, error_payload(
-                "invalid console token" if console_api else "invalid proxy token",
-                "authentication_error",
-            ))
+            self._send_json(
+                401,
+                error_payload(
+                    "invalid console token" if console_api else "invalid proxy token",
+                    "authentication_error",
+                ),
+            )
             return
         try:
             raw = self._read_body()
@@ -428,13 +487,22 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             self._send_json(413, error_payload(str(exc), "invalid_request_error"))
             return
 
+        if self.console is not None and path == MODEL_TEST_PATH:
+            self._handle_model_test(raw)
+            return
+
         if console_api:
             try:
                 body = json.loads(raw or b"{}")
             except json.JSONDecodeError as exc:
-                self._send_json(400, error_payload(f"invalid JSON body: {exc}", "invalid_request_error"))
+                self._send_json(
+                    400,
+                    error_payload(f"invalid JSON body: {exc}", "invalid_request_error"),
+                )
                 return
-            self._dispatch_console("POST", path, body=body if isinstance(body, dict) else {})
+            self._dispatch_console(
+                "POST", path, body=body if isinstance(body, dict) else {}
+            )
             return
 
         query_suffix = f"?{parsed.query}" if parsed.query else ""
@@ -444,7 +512,9 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         if path.startswith("/v1/"):
             self._forward_simple("POST", f"{path[4:]}{query_suffix}", raw)
             return
-        self._send_json(404, error_payload(f"unknown path {path}", "invalid_request_error"))
+        self._send_json(
+            404, error_payload(f"unknown path {path}", "invalid_request_error")
+        )
 
     # ------------------------------------------------------------ 具体处理
 
@@ -468,7 +538,9 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         if wait > 0:
             self._send_json(
                 429,
-                error_payload("登录尝试过于频繁，请稍后再试", "rate_limit_exceeded", "429"),
+                error_payload(
+                    "登录尝试过于频繁，请稍后再试", "rate_limit_exceeded", "429"
+                ),
                 retry_after=wait,
             )
             return
@@ -494,7 +566,12 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
 
     def _handle_chat(self, raw: bytes) -> None:
         if self._paused:
-            self._send_json(503, error_payload("gateway paused from console", "service_unavailable", "503"))
+            self._send_json(
+                503,
+                error_payload(
+                    "gateway paused from console", "service_unavailable", "503"
+                ),
+            )
             return
         # 告诉烧点模块"有用户在等"，让它主动让路（小内存设备上这一步直接决定 TTFT）
         note_serve_begin()
@@ -507,10 +584,15 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         try:
             payload = json.loads(raw or b"{}")
         except json.JSONDecodeError as exc:
-            self._send_json(400, error_payload(f"invalid JSON body: {exc}", "invalid_request_error"))
+            self._send_json(
+                400, error_payload(f"invalid JSON body: {exc}", "invalid_request_error")
+            )
             return
         if not isinstance(payload, dict):
-            self._send_json(400, error_payload("body must be a JSON object", "invalid_request_error"))
+            self._send_json(
+                400,
+                error_payload("body must be a JSON object", "invalid_request_error"),
+            )
             return
 
         params = dict(payload)
@@ -518,14 +600,21 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         model = params.pop("model", None)
         messages = params.pop("messages", None)
         if not messages:
-            self._send_json(400, error_payload("'messages' is required", "invalid_request_error"))
+            self._send_json(
+                400, error_payload("'messages' is required", "invalid_request_error")
+            )
             return
 
         # max_tokens 下限：推理模型思考模式需要额外预算（SenseNova 建议 ≥2048），
         # 客户端给得过小时抬到下限，避免 content 被 reasoning_content 吃空。
         floor = self.rotator.config.min_max_tokens
         current_mt = params.get("max_tokens")
-        if floor > 0 and isinstance(current_mt, int) and not isinstance(current_mt, bool) and current_mt < floor:
+        if (
+            floor > 0
+            and isinstance(current_mt, int)
+            and not isinstance(current_mt, bool)
+            and current_mt < floor
+        ):
             params["max_tokens"] = floor
 
         # 流式统计 token 用量：注入 include_usage 让上游在末尾回一个 usage 块。
@@ -553,7 +642,11 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         )
 
     def _chat_complete(
-        self, messages: Any, model: str | None, params: dict, headers: Mapping[str, str] | None = None
+        self,
+        messages: Any,
+        model: str | None,
+        params: dict,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
         try:
             result = self.rotator.chat(messages, model=model, headers=headers, **params)
@@ -562,11 +655,16 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             return
         except RotationExhausted as exc:
             status = exc.last_status if (exc.last_status or 0) >= 400 else 502
-            self._send_json(status, error_payload(str(exc), "upstream_exhausted", str(status)))
+            self._send_json(
+                status, error_payload(str(exc), "upstream_exhausted", str(status))
+            )
             return
         except NoAvailableKey as exc:
-            self._send_json(429, error_payload(str(exc), "rate_limit_exceeded", "429"),
-                            retry_after=exc.retry_after)
+            self._send_json(
+                429,
+                error_payload(str(exc), "rate_limit_exceeded", "429"),
+                retry_after=exc.retry_after,
+            )
             return
         except AllKeysInvalid as exc:
             self._send_json(503, error_payload(str(exc), "all_keys_invalid", "503"))
@@ -578,9 +676,15 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         self._send_json(200, result)
 
     def _chat_stream(
-        self, messages: Any, model: str | None, params: dict, headers: Mapping[str, str] | None = None
+        self,
+        messages: Any,
+        model: str | None,
+        params: dict,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
-        stream = self.rotator.chat_stream_raw(messages, model=model, headers=headers, **params)
+        stream = self.rotator.chat_stream_raw(
+            messages, model=model, headers=headers, **params
+        )
         first_chunk = None
         has_first = False
         try:
@@ -599,10 +703,16 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             return
         except RotationExhausted as exc:
             status = exc.last_status if (exc.last_status or 0) >= 400 else 502
-            self._send_json(status, error_payload(str(exc), "upstream_exhausted", str(status)))
+            self._send_json(
+                status, error_payload(str(exc), "upstream_exhausted", str(status))
+            )
             return
         except NoAvailableKey as exc:
-            self._send_json(429, error_payload(str(exc), "rate_limit_exceeded", "429"), retry_after=exc.retry_after)
+            self._send_json(
+                429,
+                error_payload(str(exc), "rate_limit_exceeded", "429"),
+                retry_after=exc.retry_after,
+            )
             return
         except AllKeysInvalid as exc:
             self._send_json(503, error_payload(str(exc), "all_keys_invalid", "503"))
@@ -622,7 +732,9 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         except RotatorError as exc:
             # 已经发出 200 了，改不了状态码，只能补一条 error 事件收尾
             try:
-                self._write_chunk(self._sse(error_payload(str(exc), "upstream_error", "502")))
+                self._write_chunk(
+                    self._sse(error_payload(str(exc), "upstream_error", "502"))
+                )
             except (BrokenPipeError, ConnectionResetError, OSError):
                 return
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -634,33 +746,140 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
 
-    def _forward_simple(self, method: str, upstream_path: str, raw: bytes = b"") -> None:
+    def _handle_model_test(self, raw: bytes) -> None:
+        """控制台模型测试：非流式返回 JSON 汇总，流式输出复用级 SSE。
+
+        鉴权沿用 do_POST 里 /api/* 的统一闸口（Bearer 或 Cookie），本方法不再单独校验。
+        run_test 内部做账号级错误隔离，未知账号名只会得到 per-account fatal 结果。
+        """
+        assert self.console is not None
+        try:
+            body = json.loads(raw or b"{}")
+        except json.JSONDecodeError as exc:
+            self._send_json(
+                400, error_payload(f"invalid JSON body: {exc}", "invalid_request_error")
+            )
+            return
+        if not isinstance(body, dict):
+            self._send_json(400, error_payload("请求体必须是 JSON 对象"))
+            return
+
+        model = body.get("model")
+        accounts = body.get("accounts")
+        prompt = body.get("prompt")
+        reasoning = body.get("reasoning_effort")
+        stream = bool(body.get("stream"))
+        if not isinstance(model, str) or not model.strip():
+            self._send_json(400, error_payload("model 必须是非空字符串"))
+            return
+        if (
+            not isinstance(accounts, list)
+            or not accounts
+            or not all(isinstance(a, str) and a.strip() for a in accounts)
+        ):
+            self._send_json(400, error_payload("accounts 必须是非空字符串数组"))
+            return
+        if not isinstance(prompt, str) or not prompt.strip():
+            self._send_json(400, error_payload("prompt 必须是非空字符串"))
+            return
+        if isinstance(reasoning, str) and reasoning == "":
+            reasoning = None
+        if reasoning is not None and (
+            not isinstance(reasoning, str)
+            or reasoning not in modeltest.REASONING_EFFORT_VALUES
+        ):
+            valid = "/".join(modeltest.REASONING_EFFORT_VALUES)
+            self._send_json(
+                400, error_payload(f"reasoning_effort 只能是 {valid} 之一或留空")
+            )
+            return
+
+        req = modeltest.ModelTestRequest(
+            model=model,
+            accounts=accounts,
+            prompt=prompt,
+            reasoning_effort=reasoning,
+            stream=stream,
+        )
+        config = self.console.config
+        if not stream:
+            results = modeltest.run_test(config, req)
+            self._send_json(
+                200,
+                {"ok": True, "results": [dataclasses.asdict(r) for r in results]},
+            )
+            return
+
+        # 流式：worker 线程内回调 emit 并发写同一 socket，必须加锁；客户端断开即停。
+        self._begin_stream()
+        write_lock = threading.Lock()
+        stop = threading.Event()
+
+        def emit(event: Mapping[str, Any]) -> None:
+            if stop.is_set():
+                return
+            typ = str(event.get("type", "message"))
+            data = {key: value for key, value in event.items() if key != "type"}
+            try:
+                with write_lock:
+                    self._write_chunk(self._sse_event(typ, data))
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                stop.set()
+
+        try:
+            modeltest.run_test(config, req, emit=emit)
+        finally:
+            stop.set()
+            try:
+                self._end_stream()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+    def _forward_simple(
+        self, method: str, upstream_path: str, raw: bytes = b""
+    ) -> None:
         """其余端点（embeddings / images / models…）原样透传，同样享受轮换。"""
         if _has_parent_segment(upstream_path):
             self._send_json(400, error_payload("非法路径", "invalid_request_error"))
             return
         if self._paused:
-            self._send_json(503, error_payload("gateway paused from console", "service_unavailable", "503"))
+            self._send_json(
+                503,
+                error_payload(
+                    "gateway paused from console", "service_unavailable", "503"
+                ),
+            )
             return
         body = None
         if raw:
             try:
                 body = json.loads(raw)
             except json.JSONDecodeError as exc:
-                self._send_json(400, error_payload(f"invalid JSON body: {exc}", "invalid_request_error"))
+                self._send_json(
+                    400,
+                    error_payload(f"invalid JSON body: {exc}", "invalid_request_error"),
+                )
                 return
         headers = self._forwardable_headers()
         try:
-            result = self.rotator.request(upstream_path, method=method, json_body=body, headers=headers)
+            result = self.rotator.request(
+                upstream_path, method=method, json_body=body, headers=headers
+            )
         except ApiError as exc:
             self._send_json(exc.status, _passthrough_error(exc.status, exc.body))
             return
         except RotationExhausted as exc:
             status = exc.last_status if (exc.last_status or 0) >= 400 else 502
-            self._send_json(status, error_payload(str(exc), "upstream_exhausted", str(status)))
+            self._send_json(
+                status, error_payload(str(exc), "upstream_exhausted", str(status))
+            )
             return
         except NoAvailableKey as exc:
-            self._send_json(429, error_payload(str(exc), "rate_limit_exceeded", "429"), retry_after=exc.retry_after)
+            self._send_json(
+                429,
+                error_payload(str(exc), "rate_limit_exceeded", "429"),
+                retry_after=exc.retry_after,
+            )
             return
         except AllKeysInvalid as exc:
             self._send_json(503, error_payload(str(exc), "all_keys_invalid", "503"))
@@ -726,8 +945,13 @@ def serve(
         on_ready: 服务已绑定端口、进入循环前回调（用于自动开窗，避免开在服务就绪之前）。
     """
     server = create_server(
-        rotator, host=host, port=port, token=token, verbose=verbose,
-        log_sink=log_sink, console=console,
+        rotator,
+        host=host,
+        port=port,
+        token=token,
+        verbose=verbose,
+        log_sink=log_sink,
+        console=console,
     )
     actual_host, actual_port = server.server_address[:2]
     base = f"http://{actual_host}:{actual_port}/v1"
