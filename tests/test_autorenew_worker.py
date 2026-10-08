@@ -193,8 +193,8 @@ class AutoRenewWorkerTest(unittest.TestCase):
         self.assertEqual(probe_calls, ["sk-ok", "sk-invalid"])
         # 登录被调用且参数正确
         self.assertEqual(login.calls, [("u1", "p1")])
-        # 平台操作顺序：先 create 后 delete-all
-        self.assertEqual(keys.ops, ["create", "list", "delete"])
+        # 平台操作顺序：先 delete-all 后 create（先清空再建唯一一把）
+        self.assertEqual(keys.ops, ["list", "delete", "create"])
         self.assertEqual(
             keys.delete_calls, [{"token": TOKEN.access_token, "key_id": "old-1"}]
         )
@@ -285,8 +285,8 @@ class AutoRenewWorkerTest(unittest.TestCase):
         worker.run_once()
         entry = worker.account_status()["账号1"]
         self.assertEqual(entry["status"], AutoRenewWorker.STATUS_CHECK_ERROR)
-        # create 已成功但删除失败 → persist 不应被调用
-        self.assertEqual(keys.ops, ["create", "list", "delete"])
+        # 删除失败 → 不继续 create，persist 不应被调用
+        self.assertEqual(keys.ops, ["list", "delete"])
         self.assertEqual(self.persist_calls, [])
 
     # ------------------------------------------------------------ 8. 全部 unknown
@@ -415,6 +415,160 @@ class AutoRenewWorkerTest(unittest.TestCase):
         self.assertEqual(
             worker.account_status()["账号1"]["status"], AutoRenewWorker.STATUS_OK
         )
+
+
+class _PlatformKeys(_FakeKeys):
+    """模拟真实平台：list 返回平台当前全部 key（含刚 create 的），delete 从平台移除。"""
+
+    def __init__(self, initial=None):
+        super().__init__()
+        self.platform = list(initial or [])
+
+    def list_keys(self, access_token, *, key_type=None, page_size=50, page_token=None):
+        self.ops.append("list")
+        self.list_calls.append(
+            {
+                "token": access_token,
+                "key_type": key_type,
+                "page_size": page_size,
+                "page_token": page_token,
+            }
+        )
+        return list(self.platform)
+
+    def create_key(self, access_token, *, displayname, key_type):
+        self.ops.append("create")
+        self.create_calls.append(
+            {"token": access_token, "displayname": displayname, "key_type": key_type}
+        )
+        self.platform.append(self.created)
+        return self.created
+
+    def delete_key(self, access_token, *, key_id):
+        self.ops.append("delete")
+        self.delete_calls.append({"token": access_token, "key_id": key_id})
+        self.platform = [k for k in self.platform if k.id != key_id]
+
+
+class RotationRegressionTest(AutoRenewWorkerTest):
+    """回归：真实平台 list 会包含刚 create 的 key，轮换绝不能删掉新建的 key（历史 bug）。"""
+
+    def test_rotation_never_deletes_newly_created_key(self):
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-bad"], user="u1", password="p1"
+        )
+        probe, _ = self._probe_stub({"sk-bad": ("invalid", "401")})
+        keys = _PlatformKeys(
+            [
+                KeyInfo(
+                    id="old-1",
+                    displayname="old",
+                    api_key="sk-old",
+                    key_type="API_KEY_TYPE_TOKEN_PLAN",
+                    create_time="t1",
+                )
+            ]
+        )
+        worker = self._worker(
+            accounts=[account], probe=probe, login=_FakeLogin(), keys=keys
+        )
+        worker.run_once()
+        deleted = [c["key_id"] for c in keys.delete_calls]
+        self.assertEqual(deleted, ["old-1"])
+        self.assertNotIn("k-new", deleted)
+        self.assertEqual([k.id for k in keys.platform], ["k-new"])
+        self.assertEqual(keys.ops, ["list", "delete", "create"])
+        self.assertEqual(self.persist_calls, [("账号1", ["sk-bad"], "sk-new-plain")])
+        self.assertEqual(
+            worker.account_status()["账号1"]["status"], AutoRenewWorker.STATUS_OK
+        )
+
+
+class CleanupTest(AutoRenewWorkerTest):
+    """30 分钟一轮的「多余 Key」清理：删除非当前配置的 key，保留当前配置的。"""
+
+    def _key(self, key_id, api_key):
+        return KeyInfo(
+            id=key_id,
+            displayname="k",
+            api_key=api_key,
+            key_type="API_KEY_TYPE_TOKEN_PLAN",
+            create_time="t",
+        )
+
+    def test_removes_extra_keys_keeps_configured(self):
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-cur"], user="u1", password="p1"
+        )
+        keys = _FakeKeys()
+        keys.list_result = [
+            self._key("cur", "sk-cur"),
+            self._key("extra1", "sk-extra1"),
+            self._key("extra2", "sk-extra2"),
+        ]
+        worker = self._worker(accounts=[account], keys=keys)
+        worker.run_cleanup()
+        self.assertEqual([c["key_id"] for c in keys.delete_calls], ["extra1", "extra2"])
+        self.assertEqual(keys.ops, ["list", "delete", "delete"])
+
+    def test_no_extra_keys_no_delete(self):
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-cur"], user="u1", password="p1"
+        )
+        keys = _FakeKeys()
+        keys.list_result = [self._key("cur", "sk-cur")]
+        worker = self._worker(accounts=[account], keys=keys)
+        worker.run_cleanup()
+        self.assertEqual(keys.delete_calls, [])
+        self.assertEqual(keys.ops, ["list"])
+
+    def test_cleanup_skips_without_credentials_zero_network(self):
+        account = AccountConfig(name="无凭据", api_keys=["sk-1"], user="", password="")
+        keys = _FakeKeys()
+        login = _FakeLogin()
+        worker = self._worker(accounts=[account], keys=keys, login=login)
+        worker.run_cleanup()
+        self.assertEqual(keys.ops, [])
+        self.assertEqual(login.calls, [])
+
+    def test_cleanup_auth_error_marks_password_error(self):
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-cur"], user="u1", password="p1"
+        )
+        keys = _FakeKeys()
+        login = _FakeLogin(exc=QuotaAuthError("用户名或密码错误"))
+        worker = self._worker(accounts=[account], keys=keys, login=login)
+        worker.run_cleanup()
+        self.assertEqual(
+            worker.account_status()["账号1"]["status"],
+            AutoRenewWorker.STATUS_PASSWORD_ERROR,
+        )
+        self.assertEqual(keys.ops, [])
+
+    def test_cleanup_transient_error_does_not_clobber_status(self):
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-cur"], user="u1", password="p1"
+        )
+        worker = self._worker(
+            accounts=[account],
+            keys=_FakeKeys(),
+            login=_FakeLogin(exc=RuntimeError("boom")),
+        )
+        worker.run_cleanup()
+        self.assertNotIn("账号1", worker.account_status())
+
+    def test_loop_runs_cleanup_periodically(self):
+        account = AccountConfig(name="空账号", api_keys=["sk-1"], user="", password="")
+        worker = self._worker(accounts=[account], interval=0.05, cleanup_interval=0.05)
+        calls = {"run": 0, "clean": 0}
+        worker.run_once = lambda: calls.__setitem__("run", calls["run"] + 1)
+        worker.run_cleanup = lambda: calls.__setitem__("clean", calls["clean"] + 1)
+        worker.start()
+        deadline = time.monotonic() + 2.0
+        while calls["clean"] < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        worker.stop()
+        self.assertGreaterEqual(calls["clean"], 2)
 
 
 if __name__ == "__main__":

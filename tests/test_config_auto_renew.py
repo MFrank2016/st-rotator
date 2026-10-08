@@ -27,7 +27,8 @@ class AutoRenewParseTest(unittest.TestCase):
         cfg = Config.from_dict(_cfg())
         self.assertIsInstance(cfg.auto_renew, AutoRenewConfig)
         self.assertEqual(cfg.auto_renew.enabled, False)
-        self.assertEqual(cfg.auto_renew.interval_seconds, 3600.0)
+        self.assertEqual(cfg.auto_renew.interval_seconds, 180.0)
+        self.assertEqual(cfg.auto_renew.cleanup_interval_seconds, 1800.0)
         self.assertEqual(cfg.auto_renew.key_name, "auto")
         self.assertEqual(cfg.auto_renew.key_type, "API_KEY_TYPE_TOKEN_PLAN")
 
@@ -61,6 +62,14 @@ class AutoRenewParseTest(unittest.TestCase):
         with self.assertRaises(ConfigError):
             AutoRenewConfig(interval_seconds="3600")
 
+    def test_cleanup_interval_invalid_raises(self):
+        with self.assertRaises(ConfigError):
+            AutoRenewConfig(cleanup_interval_seconds=0)
+        with self.assertRaises(ConfigError):
+            AutoRenewConfig(cleanup_interval_seconds=-1.0)
+        with self.assertRaises(ConfigError):
+            AutoRenewConfig(cleanup_interval_seconds="1800")
+
     def test_key_name_non_string_raises(self):
         with self.assertRaises(ConfigError):
             AutoRenewConfig(key_name=123)
@@ -73,6 +82,7 @@ class AutoRenewToDictTest(unittest.TestCase):
                 auto_renew={
                     "enabled": True,
                     "interval_seconds": 120,
+                    "cleanup_interval_seconds": 900,
                     "key_name": "手动",
                     "key_type": "API_KEY_TYPE_METERED",
                 }
@@ -82,6 +92,7 @@ class AutoRenewToDictTest(unittest.TestCase):
         self.assertIn("auto_renew", d)
         self.assertEqual(d["auto_renew"]["enabled"], True)
         self.assertEqual(d["auto_renew"]["interval_seconds"], 120)
+        self.assertEqual(d["auto_renew"]["cleanup_interval_seconds"], 900)
         self.assertEqual(d["auto_renew"]["key_name"], "手动")
         self.assertEqual(d["auto_renew"]["key_type"], "API_KEY_TYPE_METERED")
 

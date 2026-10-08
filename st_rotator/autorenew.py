@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -64,7 +65,7 @@ class KeyTransport(Protocol):
         key_type: str | None = None,
         page_size: int = 50,
         page_token: str | None = None,
-    ) -> tuple[list[KeyInfo], str]: ...
+    ) -> list[KeyInfo]: ...
     def create_key(
         self, access_token: str, *, displayname: str, key_type: str
     ) -> KeyInfo: ...
@@ -223,9 +224,10 @@ class AutoRenewWorker:
     * ``check_error``    —— 登录或平台操作瞬时失败（网络 / 风控），下次再试。
     * ``unavailable``    —— 缺 jwcrypto 等依赖，无法登录。
 
-    平台操作顺序固定为「先 create 后 delete-all」：避免中途失败导致账号零 key。
-    若 delete 中途失败，可能残留一把新 key——不做 persist 回调，下一轮检测会走
-    ``list → create → delete-all`` 路径把它一并收敛掉（旧 key 与残留新 key 全被注销）。
+    平台操作顺序固定为「先 delete-all 后 create」：先把该账号平台侧的全部 key 注销，
+    再新建唯一一把 key。若反过来（先 create 后 delete-all），list 会把刚建的 key 也算进去
+    并把它一并删掉，导致账号零 key、新 key 立即失效、无限轮换（历史 bug）。
+    轮换成功后 persist 新 key；delete 中途失败则不 persist，下一轮会重新收敛。
     """
 
     STATUS_OK = "ok"  # 全部 key 有效（或轮换成功）
@@ -244,7 +246,8 @@ class AutoRenewWorker:
         persist: Callable[[str, Sequence[str], str], None],
         key_name: str = "auto",
         key_type: str = "API_KEY_TYPE_TOKEN_PLAN",
-        interval: float = 3600.0,
+        interval: float = 180.0,
+        cleanup_interval: float = 1800.0,
         log: Callable[[str], None] | None = None,
     ) -> None:
         self._accounts = accounts
@@ -255,6 +258,7 @@ class AutoRenewWorker:
         self._key_name = key_name
         self._key_type = key_type
         self._interval = float(interval)
+        self._cleanup_interval = float(cleanup_interval)
         self._log = log or (lambda _msg: None)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -293,11 +297,70 @@ class AutoRenewWorker:
                     f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT],
                 )
 
+    def run_cleanup(self) -> None:
+        """跑一轮「多余 Key」清理：删除账号在平台侧、但不在当前配置 api_keys 里的 key。"""
+        for account in list(self._accounts()):
+            try:
+                self._cleanup_account(account)
+            except Exception as exc:  # noqa: BLE001 - 单账号异常不影响其它账号
+                self._log(
+                    f"账号 {account.name}：清理多余 Key 失败：{type(exc).__name__}: {exc}"[
+                        :DETAIL_LIMIT
+                    ]
+                )
+
+    def _cleanup_account(self, account: AccountConfig) -> None:
+        """删除平台侧多余 key（保留当前配置的）；无凭据/无 key 直接跳过，零网络。"""
+        if not account.user or not account.password or not account.api_keys:
+            return
+        configured = set(account.api_keys)
+        try:
+            bundle = self._login(account.user, account.password)
+        except QuotaAuthError as exc:
+            self._set_status(
+                account.name,
+                self.STATUS_PASSWORD_ERROR,
+                str(exc),
+                log_line=f"账号 {account.name}：密码错误",
+            )
+            return
+        except QuotaUnavailable:
+            return
+        except Exception as exc:  # noqa: BLE001 - 清理是后台兜底，瞬时失败仅记日志
+            self._log(
+                f"账号 {account.name}：清理多余 Key 登录失败：{type(exc).__name__}: {exc}"[
+                    :DETAIL_LIMIT
+                ]
+            )
+            return
+        try:
+            extras = [
+                item
+                for item in self._keys.list_keys(bundle.access_token)
+                if item.api_key not in configured
+            ]
+            for item in extras:
+                self._keys.delete_key(bundle.access_token, key_id=item.id)
+        except Exception as exc:  # noqa: BLE001
+            self._log(
+                f"账号 {account.name}：清理多余 Key 失败：{type(exc).__name__}: {exc}"[
+                    :DETAIL_LIMIT
+                ]
+            )
+            return
+        if extras:
+            self._log(f"账号 {account.name}：已清理 {len(extras)} 把多余 Key")
+
     def _loop(self) -> None:
-        """先立即跑一轮，再按 interval 周期循环；stop 时退出等待。"""
+        """先立即跑一轮检测与清理，再按 interval 周期检测、按 cleanup_interval 周期清理。"""
         self.run_once()
+        self.run_cleanup()
+        next_cleanup = time.monotonic() + self._cleanup_interval
         while not self._stop.wait(self._interval):
             self.run_once()
+            if time.monotonic() >= next_cleanup:
+                self.run_cleanup()
+                next_cleanup = time.monotonic() + self._cleanup_interval
 
     # ------------------------------------------------------------ 内部
     def _check_account(self, account: AccountConfig) -> None:
@@ -364,15 +427,14 @@ class AutoRenewWorker:
         # 登录成功后日志「开始轮换」：登录失败（含 unavailable）时保持静默
         self._log(f"账号 {account.name}：key 失效，开始轮换")
         try:
+            for item in self._keys.list_keys(bundle.access_token):
+                self._keys.delete_key(bundle.access_token, key_id=item.id)
             created = self._keys.create_key(
                 bundle.access_token,
                 displayname=self._key_name,
                 key_type=self._key_type,
             )
-            for item in self._keys.list_keys(bundle.access_token):
-                self._keys.delete_key(bundle.access_token, key_id=item.id)
         except Exception as exc:  # noqa: BLE001 - 平台瞬时失败
-            # 不调用 persist：可能残留一把新 key，下个周期 list→create→delete-all 会收敛
             self._set_status(
                 account.name,
                 self.STATUS_CHECK_ERROR,

@@ -479,6 +479,7 @@ def build_auto_renew(
         key_name=config.auto_renew.key_name,
         key_type=config.auto_renew.key_type,
         interval=config.auto_renew.interval_seconds,
+        cleanup_interval=config.auto_renew.cleanup_interval_seconds,
         log=sink,
     )
     worker.start()

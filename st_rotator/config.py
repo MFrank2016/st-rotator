@@ -163,13 +163,15 @@ class AutoRenewConfig:
 
     Attributes:
         enabled: 是否启用定时检测。
-        interval_seconds: 两次检测之间的间隔秒数。
+        interval_seconds: 探测「当前 Key 是否失效」的间隔秒数（默认 180 = 3 分钟）。
+        cleanup_interval_seconds: 清理「多余 Key」的间隔秒数（默认 1800 = 30 分钟）。
         key_name: 续期创建的新 Key 名称（仅允许中文、字母、数字、连字符，≤64）。
         key_type: 续期 API 对应的 Key 类型（Token Plan / 按量计费）。
     """
 
     enabled: bool = False
-    interval_seconds: float = 3600.0
+    interval_seconds: float = 180.0
+    cleanup_interval_seconds: float = 1800.0
     key_name: str = "auto"
     key_type: str = "API_KEY_TYPE_TOKEN_PLAN"
 
@@ -189,6 +191,14 @@ class AutoRenewConfig:
             )
         if self.interval_seconds <= 0:
             raise ConfigError("auto_renew.interval_seconds 必须 > 0")
+        if isinstance(self.cleanup_interval_seconds, bool) or not isinstance(
+            self.cleanup_interval_seconds, (int, float)
+        ):
+            raise ConfigError(
+                f"auto_renew.cleanup_interval_seconds 必须是数值，当前为 {self.cleanup_interval_seconds!r}"
+            )
+        if self.cleanup_interval_seconds <= 0:
+            raise ConfigError("auto_renew.cleanup_interval_seconds 必须 > 0")
         if not isinstance(self.key_name, str):
             raise ConfigError(
                 f"auto_renew.key_name 必须是字符串，当前为 {self.key_name!r}"
@@ -222,6 +232,7 @@ class AutoRenewConfig:
         return {
             "enabled": self.enabled,
             "interval_seconds": self.interval_seconds,
+            "cleanup_interval_seconds": self.cleanup_interval_seconds,
             "key_name": self.key_name,
             "key_type": self.key_type,
         }

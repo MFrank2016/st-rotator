@@ -52,7 +52,8 @@
 
   "auto_renew": {
     "enabled": false,
-    "interval_seconds": 3600,
+    "interval_seconds": 180,
+    "cleanup_interval_seconds": 1800,
     "key_name": "auto",
     "key_type": "API_KEY_TYPE_TOKEN_PLAN"
   },
