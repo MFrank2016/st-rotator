@@ -298,6 +298,119 @@ class FlashLiteExchangeConfig:
 
 
 @dataclass
+class ReplenishConfig:
+    """自动补充账号：可用账号数低于目标时，用易码短信自动注册/接管新账号。
+
+    ``sms_token`` 是短信平台的密钥，支持 ``${ENV}`` 占位符，属于敏感信息——
+    绝不写入日志、绝不回显（见 ``to_dict``）。
+
+    Attributes:
+        enabled: 总开关。
+        target_count: 目标可用账号数；0 = 不启用数量约束。
+        interval_seconds: 两次检测之间的间隔秒数。
+        sms_token: 易码平台 token（``${ENV}`` 可展开）。
+        keyword: 短信关键词（易码 getPhone 的项目关键字）。
+        daily_spend_cap: 短信平台单日消费上限（元）；0 表示不限制。
+        sms_poll_interval: 轮询短信的间隔秒数。
+        sms_poll_timeout: 单次取号的短信等待超时秒数，超时换新号重试。
+        key_name: 注册/接管后创建的新 Key 名称（中文、字母、数字、连字符，≤64）。
+        key_type: 新 Key 的类型（Token Plan / 按量计费）。
+    """
+
+    enabled: bool = False
+    target_count: int = 0
+    interval_seconds: float = 3600.0
+    sms_token: str = ""
+    keyword: str = "商汤"
+    daily_spend_cap: float = 5.0
+    sms_poll_interval: float = 5.0
+    sms_poll_timeout: float = 60.0
+    key_name: str = "auto"
+    key_type: str = "API_KEY_TYPE_TOKEN_PLAN"
+
+    KEY_TYPES = ("API_KEY_TYPE_TOKEN_PLAN", "API_KEY_TYPE_METERED")
+    _KEY_NAME_PATTERN = re.compile(r"^[A-Za-z0-9\u4e00-\u9fa5-]+$")
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigError(
+                f"replenish.enabled 必须是布尔值，当前为 {self.enabled!r}"
+            )
+        if isinstance(self.target_count, bool) or not isinstance(
+            self.target_count, int
+        ):
+            raise ConfigError(
+                f"replenish.target_count 必须是整数，当前为 {self.target_count!r}"
+            )
+        if self.target_count < 0:
+            raise ConfigError("replenish.target_count 不能为负")
+        for field_name in (
+            "interval_seconds",
+            "sms_poll_interval",
+            "sms_poll_timeout",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ConfigError(
+                    f"replenish.{field_name} 必须是数值，当前为 {value!r}"
+                )
+            if value <= 0:
+                raise ConfigError(f"replenish.{field_name} 必须 > 0")
+        cap = self.daily_spend_cap
+        if isinstance(cap, bool) or not isinstance(cap, (int, float)):
+            raise ConfigError(f"replenish.daily_spend_cap 必须是数值，当前为 {cap!r}")
+        if cap < 0:
+            raise ConfigError("replenish.daily_spend_cap 不能为负")
+        if not isinstance(self.key_name, str):
+            raise ConfigError(
+                f"replenish.key_name 必须是字符串，当前为 {self.key_name!r}"
+            )
+        self.key_name = self.key_name.strip()
+        if not self.key_name:
+            raise ConfigError("replenish.key_name 不能为空")
+        if len(self.key_name) > 64:
+            raise ConfigError("replenish.key_name 长度不能超过 64")
+        if not self._KEY_NAME_PATTERN.match(self.key_name):
+            raise ConfigError("replenish.key_name 仅允许中文、字母、数字与连字符")
+        if not isinstance(self.key_type, str):
+            raise ConfigError(
+                f"replenish.key_type 必须是字符串，当前为 {self.key_type!r}"
+            )
+        if self.key_type not in self.KEY_TYPES:
+            raise ConfigError(
+                f"replenish.key_type 必须是 {self.KEY_TYPES} 之一，当前为 {self.key_type!r}"
+            )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any] | None) -> "ReplenishConfig":
+        data = dict(data or {})
+        unknown = set(data) - set(cls.__dataclass_fields__)
+        if unknown:
+            raise ConfigError(f"replenish 存在未知字段: {sorted(unknown)}")
+        for field_name in ("sms_token", "keyword"):
+            if field_name in data and data[field_name] is not None:
+                data[field_name] = expand_env(str(data[field_name]))
+        return cls(**data)
+
+    def to_dict(self) -> dict[str, Any]:
+        """导出为可序列化字典。
+
+        **不包含 sms_token**：密钥绝不落到日志 / 前端，避免泄漏。
+        """
+        return {
+            "enabled": self.enabled,
+            "target_count": self.target_count,
+            "interval_seconds": self.interval_seconds,
+            "keyword": self.keyword,
+            "daily_spend_cap": self.daily_spend_cap,
+            "sms_poll_interval": self.sms_poll_interval,
+            "sms_poll_timeout": self.sms_poll_timeout,
+            "key_name": self.key_name,
+            "key_type": self.key_type,
+        }
+
+
+@dataclass
 class AccountConfig:
     """一个账号（可含多把 Key）。
 
@@ -405,6 +518,8 @@ class Config:
     flash_lite_exchange: FlashLiteExchangeConfig = field(
         default_factory=FlashLiteExchangeConfig
     )
+    # 自动补充账号（可用账号数不足时用易码短信注册/接管）
+    replenish: ReplenishConfig = field(default_factory=ReplenishConfig)
 
     # 连接池
     max_connections: int = 100
@@ -463,6 +578,7 @@ class Config:
         flash_lite = FlashLiteExchangeConfig.from_dict(
             data.pop("flash_lite_exchange", None)
         )
+        replenish = ReplenishConfig.from_dict(data.pop("replenish", None))
         headers = {
             str(k): expand_env(str(v))
             for k, v in (data.pop("extra_headers", None) or {}).items()
@@ -474,6 +590,7 @@ class Config:
             "extra_headers",
             "auto_renew",
             "flash_lite_exchange",
+            "replenish",
         }
         unknown = set(data) - known
         if unknown:
@@ -485,6 +602,7 @@ class Config:
             rate_control=rate_control,
             auto_renew=auto_renew,
             flash_lite_exchange=flash_lite,
+            replenish=replenish,
             extra_headers=headers,
             **{k: expand_env(v) if isinstance(v, str) else v for k, v in data.items()},
         )
@@ -517,6 +635,7 @@ class Config:
                 "qps": self.rate_control.qps,
             },
             "auto_renew": self.auto_renew.to_dict(),
+            "replenish": self.replenish.to_dict(),
             "accounts": [
                 {
                     "name": a.name,
@@ -651,6 +770,38 @@ class ConfigStore:
             "weight": weight,
         }
         accounts.append(entry)
+        return entry
+
+    def add_account(
+        self,
+        name: str,
+        *,
+        user: str,
+        phone: str,
+        password: str,
+        api_keys: Sequence[str],
+    ) -> dict[str, Any]:
+        """新建一个带登录凭据与 Key 的账号（重复名字报错），然后 reload。"""
+        name = (name or "").strip()
+        if not name:
+            raise ConfigError("账号名不能为空")
+        accounts = self._accounts_raw()
+        if any(
+            isinstance(item, dict) and item.get("name") == name for item in accounts
+        ):
+            raise ConfigError(f"账号 {name} 已存在")
+        entry = {
+            "name": name,
+            "api_keys": list(api_keys or []),
+            "user": user,
+            "phone": phone,
+            "password": password,
+            "rpm_limit": None,
+            "max_concurrency": 4,
+            "weight": 1.0,
+        }
+        accounts.append(entry)
+        self.reload()
         return entry
 
     def set_account_credentials(

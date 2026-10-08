@@ -57,6 +57,19 @@
     "key_type": "API_KEY_TYPE_TOKEN_PLAN"
   },
 
+  "replenish": {
+    "enabled": false,
+    "target_count": 0,
+    "interval_seconds": 3600,
+    "sms_token": "",
+    "keyword": "商汤",
+    "daily_spend_cap": 5,
+    "sms_poll_interval": 5,
+    "sms_poll_timeout": 60,
+    "key_name": "auto",
+    "key_type": "API_KEY_TYPE_TOKEN_PLAN"
+  },
+
   "accounts": [
     {
       "name": "账号1",
