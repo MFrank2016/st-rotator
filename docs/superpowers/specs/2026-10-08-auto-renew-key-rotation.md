@@ -32,7 +32,7 @@ st-rotator 把多把商汤日日新 API Key 池化。Key 会因上游侧原因�
    list / create / delete（见 §6），隔离在 `autorenew.HttpKeyManager`，失败只降级。
 4. **轮换只改选定账号**：一经探测到某账号任一把 Key `invalid`，只轮换该账号；
    单账号失败不影响其它账号（逐账号 try/except 隔离）。
-5. **平台操作顺序 create 先于 delete-all**：避免中途失败时账号在平台侧变成零 Key。
+5. **平台操作顺序 delete-all 先于 create**：先注销该账号平台侧全部 key、再新建唯一一把。若反过来（create 先于 delete-all），list 会把刚建的 key 也算进去并一并删除，导致账号零 key、新 key 立即失效、无限轮换（历史 bug，已修）。
 6. **`persist` 回调只在平台操作全成功后调用**：所有落池/落盘（pool + ConfigStore + 内存 config
    同步）封装成一个注入的 `persist(account, old_keys, new_key)`，测试可用 spy 替换。
 7. **状态词汇**（`AutoRenewWorker.account_status()`，仅运行期，含 message）：
@@ -44,13 +44,14 @@ st-rotator 把多把商汤日日新 API Key 池化。Key 会因上游侧原因�
 ```jsonc
 "auto_renew": {
   "enabled": false,                 // 是否启用定时检测（默认关闭）
-  "interval_seconds": 3600,         // 两次检测间隔（秒，>0）
+  "interval_seconds": 180,          // 探测「当前 Key 是否失效」的间隔（秒，>0；默认 180=3 分钟）
+  "cleanup_interval_seconds": 1800, // 清理「多余 Key」的间隔（秒，>0；默认 1800=30 分钟）
   "key_name": "auto",               // 轮换新建的 Key 名称（≤64，仅中文/字母/数字/连字符）
   "key_type": "API_KEY_TYPE_TOKEN_PLAN"   // 仅 TOKEN_PLAN / METERED
 }
 ```
 
-- 新 `AutoRenewConfig` dataclass（`enabled=False`、`interval_seconds=3600.0`、
+- 新 `AutoRenewConfig` dataclass（`enabled=False`、`interval_seconds=180.0`、`cleanup_interval_seconds=1800.0`、
   `key_name="auto"`、`key_type="API_KEY_TYPE_TOKEN_PLAN"`），`__post_init__` 校验、
   `from_dict`（未知字段报错）、`to_dict`；`Config` 增同名字段，`from_dict`/`to_dict` 同步接线。
 - `config.example.json` 增加上述节。
@@ -100,11 +101,14 @@ class AutoRenewWorker:
   1. 无 user/password 或 api_keys 为空 → `no_credentials`，零网络。
   2. 逐个 `probe`；首个 `invalid` 即停；无一 invalid → `ok`（清除既有 password_error）。
   3. 轮换：`login` → 异常分类（`QuotaAuthError`→`password_error`；`QuotaUnavailable`→`unavailable`；
-     其它→`check_error`，均不做平台调用）→ `create_key` → `list_keys` 逐个 `delete_key`
-     → 全成功才 `persist`；平台任一步失败→`check_error`（不 persist）。
+     其它→`check_error`，均不做平台调用）→ `list_keys` 逐个 `delete_key`（先清空）→ `create_key`
+     （再建唯一一把）→ 全成功才 `persist`；平台任一步失败→`check_error`（不 persist）。
   4. 成功 → `ok`。
-- daemon 线程（`name="auto-renew"`），先 `run_once()` 一次再 `while not stop.wait(interval)`；
+- daemon 线程（`name="auto-renew"`）：先 `run_once()`+`run_cleanup()` 各一次，再按 `interval`
+  周期 `run_once()`（探测/轮换）、按 `cleanup_interval` 周期 `run_cleanup()`（清理多余 key）；
   `stop()` 置 Event + `join(timeout=5)`。
+- `run_cleanup()`：逐账号登录后 `list_keys`，删除 api_key 不在该账号当前 `api_keys` 里的 key
+  （保留当前配置的）；无凭据/无 key 跳过，零网络；登录密码错→`password_error`，瞬时错仅记日志。
 - `account_status()` 线程安全深拷贝；log 只记状态迁移，绝不出现明文 key / access_token。
 
 ## 6. 平台端点契约（逆向，勿改）
