@@ -145,6 +145,15 @@ def _run_non_stream(
     )
 
 
+def _reasoning_text(chunk: Any) -> str:
+    """取出流式分片里的思考内容（``delta.reasoning_content``，与正文分离）。"""
+    choices = chunk.get("choices") or []
+    if not choices:
+        return ""
+    delta = choices[0].get("delta") or {}
+    return delta.get("reasoning_content") or ""
+
+
 def _run_stream(
     req: ModelTestRequest,
     client: Any,
@@ -162,6 +171,9 @@ def _run_stream(
     emit({"type": "start", "account": name, "model": req.model})
     pieces: list[str] = []
     for chunk in StRotator._iter_sse_chunks(resp):
+        reasoning = _reasoning_text(chunk)
+        if reasoning:
+            emit({"type": "reasoning", "account": name, "text": reasoning})
         piece = StRotator._chunk_text(chunk)
         if piece:
             pieces.append(piece)
@@ -196,6 +208,7 @@ def _run_one(
         headers = {"Authorization": f"Bearer {key}"}
         if req.stream:
             payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
             return _run_stream(req, client, payload, headers, name, started, emit)
         return _run_non_stream(client, payload, headers, name, started, emit)
     except NetworkError as exc:
@@ -219,7 +232,7 @@ def run_test(
     client_factory = factory if factory is not None else DEFAULT_CLIENT_FACTORY(config)
     emit_call = emit if emit is not None else _noop
     accounts_by_name = {acct.name: acct for acct in config.accounts}
-    names = list(req.accounts)
+    names = list(dict.fromkeys(req.accounts))
     workers = max(1, min(int(max_workers), len(names)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(

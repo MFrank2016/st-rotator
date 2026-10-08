@@ -54,6 +54,10 @@ class DashboardModelTestTest(unittest.TestCase):
         # error 分支必须兜底建卡，否则该账号在结果区完全不显示。
         self.assertIn("card = card || modelTestCard(obj.account);", DASHBOARD_HTML)
 
+    def test_reasoning_event_rendered(self):
+        # 思考内容（reasoning_content）以 reasoning 事件单独淡色渲染，不混入正文。
+        self.assertIn('name === "reasoning"', DASHBOARD_HTML)
+
 
 if __name__ == "__main__":
     unittest.main()

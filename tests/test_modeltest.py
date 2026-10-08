@@ -507,6 +507,10 @@ class StreamTest(unittest.TestCase):
         self.assertTrue(clients[0].calls[0]["stream"])
         # 上游要求请求体显式 stream=true 才会返回 SSE（否则退回非流式 JSON）
         self.assertIs(clients[0].calls[0]["json_body"].get("stream"), True)
+        self.assertEqual(
+            clients[0].calls[0]["json_body"].get("stream_options"),
+            {"include_usage": True},
+        )
 
         # 单账号：事件顺序完全确定
         self.assertEqual(
@@ -576,6 +580,55 @@ class StreamTest(unittest.TestCase):
         ]
         self.assertEqual(bad_errors[0]["code"], "invalid")
         self.assertEqual(events[-1], {"type": "complete"})
+
+
+class StreamReasoningTest(unittest.TestCase):
+    """思考内容（reasoning_content）作为独立 reasoning 事件下发，且不计入正文。"""
+
+    def test_reasoning_emitted_separately(self):
+        config = _config([AccountConfig(name="账号1", api_keys=["sk-1"])])
+        sse = (
+            'data: {"choices": [{"delta": {"reasoning_content": "想"}}]}\n\n'
+            'data: {"choices": [{"delta": {"reasoning_content": "了"}}]}\n\n'
+            'data: {"choices": [{"delta": {"content": "答"}}]}\n\n'
+            "data: [DONE]\n\n"
+        )
+        clients: list[_FakeClient] = []
+        events: list[dict[str, Any]] = []
+        req = modeltest.ModelTestRequest(
+            model="m1", accounts=["账号1"], prompt="p", stream=True
+        )
+        results = _run_test(
+            config,
+            req,
+            clients,
+            _single_factory(clients, [Response(200, {}, sse.encode("utf-8"))]),
+            emit=events.append,
+        )
+        self.assertEqual(
+            [e["type"] for e in events],
+            ["start", "reasoning", "reasoning", "token", "done", "complete"],
+        )
+        self.assertEqual(
+            [e["text"] for e in events if e["type"] == "reasoning"], ["想", "了"]
+        )
+        self.assertEqual(results[0].text, "答")
+
+
+class DedupeAccountsTest(unittest.TestCase):
+    """重复的账号名只跑一次，避免同账号重复请求与结果卡互相覆盖。"""
+
+    def test_duplicate_accounts_run_once(self):
+        config = _config([AccountConfig(name="账号1", api_keys=["sk-1"])])
+        clients: list[_FakeClient] = []
+        req = modeltest.ModelTestRequest(
+            model="m1", accounts=["账号1", "账号1"], prompt="p"
+        )
+        results = _run_test(
+            config, req, clients, _single_factory(clients, [_ok_response()])
+        )
+        self.assertEqual([r.account for r in results], ["账号1"])
+        self.assertEqual(len(clients), 1)
 
 
 if __name__ == "__main__":

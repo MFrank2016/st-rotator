@@ -1011,6 +1011,10 @@ function onModelTestEvent(name, obj) {
   var card = (S.modelTestCards || {})[obj.account];
   if (name === "start") {
     modelTestCard(obj.account);
+  } else if (name === "reasoning") {
+    if (card) {
+      card.querySelector("pre").innerHTML += '<span class="muted">' + esc(obj.text) + '</span>';
+    }
   } else if (name === "token") {
     if (card) {
       var pre = card.querySelector("pre");
