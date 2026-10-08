@@ -505,6 +505,8 @@ class StreamTest(unittest.TestCase):
         self.assertEqual(result.status, "ok")
         self.assertEqual(result.text, "你好")
         self.assertTrue(clients[0].calls[0]["stream"])
+        # 上游要求请求体显式 stream=true 才会返回 SSE（否则退回非流式 JSON）
+        self.assertIs(clients[0].calls[0]["json_body"].get("stream"), True)
 
         # 单账号：事件顺序完全确定
         self.assertEqual(

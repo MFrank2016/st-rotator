@@ -195,6 +195,7 @@ def _run_one(
         payload = payload_for(req.model, req.prompt, req.reasoning_effort)
         headers = {"Authorization": f"Bearer {key}"}
         if req.stream:
+            payload["stream"] = True
             return _run_stream(req, client, payload, headers, name, started, emit)
         return _run_non_stream(client, payload, headers, name, started, emit)
     except NetworkError as exc:
