@@ -314,6 +314,7 @@ class ConsoleState:
         metrics["upstream_attempts"] = self.rotator.upstream_attempts
         return {
             "version": __version__,
+            "account_names": [a.name for a in self.config.accounts],
             "gateway": self.gateway_info(
                 reveal_token=reveal_token, request_base=request_base
             ),
