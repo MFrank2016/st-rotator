@@ -1,0 +1,482 @@
+"""自动补充账号：可用账号数低于目标时，用易码短信自动注册 / 接管新账号。
+
+决策与平台调用集中在 ``ReplenishWorker``；所有外部依赖（sms / authn / keys /
+persist / registry）都通过注入的协议与回调提供，因此可无网络地整体拉通测试
+（与 autorenew.AutoRenewWorker 同风格）。
+
+一轮 ``run_once`` 的流程：
+1. ``count_available``（只有密码错误才算不可用）对比目标；够 → idle。
+2. 不够 → 循环补齐：
+   a. spend gate：余额差口径算当日消费，超上限 → blocked_cap 即停。
+   b. 取号 + 去重（已用号码跳过，上限 20 次）→ claim。
+   c. 发短信验证码；返回 None → 需要滑块（captcha_required，不花钱），
+      除非注入了 captcha_solver（先 getCaptcha+checkCaptcha 再带 code_key 重发）。
+   d. 等短信；超时 → 换新号，重跑 spend gate。
+   e. mint login challenge（challenge_expired 时重 mint 一次）。
+   f. S1 register → exchange → create key → persist；
+      already_registered → S2 接管：sms_login → 吊销全部 key → 建新 key →
+      二次短信 → 改密 → get_user_info → persist；
+      username_taken → 重造用户名重试一次，仍失败 → check_error。
+   g. 其它异常 → check_error，结束本轮。
+
+纯函数 ``generate_credentials`` 生成的用户名 / 密码字符集都排除 ``$`` ``{``
+``}``，避免被 ConfigStore 的 ``${ENV}`` 占位符展开误伤。
+
+说明：本模块行数超出通用 250 行上限，按 single-responsibility 不可再拆 ——
+接口由 .omo/plans/replenish.md T5 钉死为单模块（6 个纯函数 + 完整 worker 周期），
+仓库同类模块亦为大文件（quota.py 634 行 / autorenew.py 404 行）。特此声明，非漏检。
+"""
+
+from __future__ import annotations
+
+import random
+import string
+import threading
+import time
+from typing import Any, Callable, Mapping, Sequence, cast
+
+from .authn import AuthnError, AuthnTransport, jwt_sub
+from .autorenew import KeyInfo, KeyTransport
+from .config import AccountConfig
+from .registry import Registry
+from .sms import SmsTransport, wait_sms_code
+
+# 错误摘要最长字符数（脱敏上限，同 autorenew.DETAIL_LIMIT）
+DETAIL_LIMIT = 200
+# 取号去重循环上限：连续拿到已用号码超过此数即放弃本轮
+DEDUPE_MAX = 20
+
+# 用户名 / 密码字符集：**刻意排除 $ { }** —— 避免 ConfigStore 的 ${ENV}
+# 占位符展开误伤生成的凭据。
+_USER_CHARSET = string.ascii_letters + string.digits
+_SPECIALS = "~!@#%^&*?_+.,;:-"
+_PASSWORD_CLASSES = (
+    string.ascii_lowercase,
+    string.ascii_uppercase,
+    string.digits,
+    _SPECIALS,
+)
+_USER_MIN, _USER_MAX = 6, 24
+_PW_MIN, _PW_MAX = 8, 32
+
+
+class _StopCycle(Exception):
+    """硬性终止本轮补充（blocked_cap / captcha / check_error / 去重耗尽）。"""
+
+
+def count_available(
+    accounts: Sequence[AccountConfig], statuses: Mapping[str, Mapping[str, str]]
+) -> int:
+    """可用账号数 = 账号总数 - 密码错误（password_error）账号数。
+
+    只有 ``auto_renew.account_status()`` 标为密码错误的账号才算「不可用」；
+    其它状态（ok / check_error / unavailable / 无记录）都算可用。
+    """
+    unavailable = 0
+    for account in accounts:
+        entry = statuses.get(account.name)
+        if entry is not None and entry.get("status") == "password_error":
+            unavailable += 1
+    return len(accounts) - unavailable
+
+
+def _randbelow(rng: Any, n: int) -> int:
+    """统一的 [0, n) 随机整数：兼容 secrets / random.Random / random 模块。"""
+    if hasattr(rng, "randbelow"):
+        return rng.randbelow(n)
+    return rng.randint(0, n - 1)
+
+
+def _sample_without_replacement(rng: Any, seq: Sequence[Any], k: int) -> list[Any]:
+    """从 seq 里不重复地取 k 个（用小算法实现，避免依赖 rng.sample）。"""
+    pool = list(seq)
+    out: list[Any] = []
+    for _ in range(k):
+        out.append(pool.pop(_randbelow(rng, len(pool))))
+    return out
+
+
+def generate_credentials(
+    rng: Any = None, *, user_length: int = 10, password_length: int = 16
+) -> tuple[str, str]:
+    """生成一对新账号凭据 ``(user, password)``。
+
+    - user: ``[A-Za-z0-9]``，长度 6..24（默认 10）。
+    - password: 至少 3 种字符类别（小写 / 大写 / 数字 / 特殊字符），
+      长度 8..32（默认 16）。
+    - 两个字符集都排除 ``$`` ``{`` ``}``，保证 ${ENV} 展开永不误伤。
+
+    ``rng`` 可注入（``secrets`` / ``random.Random(seed)`` / ``random`` 模块）；
+    缺省用 ``random`` 模块，便于测试固定种子。
+    """
+    if rng is None:
+        rng = random
+    ulen = max(_USER_MIN, min(_USER_MAX, int(user_length)))
+    plen = max(_PW_MIN, min(_PW_MAX, int(password_length)))
+
+    user = "".join(rng.choice(_USER_CHARSET) for _ in range(ulen))
+
+    # 随机挑 3 或 4 个类别保证「至少 3 类」，每类至少 1 字符，其余从这些类别里补
+    picked = _sample_without_replacement(rng, _PASSWORD_CLASSES, 3 + _randbelow(rng, 2))
+    pool = "".join(picked)
+    chars = [rng.choice(cls) for cls in picked]
+    chars += [rng.choice(pool) for _ in range(plen - len(chars))]
+    # 就地洗牌，让「每类至少 1 字符」的约束不暴露在头部
+    for i in range(len(chars) - 1, 0, -1):
+        j = _randbelow(rng, i + 1)
+        chars[i], chars[j] = chars[j], chars[i]
+    return user, "".join(chars)
+
+
+def today_str(clock: Callable[[], float] = time.time) -> str:
+    """本地日期 ``YYYY-MM-DD``。"""
+    return time.strftime("%Y-%m-%d", time.localtime(clock()))
+
+
+def spend_ok(cap: float, state: Mapping[str, Any], today: str) -> tuple[bool, float]:
+    """当日花销闸门：返回 ``(allowed, consumed)``。
+
+    - ``state["date"] != today`` → 换天重置：consumed=0，allowed=True。
+    - ``start_balance`` 为 None（当天首次读，基线在别处建立）→ allowed=True，consumed=0。
+    - 否则 consumed = max(0, start_balance - last_balance)，allowed = consumed < cap
+      （cap <= 0 表示不限制）。
+    """
+    if state.get("date") != today:
+        return True, 0.0
+    start = state.get("start_balance")
+    if start is None:
+        return True, 0.0
+    last = state.get("last_balance")
+    try:
+        consumed = max(0.0, float(start) - float(last if last is not None else start))
+    except (TypeError, ValueError):
+        consumed = 0.0
+    try:
+        cap_value = float(cap)
+    except (TypeError, ValueError):
+        cap_value = 0.0
+    return (cap_value <= 0 or consumed < cap_value), consumed
+
+
+class ReplenishWorker:
+    """定时检测可用账号数，不足时自动注册 / 接管新账号。
+
+    与 AutoRenewWorker 同构：``start`` 先立即跑一轮再按 interval 周期循环；
+    任何异常都收敛为状态而不抛出，线程循环永不中断。所有状态写入
+    ``account_status()["_replenish"]``。
+    """
+
+    STATUS_IDLE = "idle"  # 可用账号数已达标
+    STATUS_OK = "ok"  # 本轮补充成功
+    STATUS_BLOCKED_CAP = "blocked_cap"  # 今日短信消费已达上限
+    STATUS_CAPTCHA = "captcha_required"  # 需要滑块验证码且未配置 solver
+    STATUS_CHECK_ERROR = "check_error"  # 平台操作瞬时失败 / 参数问题，下次再试
+    STATUS_UNAVAILABLE = "unavailable"  # 保留位（与 autorenew 状态集合对齐）
+
+    def __init__(
+        self,
+        *,
+        accounts: Callable[[], Sequence[AccountConfig]],
+        status_source: Callable[[], Mapping[str, Mapping[str, str]]],
+        target: int,
+        sms: SmsTransport,
+        authn: AuthnTransport,
+        keys: KeyTransport,
+        captcha_solver: Callable[[], str] | None = None,
+        persist: Callable[..., None],
+        registry: Registry,
+        clock: Callable[[], float] = time.time,
+        key_name: str = "auto",
+        key_type: str = "API_KEY_TYPE_TOKEN_PLAN",
+        keyword: str = "商汤",
+        sms_poll_interval: float = 5.0,
+        sms_poll_timeout: float = 60.0,
+        daily_spend_cap: float = 5.0,
+        interval: float = 3600.0,
+        log: Callable[[str], None] | None = None,
+    ) -> None:
+        self._accounts = accounts
+        self._status_source = status_source
+        self._target = int(target)
+        self._sms = sms
+        self._authn = authn
+        self._keys = keys
+        self._captcha_solver = captcha_solver
+        self._persist = persist
+        self._registry = registry
+        self._clock = clock
+        self._key_name = key_name
+        self._key_type = key_type
+        self._keyword = keyword
+        self._sms_poll_interval = float(sms_poll_interval)
+        self._sms_poll_timeout = float(sms_poll_timeout)
+        self._daily_spend_cap = float(daily_spend_cap)
+        self._interval = float(interval)
+        self._log = log or (lambda _msg: None)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._status: dict[str, dict[str, str]] = {}
+        self._status_lock = threading.Lock()
+
+    # ------------------------------------------------------------ 线程生命周期
+    def start(self) -> None:
+        """以后台 daemon 线程启动补充循环。"""
+        self._thread = threading.Thread(
+            target=self._loop, name="replenish", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """请求停止并 join 线程（最多等 5 秒）。"""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def account_status(self) -> dict[str, dict[str, str]]:
+        """返回 ``{"_replenish": {"status", "message"}}`` 的深拷贝（线程安全）。"""
+        with self._status_lock:
+            return {name: dict(entry) for name, entry in self._status.items()}
+
+    # ------------------------------------------------------------ 核心
+    def run_once(self) -> None:
+        """跑一轮补充；任何异常收敛为 check_error，绝不抛出（线程循环永续）。"""
+        try:
+            self._cycle()
+        except Exception as exc:  # noqa: BLE001 - 兜底：循环线程永不中断
+            self._set_status(
+                self.STATUS_CHECK_ERROR,
+                f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT],
+            )
+
+    def _loop(self) -> None:
+        """先立即跑一轮，再按 interval 周期循环；stop 时退出等待。"""
+        self.run_once()
+        while not self._stop.wait(self._interval):
+            self.run_once()
+
+    def _cycle(self) -> None:
+        """统计可用数 vs 目标；不足则逐个补齐，单次失败即停本轮。"""
+        accounts = list(self._accounts())
+        available = count_available(accounts, self._status_source())
+        if available >= self._target:
+            self._set_status(
+                self.STATUS_IDLE,
+                "",
+                log_line=f"可用账号 {available} >= 目标 {self._target}，无需补充",
+            )
+            return
+        need = self._target - available
+        while need > 0:
+            try:
+                if self._replenish_one():
+                    need -= 1
+            except _StopCycle:
+                return
+            except Exception as exc:  # noqa: BLE001 - 单次迭代失败不拖垮循环
+                self._set_status(
+                    self.STATUS_CHECK_ERROR,
+                    f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT],
+                )
+                return
+
+    # ------------------------------------------------------------ 单次补齐
+    def _replenish_one(self) -> bool:
+        """尝试补齐一个账号。
+
+        返回 True = 成功建号（need 减一）；False = 软重试（短信超时，换新号）。
+        硬性终止（blocked_cap / captcha / check_error / 去重耗尽）先写状态再抛
+        ``_StopCycle`` 结束本轮。
+        """
+        # a. spend gate：余额差口径，超当日上限即停（先查余额再记余额）
+        today = today_str(self._clock)
+        balance = self._sms.left_amount()
+        allowed, _consumed = spend_ok(
+            self._daily_spend_cap, self._registry.spend_state(), today
+        )
+        self._registry.note_balance(today, balance)
+        if not allowed:
+            self._set_status(self.STATUS_BLOCKED_CAP, "今日短信消费已达上限")
+            raise _StopCycle()
+
+        # b. 取号 + 去重（已用号码跳过，不 claim；连续 20 个已用即放弃）
+        phone = self._fetch_fresh_phone()
+        self._registry.claim_phone(phone)
+
+        # c. 发短信验证码；None -> 需要滑块（不花钱），除非有 solver 带 code_key 重发
+        token_code = self._authn.send_sms_code(phone)
+        if token_code is None:
+            if self._captcha_solver is None:
+                self._set_status(self.STATUS_CAPTCHA, "需要滑块验证码（未配置 solver）")
+                raise _StopCycle()
+            code_key = self._captcha_solver()
+            token_code = self._authn.send_sms_code(phone, code_key=code_key)
+            if token_code is None:
+                self._set_status(self.STATUS_CAPTCHA, "滑块验证后仍未下发验证码")
+                raise _StopCycle()
+
+        # d. 等短信；超时 -> 软重试（换新号，重跑 spend gate）
+        code = wait_sms_code(
+            self._sms,
+            phone,
+            keyword=self._keyword,
+            interval=self._sms_poll_interval,
+            timeout=self._sms_poll_timeout,
+            clock=self._clock,
+        )
+        if code is None:
+            return False
+
+        # e. mint login challenge（challenge_expired 重 mint 一次）
+        challenge, verifier = self._mint_challenge()
+
+        # f. S1 新注册；already_registered -> S2 接管；username_taken -> 重试一次
+        user, password = generate_credentials()
+        try:
+            redirect = self._authn.register(
+                token_code=token_code,
+                user_name=user,
+                password=password,
+                challenge=challenge,
+            )
+        except AuthnError as exc:
+            if exc.reason == "already_registered":
+                return self._takeover(token_code, code, challenge, verifier, phone)
+            if exc.reason == "username_taken":
+                user, redirect = self._retry_register(token_code, password, challenge)
+            else:
+                raise
+
+        bundle = self._authn.exchange_code(redirect, verifier)
+        created = self._keys.create_key(
+            bundle.access_token, displayname=self._key_name, key_type=self._key_type
+        )
+        self._persist(user, phone, password, created.api_key)
+        self._set_status(
+            self.STATUS_OK,
+            "",
+            log_line=f"已注册新账号 {user}（{phone}）",
+        )
+        return True
+
+    def _fetch_fresh_phone(self) -> str:
+        """连续取号直到拿到一个未用过的号码；去重耗尽 -> check_error。"""
+        for _ in range(DEDUPE_MAX):
+            phone = self._sms.get_phone(keyword=self._keyword)
+            if not self._registry.is_phone_used(phone):
+                return phone
+        self._set_status(self.STATUS_CHECK_ERROR, f"取号去重超过 {DEDUPE_MAX} 次")
+        raise _StopCycle()
+
+    def _mint_challenge(self) -> tuple[str, str]:
+        """拿 login challenge；challenge_expired 时重 mint 一次。"""
+        try:
+            return self._authn.mint_login_challenge(intent="register")
+        except AuthnError as exc:
+            if exc.reason == "challenge_expired":
+                return self._authn.mint_login_challenge(intent="register")
+            raise
+
+    def _retry_register(
+        self, token_code: str, password: str, challenge: str
+    ) -> tuple[str, str]:
+        """username_taken：重造用户名重试；仍失败 -> check_error。返回 (user, redirect)。"""
+        new_user, _ = generate_credentials()
+        try:
+            redirect = self._authn.register(
+                token_code=token_code,
+                user_name=new_user,
+                password=password,
+                challenge=challenge,
+            )
+        except AuthnError as exc:
+            self._set_status(
+                self.STATUS_CHECK_ERROR,
+                f"用户名重试仍失败: {exc.detail}"[:DETAIL_LIMIT],
+            )
+            raise _StopCycle() from exc
+        return new_user, redirect
+
+    # ------------------------------------------------------------ S2 接管
+    def _takeover(
+        self,
+        token_code: str,
+        verify_code: str,
+        challenge: str,
+        verifier: str,
+        phone: str,
+    ) -> bool:
+        """手机号已被他人注册：短信登录 -> 吊销全部 key -> 建新 key -> 二次短信改密。"""
+        redirect = self._authn.sms_login(
+            token_code=token_code, verify_code=verify_code, challenge=challenge
+        )
+        bundle = self._authn.exchange_code(redirect, verifier)
+        user_id = jwt_sub(bundle.access_token)
+        if not user_id:
+            self._set_status(self.STATUS_CHECK_ERROR, "接管后无法解析 user_id")
+            raise _StopCycle()
+        # 先吊销全部旧 key（该手机号归我们所有，旧凭据一律作废）。
+        # KeyTransport 协议把 list_keys 声明为 (list, next_page_token)，而具体实现
+        # HttpKeyManager.list_keys 已在内部翻页并直接返回 list —— 按实现语义取全部
+        # key（cast 仅消除协议与实现间的既有类型偏差，同 autorenew.py:373）。
+        for item in cast(Sequence[KeyInfo], self._keys.list_keys(bundle.access_token)):
+            self._keys.delete_key(bundle.access_token, key_id=item.id)
+        created = self._keys.create_key(
+            bundle.access_token, displayname=self._key_name, key_type=self._key_type
+        )
+        new_pw = generate_credentials()[1]
+        tok2 = self._authn.request_change_password_code(bundle.access_token, user_id)
+        code2 = wait_sms_code(
+            self._sms,
+            phone,
+            keyword=self._keyword,
+            interval=self._sms_poll_interval,
+            timeout=self._sms_poll_timeout,
+            clock=self._clock,
+        )
+        if code2 is None:
+            # 二次短信超时：账号已在平台接管成功（新 key 已建）。尽量保住成果——
+            # 仍把 key 与新密码落账，但标记 check_error（真实密码未知，可能登录失败，
+            # 下一轮 auto_renew 会如实报 password_error / 或直接走 check_error）。
+            self._persist(
+                "", phone, new_pw, created.api_key, outcome="takeover_password_unset"
+            )
+            self._set_status(
+                self.STATUS_CHECK_ERROR, "改密短信超时，账号已接管但未改密"
+            )
+            raise _StopCycle()
+        self._authn.change_password(
+            bundle.access_token,
+            user_id,
+            token_code=tok2,
+            verify_code=code2,
+            password=new_pw,
+        )
+        try:
+            profile = self._authn.get_user_info(bundle.access_token, user_id)
+            username = str(profile.get("user_name") or profile.get("username") or "")
+        except Exception:  # noqa: BLE001 - 用户名可缺省，不影响落账
+            username = ""
+        self._persist(username, phone, new_pw, created.api_key)
+        self._set_status(
+            self.STATUS_OK,
+            "",
+            log_line=f"已接管账号 {username or phone}（{phone}）并改密",
+        )
+        return True
+
+    # ------------------------------------------------------------ 状态
+    def _set_status(
+        self, status: str, message: str, *, log_line: str | None = None
+    ) -> None:
+        """写入 ``_replenish`` 状态；仅在状态迁移时输出日志。"""
+        with self._status_lock:
+            current = self._status.get("_replenish")
+            changed = (
+                current is None
+                or current.get("status") != status
+                or current.get("message") != message
+            )
+            if changed:
+                self._status["_replenish"] = {"status": status, "message": message}
+        if changed and log_line is not None:
+            self._log(log_line)

@@ -26,6 +26,7 @@ from .config import (
     ConfigStore,
     CooldownConfig,
     RateControlConfig,
+    ReplenishConfig,
 )
 from .errors import (
     AllKeysInvalid,
@@ -40,6 +41,8 @@ from .keypool import ApiKey, KeyPool, KeyStatus, key_id, mask_key
 from .limiter import AdaptiveRateLimiter, RateLimiter
 from .logs import LogBuffer, build_logger, make_log_sink, read_log_tail
 from .proxy import create_server, serve
+from .registry import Registry
+from .replenish import ReplenishWorker, count_available, generate_credentials, spend_ok
 from .transport import HttpClient, NetworkError, Request, Response, StreamResponse
 from .ui import ConsoleState, GatewayMetrics, UiResponse, open_console_window
 from .version import __version__
@@ -65,6 +68,9 @@ __all__ = [
     "NoAvailableKey",
     "RateControlConfig",
     "RateLimiter",
+    "Registry",
+    "ReplenishConfig",
+    "ReplenishWorker",
     "Request",
     "Response",
     "RotationExhausted",
@@ -76,8 +82,10 @@ __all__ = [
     "__version__",
     "build_logger",
     "classify",
+    "count_available",
     "create_server",
     "extract_error",
+    "generate_credentials",
     "key_id",
     "make_log_sink",
     "mask_key",
@@ -85,4 +93,5 @@ __all__ = [
     "parse_retry_after",
     "read_log_tail",
     "serve",
+    "spend_ok",
 ]
