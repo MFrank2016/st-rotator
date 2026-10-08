@@ -341,6 +341,53 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </label>
         <button class="primary" id="btn-apply-options" style="height:33px">应用</button>
       </div>
+      <div class="row" style="margin-bottom:12px;align-items:flex-end;flex-wrap:wrap">
+        <label class="field" style="width:auto;margin-bottom:0;flex-direction:row;align-items:center;gap:6px">
+          <input id="opt-fx-enabled" type="checkbox" style="width:auto;margin:0">
+          <span style="font-weight:600">智能一换一</span>
+        </label>
+        <label class="field" style="width:82px;margin-bottom:0">
+          <span>并发</span>
+          <input id="opt-fx-concurrency" type="number" min="1" max="64">
+        </label>
+        <label class="field" style="width:96px;margin-bottom:0">
+          <span>单轮上限</span>
+          <input id="opt-fx-req" type="number" min="1" max="2048">
+        </label>
+        <label class="field" style="width:110px;margin-bottom:0">
+          <span>触发间隔(秒)</span>
+          <input id="opt-fx-interval" type="number" min="60" step="60">
+        </label>
+        <label class="field" style="width:130px;margin-bottom:0">
+          <span>长文 max_tokens</span>
+          <input id="opt-fx-tokens" type="number" min="128" max="16384" step="128">
+        </label>
+        <label class="field" style="width:104px;margin-bottom:0">
+          <span>大图边长px</span>
+          <input id="opt-fx-imgsize" type="number" min="256" max="2048" step="256">
+        </label>
+        <label class="field" style="width:104px;margin-bottom:0">
+          <span>每请求图片数</span>
+          <input id="opt-fx-imgcount" type="number" min="1" max="9">
+        </label>
+        <label class="field" style="width:auto;margin-bottom:0;flex-direction:row;align-items:center;gap:6px">
+          <input id="opt-fx-image" type="checkbox" style="width:auto;margin:0">
+          <span>带大图</span>
+        </label>
+        <label class="field" style="width:auto;margin-bottom:0;flex-direction:row;align-items:center;gap:6px">
+          <input id="opt-fx-yield" type="checkbox" style="width:auto;margin:0">
+          <span title="有用户请求在途时烧点主动让路，优先保证首字延迟">服务优先</span>
+        </label>
+        <label class="field" style="width:118px;margin-bottom:0">
+          <span>内存下限(MB)</span>
+          <input id="opt-fx-minmem" type="number" min="0" max="8192" step="50">
+        </label>
+      </div>
+      <div class="muted" style="font-size:11.5px;margin-bottom:8px">
+        智能一换一：账号因「套餐额度耗尽」冷却期间，自动用该账号持续调用推广池模型
+        （sensenova-6.8-flash-lite，长文/多图交替），按官方活动「1 推广池积分换 1 通用池积分」加速回补；
+        每轮结束探测一次通用池，回补成功立即复活账号收工；撞推广池窗口限流会自动放慢，耗尽才停。
+      </div>
       <div class="muted" style="font-size:11.5px">
         AIMD 模式下「目标 QPS」是**起始速率**；工具会自己往上下界之间收敛，撞 429 就降、
         长时间干净就升。改参数会重置收敛点，从起始速率重新探测。
@@ -939,6 +986,21 @@ function renderOptions(state) {
   if (document.activeElement !== wait) wait.value = opt.max_total_wait;
   var attempts = $("opt-attempts");
   if (document.activeElement !== attempts) attempts.value = opt.max_attempts;
+  var fx = opt.flash_lite || {};
+  var fe = $("opt-fx-enabled");
+  if (document.activeElement !== fe) fe.checked = !!fx.enabled;
+  var fi = $("opt-fx-image");
+  if (document.activeElement !== fi) fi.checked = !!fx.image_enabled;
+  var fy = $("opt-fx-yield");
+  if (document.activeElement !== fy) fy.checked = fx.yield_to_serve !== false;
+  var fm = $("opt-fx-minmem");
+  if (document.activeElement !== fm && fx.min_available_mb != null) fm.value = fx.min_available_mb;
+  [["opt-fx-concurrency", "concurrency"], ["opt-fx-req", "requests_per_trigger"],
+   ["opt-fx-interval", "min_interval_s"], ["opt-fx-tokens", "long_text_max_tokens"],
+   ["opt-fx-imgsize", "image_size"], ["opt-fx-imgcount", "multi_image_count"]].forEach(function (p) {
+    var el = $(p[0]);
+    if (document.activeElement !== el && fx[p[1]] != null) el.value = fx[p[1]];
+  });
 }
 
 /* ------------------------------------------------------------------ 日志 */
@@ -1060,7 +1122,19 @@ async function onApplyOptions() {
     rate_mode: $("opt-rate-mode").value,
     qps: parseFloat($("opt-qps").value),
     max_total_wait: parseFloat($("opt-wait").value),
-    max_attempts: parseInt($("opt-attempts").value, 10)
+    max_attempts: parseInt($("opt-attempts").value, 10),
+    flash_lite: {
+      enabled: $("opt-fx-enabled").checked,
+      image_enabled: $("opt-fx-image").checked,
+      yield_to_serve: $("opt-fx-yield").checked,
+      min_available_mb: parseFloat($("opt-fx-minmem").value),
+      concurrency: parseInt($("opt-fx-concurrency").value, 10),
+      requests_per_trigger: parseInt($("opt-fx-req").value, 10),
+      min_interval_s: parseFloat($("opt-fx-interval").value),
+      long_text_max_tokens: parseInt($("opt-fx-tokens").value, 10),
+      image_size: parseInt($("opt-fx-imgsize").value, 10),
+      multi_image_count: parseInt($("opt-fx-imgcount").value, 10)
+    }
   };
   try {
     var result = await api("/api/options", { method: "POST", body: JSON.stringify(body) });

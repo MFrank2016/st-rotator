@@ -9,6 +9,7 @@
   "connect_timeout": 10,
   "acquire_timeout": 120,
   "max_total_wait": 120,
+  "acquire_fail_fast": 15,
   "retry_backoff": 0.5,
   "max_retry_backoff": 8,
   "min_max_tokens": 2048,
@@ -32,7 +33,21 @@
     "max": 120,
     "jitter": 0.5,
     "invalid_ttl": 600,
-    "server_error": 2
+    "server_error": 2,
+    "model_unavailable": 300
+  },
+
+  "flash_lite_exchange": {
+    "enabled": false,
+    "model": "sensenova-6.8-flash-lite",
+    "concurrency": 2,
+    "requests_per_trigger": 64,
+    "min_interval_s": 300,
+    "long_text_max_tokens": 1024,
+    "image_enabled": true,
+    "image_size": 768,
+    "multi_image_count": 3,
+    "max_workers": 8
   },
 
   "auto_renew": {

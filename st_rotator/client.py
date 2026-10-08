@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import random
 import re
@@ -72,6 +73,123 @@ MODEL_UNAVAILABLE_HINTS = (
 
 _RETRY_AFTER_BODY = re.compile(r'"retry_?after"?\s*[:=]\s*"?(\d+(?:\.\d+)?)', re.I)
 _RETRY_AFTER_CN = re.compile(r"(\d+(?:\.\d+)?)\s*(?:秒|s)\s*(?:后|之后)", re.I)
+
+# ------------------------------------------------------------ 智能一换一
+# 模块级状态（进程内共享）：触发节流 + 全局并发护栏
+_FX_LOCK = threading.Lock()
+_FX_LAST: dict[str, float] = {}
+_FX_ACTIVE = 0
+
+# 噪声图按尺寸进程级共享——烧点请求体动辄数 MB，反复生成会让 glibc 堆碎片化、
+# RSS 只涨不降（实测一波烧点 37MB→200MB 不回落）；同尺寸图生成一次重复用即可。
+_FX_IMG_CACHE: dict[int, str] = {}
+# 带图请求体每发约 1MB×N 图，是唯一的内存大头：全局限 8 个在飞，防多账号同烧时 OOM
+_FX_IMG_SEM = threading.Semaphore(8)
+
+
+def _noise_png_b64(size: int) -> str:
+    """生成 size×size 随机噪声 PNG 的 base64（纯标准库；按尺寸缓存，避免重复分配 MB 级缓冲）。
+
+    噪声几乎不可压缩，能保证视觉模型按高分辨率图片计费——这正是烧点的目的。
+    """
+    cached = _FX_IMG_CACHE.get(size)
+    if cached is not None:
+        return cached
+    import base64
+    import os
+    import struct
+    import zlib
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    raw = b"".join(b"\x00" + os.urandom(size * 3) for _ in range(size))
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw, 1))
+        + chunk(b"IEND", b"")
+    )
+    b64 = base64.b64encode(png).decode("ascii")
+    with _FX_LOCK:
+        if len(_FX_IMG_CACHE) < 8:  # 最多缓存 8 种尺寸，防无界
+            _FX_IMG_CACHE[size] = b64
+        return _FX_IMG_CACHE.get(size, b64)
+
+
+# ------------------------------------------------------------ 内存看门人
+# CPython 持有已释放的 arena 不还给 OS（glibc 堆碎片化后 RSS 只涨不降，
+# 烧点这类 MB 级瞬时分配会把网关进程的 RSS 顶上去——实测一波烧点 37MB→200MB）。
+# 定期 gc + malloc_trim 可以把空闲堆页真正还给内核；非 glibc 平台自动静默跳过。
+_JANITOR_STARTED = False
+
+
+# ------------------------------------------------------------ 服务优先（烧点让路）
+# 小内存设备上，烧点与用户请求抢 CPU/内存/网络会直接把 TTFT 拖到几十秒。
+# 网关每处理一个用户请求就 +1，烧点在发请求前先看这个计数：有人在等就先让路。
+_SERVE_LOCK = threading.Lock()
+_SERVE_INFLIGHT = 0
+
+
+def note_serve_begin() -> None:
+    """网关开始处理一个用户请求（烧点据此让路）。"""
+    global _SERVE_INFLIGHT
+    with _SERVE_LOCK:
+        _SERVE_INFLIGHT += 1
+
+
+def note_serve_end() -> None:
+    """用户请求处理结束。"""
+    global _SERVE_INFLIGHT
+    with _SERVE_LOCK:
+        _SERVE_INFLIGHT = max(0, _SERVE_INFLIGHT - 1)
+
+
+def serve_inflight() -> int:
+    with _SERVE_LOCK:
+        return _SERVE_INFLIGHT
+
+
+def available_mb() -> float | None:
+    """Linux 下返回 /proc/meminfo 的 MemAvailable（MB）；其他平台返回 None。"""
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _start_janitor() -> None:
+    global _JANITOR_STARTED
+    if _JANITOR_STARTED:
+        return
+    _JANITOR_STARTED = True
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    except OSError:
+        libc = None  # Windows / macOS：obmalloc  arenas 保留，但无 trim 可用
+
+    def loop() -> None:
+        while True:
+            time.sleep(60)
+            try:
+                gc.collect()
+                if libc is not None:
+                    libc.malloc_trim(64 * 1024)
+            except Exception:
+                pass
+
+    threading.Thread(target=loop, daemon=True, name="mem-janitor").start()
 
 
 def safe_text(response: Response | StreamResponse) -> str:
@@ -244,6 +362,9 @@ class StRotator:
         # 一个客户端请求可能因为 429 变成好几次上游尝试，这个比值就是轮换的成本。
         self._attempts_lock = threading.Lock()
         self._upstream_attempts = 0
+        _start_janitor()
+
+    # ------------------------------------------------------------ 生命周期（内存）
 
     # ------------------------------------------------------------ 生命周期
 
@@ -608,6 +729,199 @@ class StRotator:
         """把当前租约对应的 Key 注入请求头。"""
         return {"Authorization": f"Bearer {key.key}"}
 
+    # ------------------------------------------------------------ 智能一换一
+
+    def _maybe_flash_lite_exchange(self, key: ApiKey, detail: str = "") -> None:
+        """账号被判"套餐耗尽冷却"后，自动烧该账号的推广池积分换通用池额度。
+
+        只在错误明确是"额度耗尽"（entitlement/quota/耗尽）时触发；"模型不在套餐"
+        （账号从未开过该模型）烧了也白烧，不触发。
+        同账号有最小触发间隔 + 全局并发护栏，防止多请求并发把触发打成螺旋。
+        """
+        fx = getattr(self.config, "flash_lite_exchange", None)
+        if fx is None or not fx.enabled:
+            return
+        text = (detail or "").lower()
+        if text and not any(k in text for k in ("entitlement", "quota", "exhaust", "额度", "耗尽")):
+            return
+        # 内存护栏：小内存设备上宁可晚点换额度，也不能把整机拖死
+        avail = available_mb()
+        if avail is not None and 0 < fx.min_available_mb and avail < fx.min_available_mb:
+            self._log(f"[一换一] {key.account} 可用内存仅 {avail:.0f}MB < {fx.min_available_mb:.0f}MB，跳过烧点")
+            return
+        global _FX_ACTIVE
+        now = time.time()
+        with _FX_LOCK:
+            last = _FX_LAST.get(key.account, 0.0)
+            if now - last < fx.min_interval_s:
+                return
+            if _FX_ACTIVE >= max(1, fx.max_workers):
+                self._log(f"[一换一] {key.account} 触发过频（全局 {_FX_ACTIVE} 个任务在烧），跳过")
+                return
+            _FX_LAST[key.account] = now
+        threading.Thread(
+            target=self._flash_lite_burn, args=(key, fx), daemon=True, name=f"fx-{key.account}"
+        ).start()
+
+    def _flash_lite_burn(self, key: ApiKey, fx: Any) -> None:
+        """烧点任务本体（后台线程，不阻塞正常流量）。
+
+        循环烧到三种结局之一：
+        1. 探测请求确认通用池已回补 → 立即复活账号、收工（目标达成）
+        2. 套餐冷却窗口（cooldown.model_unavailable）到期 → 收工，交给正常复探
+        3. 推广池积分也耗尽（429 entitlement）→ 收工，不硬烧
+        """
+        global _FX_ACTIVE
+        with _FX_LOCK:
+            _FX_ACTIVE += 1
+        try:
+            cooldown_s = max(60.0, float(self.config.cooldown.model_unavailable))
+            deadline = time.time() + cooldown_s
+            self._log(
+                f"[一换一] {key.masked}({key.account}) 套餐耗尽，开始持续烧 {fx.model} 换通用池"
+                f"（窗口 {cooldown_s:.0f}s / 上限 {fx.requests_per_trigger} 发 / 并发 {fx.concurrency}）…"
+            )
+            stop = threading.Event()  # 硬停止信号（推广池耗尽 / 网络异常）
+            done = 0
+            lock = threading.Lock()
+            images_b64: list[str] | None = None  # 本任务的图组（首次用到时一次性生成）
+
+            def ensure_images() -> list[str]:
+                nonlocal images_b64
+                with lock:
+                    if images_b64 is None:
+                        n = max(1, fx.multi_image_count)
+                        images_b64 = [_noise_png_b64(fx.image_size) for _ in range(n)]
+                    return images_b64
+
+            def one(i: int) -> str:
+                """单发烧点。返回 'ok' / 'soft429' / 'stop' / 'err'。"""
+                nonlocal done
+                if stop.is_set():
+                    return "stop"
+                if fx.image_enabled and i % 2 == 1:
+                    imgs = ensure_images()
+                    content: Any = [{"type": "text", "text": "请逐一详细描述这些图片的内容，不少于300字。"}]
+                    content += [
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}
+                        for b64 in imgs
+                    ]
+                    max_tok = min(fx.long_text_max_tokens, 1024)  # 图请求输出小，省时间
+                else:
+                    content = fx.long_text_prompt
+                    max_tok = fx.long_text_max_tokens
+                payload = {
+                    "model": fx.model,
+                    "messages": [{"role": "user", "content": content}],
+                    "max_tokens": max_tok,
+                    "stream": False,
+                }
+                is_img = isinstance(content, list)
+                # 服务优先：有用户请求在途就先让路（最多等 8s，避免烧点被彻底饿死）
+                if fx.yield_to_serve:
+                    waited = 0.0
+                    while serve_inflight() > 0 and not stop.is_set() and waited < 8.0:
+                        time.sleep(0.3)
+                        waited += 0.3
+                if is_img:
+                    _FX_IMG_SEM.acquire()  # 大图请求进限流闸，防瞬时内存峰值
+                try:
+                    resp = self._client.request("POST", "/chat/completions", json_body=payload, headers=self._auth(key))
+                    if resp.status == 200:
+                        try:
+                            usage = (resp.json() or {}).get("usage") or {}
+                        except Exception:
+                            usage = {}
+                        with lock:
+                            done += 1
+                        n_img = len(content) - 1 if isinstance(content, list) else 0
+                        self._log(
+                            f"[一换一] {key.account} 第 {i + 1} 发烧点完成"
+                            f"（{'%d图' % n_img if n_img else '长文'}，总耗≈{usage.get('total_tokens', '?')} tokens，累计 {done}）"
+                        )
+                        return "ok"
+                    if resp.status == 429:
+                        low = safe_text(resp).lower()
+                        if any(k in low for k in ("entitlement", "quota", "exhaust", "额度", "耗尽")):
+                            self._log(f"[一换一] {key.account} 推广池额度也耗尽（429 entitlement），本轮停止")
+                            stop.set()
+                            return "stop"
+                        return "soft429"  # 分钟级 TPM 窗口：额度还在，放慢即可
+                    self._log(f"[一换一] {key.account} 烧点失败 HTTP {resp.status}: {safe_text(resp)[:120]}")
+                    return "err"
+                except Exception as exc:  # 后台任务，异常不外抛
+                    self._log(f"[一换一] {key.account} 烧点异常: {type(exc).__name__}: {exc}")
+                    stop.set()
+                    return "stop"
+                finally:
+                    if is_img:
+                        _FX_IMG_SEM.release()
+
+            def probe_recovered() -> bool:
+                """用默认模型发一个极小请求，探测通用池是否已回补。"""
+                payload = {
+                    "model": self.config.default_model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 8,
+                    "stream": False,
+                }
+                try:
+                    resp = self._client.request("POST", "/chat/completions", json_body=payload, headers=self._auth(key))
+                    return resp.status == 200
+                except Exception:
+                    return False
+
+            round_i = 0
+            recovered = False
+            last_mem_warn = 0.0
+            while not stop.is_set() and time.time() < deadline and done < fx.requests_per_trigger:
+                # 内存护栏：内存吃紧就先歇着（小内存设备保命优先，别把整机拖死）
+                avail = available_mb()
+                if avail is not None and 0 < fx.min_available_mb and avail < fx.min_available_mb:
+                    if time.time() - last_mem_warn > 60:  # 每分钟最多提示一次，别刷日志
+                        self._log(f"[一换一] {key.account} 可用内存 {avail:.0f}MB 偏低，暂停烧点等待内存回收")
+                        last_mem_warn = time.time()
+                    time.sleep(10)
+                    continue
+                # 服务优先：有用户请求在途就让路，避免抢 CPU/网络把首字延迟拖长
+                if fx.yield_to_serve and serve_inflight() > 0:
+                    time.sleep(1.0)
+                    continue
+                # 每轮并发打一小批
+                batch = min(max(1, fx.concurrency), fx.requests_per_trigger - done)
+                threads = []
+                for _ in range(batch):
+                    if stop.is_set() or time.time() >= deadline:
+                        break
+                    t = threading.Thread(target=one, args=(round_i,), daemon=True)
+                    threads.append(t)
+                    t.start()
+                    round_i += 1
+                for t in threads:
+                    t.join()
+
+                # 每轮结束探测一次：通用池回补了就提前收工 + 立即复活账号
+                if probe_recovered():
+                    self._log(f"[一换一] {key.account} 通用池已回补，提前结束烧点 ✅")
+                    try:
+                        self.pool.report_success(key, latency=0.0)  # 顺带清掉冷却，立刻可用
+                    except Exception:
+                        pass
+                    recovered = True
+                    break
+                # 暴力烧点：正常时立刻下一轮；只有撞推广池窗口限流（soft429）才在 one() 里自行降速
+
+            if not recovered and time.time() >= deadline:
+                self._log(f"[一换一] {key.account} 冷却窗口到期，结束烧点（成功 {done} 发，等待正常复探）")
+            elif not recovered:
+                self._log(f"[一换一] {key.account} 结束烧点，成功 {done} 发")
+        finally:
+            images_b64 = None  # 确定性释放 MB 级图组，别等 GC
+            gc.collect()
+            with _FX_LOCK:
+                _FX_ACTIVE -= 1
+
+
     def _remaining(self, started_at: float, budget: float | None) -> float | None:
         """单请求剩余等待预算；None 表示不设上限。"""
         if budget is None:
@@ -694,6 +1008,7 @@ class StRotator:
                 key = self.pool.acquire(
                     exclude=excluded,
                     timeout=self._acquire_timeout(remaining),
+                    fail_fast=self.config.acquire_fail_fast,
                 )
             except AllKeysInvalid:
                 self.limiter.refund()
@@ -732,12 +1047,24 @@ class StRotator:
                 elif action == "model":
                     # 模型不在当前 Key 的套餐：Key 本身是好的，绝不能标记失效。
                     # 本轮排除这把、换下一把试试（不同账号套餐可能不同）；
+                    # 同时给该账号一个中短冷却，避免后续请求反复白打（额度按小时补充，
+                    # 冷却到期自动复探）；若开启智能一换一，后台烧推广池加速回补。
                     # 若所有 Key 都报模型不可用，直接透传上游错误，不空等。
-                    self.pool.report_client_error(key, extract_error(body))
+                    err_detail = extract_error(body)
+                    delay = self.pool.report_model_unavailable(key, err_detail)
+                    self._maybe_flash_lite_exchange(key, err_detail)
                     excluded.add(key.key)
-                    self._log(f"[模型] {key.masked}({key.account}) 套餐不含该模型，换下一把: {extract_error(body)}")
+                    self._log(f"[模型] {key.masked}({key.account}) 套餐不含该模型，冷却 {delay:.0f}s 换下一把: {err_detail}")
                     if all(k.key in excluded for k in self.pool.keys):
                         raise ApiError(response.status, body)
+                    # 池子已整体不可用（都耗尽/冷却）→ 立即失败，别把剩下的 Key 一把把白打一遍
+                    if not self.pool.any_usable():
+                        wait = self.pool.soonest_wait()
+                        last_exc = NoAvailableKey(
+                            f"所有 Key 的套餐额度都不可用（最快 {wait:.0f}s 后复探）",
+                            retry_after=wait or None,
+                        )
+                        break
                     retryable = True
                 elif action == "retry":
                     if response.status == 429:
@@ -805,6 +1132,7 @@ class StRotator:
                 key = self.pool.acquire(
                     exclude=excluded,
                     timeout=self._acquire_timeout(remaining),
+                    fail_fast=self.config.acquire_fail_fast,
                 )
             except AllKeysInvalid:
                 self.limiter.refund()
@@ -857,13 +1185,23 @@ class StRotator:
                     retryable = True
                 elif action == "model":
                     # 同非流式：模型不在套餐 ≠ Key 失效，换下一把试试；
+                    # 同时给该账号中短冷却，并按需触发一换一烧点。
                     # 所有 Key 都报模型不可用时直接透传上游错误。
                     last_status, last_body = response.status, body
-                    self.pool.report_client_error(key, extract_error(body))
+                    err_detail = extract_error(body)
+                    delay = self.pool.report_model_unavailable(key, err_detail)
+                    self._maybe_flash_lite_exchange(key, err_detail)
                     excluded.add(key.key)
-                    self._log(f"[模型] {key.masked}({key.account}) 套餐不含该模型，换下一把: {extract_error(body)}")
+                    self._log(f"[模型] {key.masked}({key.account}) 套餐不含该模型，冷却 {delay:.0f}s 换下一把: {err_detail}")
                     if all(k.key in excluded for k in self.pool.keys):
                         raise ApiError(response.status, body)
+                    if not self.pool.any_usable():
+                        wait = self.pool.soonest_wait()
+                        last_exc = NoAvailableKey(
+                            f"所有 Key 的套餐额度都不可用（最快 {wait:.0f}s 后复探）",
+                            retry_after=wait or None,
+                        )
+                        break
                     retryable = True
                 elif action == "retry":
                     last_status, last_body = response.status, body
@@ -939,6 +1277,10 @@ class StRotator:
         last_body: str,
         last_exc: Exception | None,
     ) -> RotatorError:
+        # 池子整体不可用（额度耗尽/全在冷却）时保留 NoAvailableKey 语义：
+        # 网关会据此返回 429 + Retry-After，上层立刻改道，而不是当成上游故障（502）。
+        if isinstance(last_exc, NoAvailableKey):
+            return last_exc
         detail = extract_error(last_body) if last_body else (str(last_exc) if last_exc else "未知原因")
         return RotationExhausted(
             f"已尝试 {attempts} 次仍失败，最后一次状态 {last_status or 'N/A'}：{detail}",

@@ -391,12 +391,16 @@ class KeyPool:
         *,
         exclude: Iterable[str] = (),
         timeout: float | None = None,
+        fail_fast: float = 0.0,
     ) -> ApiKey:
         """取一把可用 Key（已计入 inflight 与 RPM 窗口）。
 
         Args:
             exclude: 本轮不要使用的 Key 明文集合（例如刚被判失效的）。
             timeout: 最长等待秒数；None 表示一直等到有 Key 可用。
+            fail_fast: 若"最快可用时刻"仍在此秒数之外，立即失败而不是干等。
+                额度耗尽场景下所有 Key 冷却 5~10 分钟，干等 120s 只会把用户的
+                首字延迟拖到分钟级；快速返回 429 + Retry-After 让上层立刻改道。
 
         Raises:
             AllKeysInvalid: 池内所有 Key 均已失效，等待没有意义。
@@ -424,6 +428,12 @@ class KeyPool:
                     return self._reserve(self._pick(candidates), now)
 
                 wait = self._next_wait(now, excluded)
+                if fail_fast > 0 and wait > fail_fast:
+                    raise NoAvailableKey(
+                        f"最快 {wait:.0f}s 后才有 Key 可用（超过快速失败阈值 {fail_fast:g}s）："
+                        f"{self._describe(now, excluded)}",
+                        retry_after=wait,
+                    )
                 sleep_for = wait if wait > 0 else 0.05
                 if deadline is not None:
                     remain = deadline - now
@@ -505,6 +515,20 @@ class KeyPool:
                 return 0.0
             soonest = moment if soonest is None else min(soonest, moment)
         return 0.0 if soonest is None else max(soonest - now, 0.0)
+
+    def any_usable(self) -> bool:
+        """当前是否有任何 Key 立即可用（不等待）。额度耗尽的快速失败靠它判断。"""
+        with self._cond:
+            now = self._clock()
+            self._refresh(now)
+            return any(k.is_usable(now) for k in self._keys)
+
+    def soonest_wait(self) -> float:
+        """最快还要等多久才有 Key 可用（秒）。"""
+        with self._cond:
+            now = self._clock()
+            self._refresh(now)
+            return self._next_wait(now, frozenset())
 
     def _describe(self, now: float, excluded: frozenset[str] = frozenset()) -> str:
         parts = []
@@ -608,6 +632,35 @@ class KeyPool:
             key.stats.client_errors += 1
             key.stats.failures += 1
             key.last_error = detail or "client error"
+
+    def report_model_unavailable(self, key: ApiKey, detail: str = "") -> float:
+        """记录一次"模型不在套餐 / 套餐额度耗尽"，返回冷却秒数。
+
+        不是凭据失效，不能标 INVALID；但额度是账号级的、立刻重试必然再失败，
+        所以给整账号一个中短冷却（cooldown.model_unavailable，默认 300s），
+        到期自动复探——额度补充（数小时）后最多再白打一次即可发现恢复。
+        冷却为 0 时退化为只计数（旧行为）。
+        """
+        with self._cond:
+            key.stats.client_errors += 1
+            key.stats.failures += 1
+            key.last_error = detail or "model unavailable in plan"
+            delay = max(0.0, self.cooldown.model_unavailable)
+            if delay <= 0:
+                return 0.0
+            until = self._clock() + delay
+            key.status = KeyStatus.COOLDOWN
+            key.cooldown_until = max(key.cooldown_until, until)
+            if key.account_state is not None:
+                key.account_state.cooldown_until = max(key.account_state.cooldown_until, until)
+                key.account_state.last_error = key.last_error
+                for sibling in self._keys:
+                    if sibling.account_state is key.account_state and sibling.status is not KeyStatus.INVALID:
+                        sibling.status = KeyStatus.COOLDOWN
+                        sibling.cooldown_until = max(sibling.cooldown_until, until)
+                        sibling.last_error = key.last_error
+            self._cond.notify_all()
+            return delay
 
     def revive_invalid(self, detail_hints: Iterable[str] = ()) -> int:
         """复活被判失效的 Key（清冷却、清连续失败）。

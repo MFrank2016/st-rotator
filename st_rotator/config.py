@@ -79,7 +79,9 @@ class RateControlConfig:
 
     def __post_init__(self) -> None:
         if self.mode not in self.MODES:
-            raise ConfigError(f"rate_control.mode 必须是 {self.MODES} 之一，当前为 {self.mode!r}")
+            raise ConfigError(
+                f"rate_control.mode 必须是 {self.MODES} 之一，当前为 {self.mode!r}"
+            )
         if self.qps < 0:
             raise ConfigError("rate_control.qps 不能为负")
         if self.mode != "off" and self.qps <= 0:
@@ -92,7 +94,9 @@ class RateControlConfig:
             if not 0 < self.decrease < 1:
                 raise ConfigError("rate_control.decrease 必须落在 (0, 1) 区间")
             if self.increase_step < 0 or self.recovery_seconds < 0:
-                raise ConfigError("rate_control.increase_step / recovery_seconds 不能为负")
+                raise ConfigError(
+                    "rate_control.increase_step / recovery_seconds 不能为负"
+                )
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any] | None) -> "RateControlConfig":
@@ -116,6 +120,9 @@ class CooldownConfig:
         jitter: 抖动比例，取 [0, jitter] 的随机比例叠加，避免多进程同时苏醒。
         invalid_ttl: Key 被判失效后的复活探测间隔；<=0 表示永久失效。
         server_error: 5xx / 网络超时的短冷却秒数（不归咎于 Key，不累计退避）。
+        model_unavailable: "模型不在套餐 / 套餐额度耗尽"的冷却秒数。
+            这类错误不是凭据失效，但立刻重试同一把 Key 必然再失败（白打），
+            给一个中短冷却让调度跳过它、到期自动复探。0 表示不冷却（旧行为）。
     """
 
     base: float = 60.0
@@ -124,6 +131,7 @@ class CooldownConfig:
     jitter: float = 0.5
     invalid_ttl: float = 600.0
     server_error: float = 2.0
+    model_unavailable: float = 300.0
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any] | None) -> "CooldownConfig":
@@ -220,6 +228,76 @@ class AutoRenewConfig:
 
 
 @dataclass
+class FlashLiteExchangeConfig:
+    """智能一换一：套餐耗尽时烧推广池积分换通用池额度。
+
+    有的上游（如商汤日日新）一个账号有两套积分池：通用池 + 推广期模型的
+    独立池（如 sensenova-6.8-flash-lite），官方活动期间烧 1 积分推广池
+    可换 1 积分通用池。开启后：某账号因“套餐额度耗尽”进入冷却的那一刻，
+    网关自动用该账号的 Key 并发调用推广池模型（长文 + 大图），推动额度
+    按活动规则回补，而不是干等恢复窗口。
+
+    Attributes:
+        enabled: 总开关。
+        model: 推广池模型名。
+        concurrency: 每轮并发烧点请求数。
+        requests_per_trigger: 一次触发会话（冷却窗口内）的总请求数上限；
+            触发后会持续烧到通用池回补 / 冷却到期 / 到上限为止。
+        min_interval_s: 同一账号两次触发之间的最小间隔（防止连续触发螺旋）。
+        long_text_max_tokens: 长文请求的 max_tokens。
+        long_text_prompt: 长文请求使用的提示词。
+        image_enabled: 是否交替发送带图的请求（视觉输入烧得更多）。
+        image_size: 生成的噪声大图边长（像素，纯标准库即时生成）。
+        multi_image_count: 每个带图请求附带几张图片（1~9）。
+        max_workers: 全局最多同时进行的烧点任务数（账号级任务，不是请求）。
+        yield_to_serve: 服务优先——有用户请求在途时烧点主动让路，避免拖慢首字延迟。
+        min_available_mb: 可用内存低于此值（MB）时暂停/跳过烧点；0 = 不检查。
+    """
+
+    enabled: bool = False
+    model: str = "sensenova-6.8-flash-lite"
+    concurrency: int = 24
+    requests_per_trigger: int = 32
+    min_interval_s: float = 300.0
+    long_text_max_tokens: int = 4096
+    long_text_prompt: str = (
+        "请写一篇结构完整、细节丰富的深度综述文章，题目为《人工智能基础设施的演进："
+        "从单机推理到全球调度》，包含引言、三个主体章节和总结，不少于1500字。"
+    )
+    image_enabled: bool = True
+    image_size: int = 512
+    multi_image_count: int = 3
+    max_workers: int = 8
+    yield_to_serve: bool = True
+    min_available_mb: float = 300.0
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any] | None) -> "FlashLiteExchangeConfig":
+        data = dict(data or {})
+        unknown = set(data) - set(cls.__dataclass_fields__)
+        if unknown:
+            raise ConfigError(f"flash_lite_exchange 存在未知字段: {sorted(unknown)}")
+        cfg = cls(**data)
+        if not (1 <= cfg.concurrency <= 64):
+            raise ConfigError("flash_lite_exchange.concurrency 需在 1~64 之间")
+        if not (1 <= cfg.requests_per_trigger <= 2048):
+            raise ConfigError(
+                "flash_lite_exchange.requests_per_trigger 需在 1~2048 之间"
+            )
+        if cfg.min_interval_s < 0:
+            raise ConfigError("flash_lite_exchange.min_interval_s 不能为负")
+        if cfg.long_text_max_tokens < 16:
+            raise ConfigError("flash_lite_exchange.long_text_max_tokens 太小")
+        if not (16 <= cfg.image_size <= 4096):
+            raise ConfigError("flash_lite_exchange.image_size 需在 16~4096 之间")
+        if not (1 <= cfg.multi_image_count <= 9):
+            raise ConfigError("flash_lite_exchange.multi_image_count 需在 1~9 之间")
+        if cfg.max_workers < 1:
+            raise ConfigError("flash_lite_exchange.max_workers 必须 >= 1")
+        return cfg
+
+
+@dataclass
 class AccountConfig:
     """一个账号（可含多把 Key）。
 
@@ -307,6 +385,9 @@ class Config:
     timeout: float = 60.0
     connect_timeout: float = 10.0
     acquire_timeout: float = 120.0
+    # 取 Key 的快速失败阈值：最快可用时刻若超过此秒数，立即返回 429 而不是干等。
+    # 额度耗尽时所有 Key 会冷却数分钟，干等会把首字延迟拖到分钟级。
+    acquire_fail_fast: float = 15.0
     max_total_wait: float = 90.0
     retry_backoff: float = 0.5
     max_retry_backoff: float = 8.0
@@ -320,6 +401,10 @@ class Config:
 
     # 定时检测 Key 失效并自动续期（轮换）
     auto_renew: AutoRenewConfig = field(default_factory=AutoRenewConfig)
+    # 智能一换一（套餐耗尽时烧推广池换通用池）
+    flash_lite_exchange: FlashLiteExchangeConfig = field(
+        default_factory=FlashLiteExchangeConfig
+    )
 
     # 连接池
     max_connections: int = 100
@@ -328,8 +413,12 @@ class Config:
     extra_headers: dict[str, str] = field(default_factory=dict)
 
     # 网关行为
-    min_max_tokens: int = 0          # >0 时把请求的 max_tokens 抬到不低于此值（推理模型建议 ≥2048）
-    track_stream_usage: bool = True  # 流式请求注入 stream_options.include_usage 以统计 token 用量
+    min_max_tokens: int = (
+        0  # >0 时把请求的 max_tokens 抬到不低于此值（推理模型建议 ≥2048）
+    )
+    track_stream_usage: bool = (
+        True  # 流式请求注入 stream_options.include_usage 以统计 token 用量
+    )
 
     # ---------------------------------------------------------------- 校验
 
@@ -337,7 +426,9 @@ class Config:
         if not self.accounts:
             raise ConfigError("配置中至少需要一个 account")
         if self.strategy not in STRATEGIES:
-            raise ConfigError(f"strategy 必须是 {STRATEGIES} 之一，当前为 {self.strategy!r}")
+            raise ConfigError(
+                f"strategy 必须是 {STRATEGIES} 之一，当前为 {self.strategy!r}"
+            )
         if self.max_attempts < 1:
             raise ConfigError("max_attempts 必须 >= 1")
         if self.timeout <= 0 or self.connect_timeout <= 0:
@@ -346,8 +437,12 @@ class Config:
             raise ConfigError("max_total_wait 不能为负")
         if self.min_max_tokens < 0:
             raise ConfigError("min_max_tokens 不能为负")
+        if self.acquire_fail_fast < 0:
+            raise ConfigError("acquire_fail_fast 不能为负")
         if not self.base_url.startswith(("http://", "https://")):
-            raise ConfigError(f"base_url 必须以 http(s):// 开头，当前为 {self.base_url!r}")
+            raise ConfigError(
+                f"base_url 必须以 http(s):// 开头，当前为 {self.base_url!r}"
+            )
         self.base_url = self.base_url.rstrip("/")
 
     @property
@@ -365,8 +460,21 @@ class Config:
         cooldown = CooldownConfig.from_dict(data.pop("cooldown", None))
         rate_control = RateControlConfig.from_dict(data.pop("rate_control", None))
         auto_renew = AutoRenewConfig.from_dict(data.pop("auto_renew", None))
-        headers = {str(k): expand_env(str(v)) for k, v in (data.pop("extra_headers", None) or {}).items()}
-        known = set(cls.__dataclass_fields__) - {"accounts", "cooldown", "rate_control", "extra_headers", "auto_renew"}
+        flash_lite = FlashLiteExchangeConfig.from_dict(
+            data.pop("flash_lite_exchange", None)
+        )
+        headers = {
+            str(k): expand_env(str(v))
+            for k, v in (data.pop("extra_headers", None) or {}).items()
+        }
+        known = set(cls.__dataclass_fields__) - {
+            "accounts",
+            "cooldown",
+            "rate_control",
+            "extra_headers",
+            "auto_renew",
+            "flash_lite_exchange",
+        }
         unknown = set(data) - known
         if unknown:
             raise ConfigError(f"配置存在未知字段: {sorted(unknown)}")
@@ -376,6 +484,7 @@ class Config:
             cooldown=cooldown,
             rate_control=rate_control,
             auto_renew=auto_renew,
+            flash_lite_exchange=flash_lite,
             extra_headers=headers,
             **{k: expand_env(v) if isinstance(v, str) else v for k, v in data.items()},
         )
@@ -413,7 +522,9 @@ class Config:
                     "name": a.name,
                     "user": a.user,
                     "phone": a.phone,
-                    "api_keys": [mask_key(k) for k in a.api_keys] if mask_keys else list(a.api_keys),
+                    "api_keys": [mask_key(k) for k in a.api_keys]
+                    if mask_keys
+                    else list(a.api_keys),
                     "rpm_limit": a.rpm_limit,
                     "max_concurrency": a.max_concurrency,
                     "weight": a.weight,
@@ -430,6 +541,7 @@ _SCALAR_FIELDS: dict[str, type] = {
     "timeout": float,
     "connect_timeout": float,
     "acquire_timeout": float,
+    "acquire_fail_fast": float,
     "retry_backoff": float,
     "max_retry_backoff": float,
     "max_connections": int,
@@ -453,7 +565,9 @@ class ConfigStore:
     写入采用「临时文件 + 原子替换」，避免写一半被中断导致配置文件损坏。
     """
 
-    def __init__(self, path: str | os.PathLike[str], raw: dict[str, Any], config: Config) -> None:
+    def __init__(
+        self, path: str | os.PathLike[str], raw: dict[str, Any], config: Config
+    ) -> None:
         self.path = Path(path)
         self._raw = raw
         self.config = config
@@ -630,6 +744,17 @@ class ConfigStore:
             raise ConfigError(f"{field} 的值不合法: {value!r}") from exc
         self._raw[field] = converted
         return converted
+
+    def set_section(self, name: str, values: Mapping[str, Any]) -> dict[str, Any]:
+        """定点更新一个嵌套配置节（如 flash_lite_exchange），其余字段原样保留。"""
+        if not isinstance(values, Mapping) or not values:
+            raise ConfigError("set_section 需要非空的字段映射")
+        section = self._raw.get(name)
+        if not isinstance(section, dict):
+            section = {}
+            self._raw[name] = section
+        section.update(dict(values))
+        return dict(section)
 
     # ------------------------------------------------------------ 重载
 

@@ -249,6 +249,7 @@ pip install -r requirements-quota.txt     # 即 jwcrypto>=1.5
   "strategy": "round_robin",     // round_robin | least_inflight | least_recent | weighted
   "max_attempts": 8,             // 单个请求最多换几次 Key
   "max_total_wait": 120,         // 单请求总等待预算（秒），0 = 不限
+  "acquire_fail_fast": 15,       // 最快可用时刻超过该秒数时立即返回 429，不干等（0 = 关闭）
 
   "rate_control": {
     "mode": "fixed",             // off | fixed | adaptive
@@ -287,11 +288,30 @@ pip install -r requirements-quota.txt     # 即 jwcrypto>=1.5
       "max_concurrency": 4,
       "weight": 1
     }
+  ],
+
+  // 智能一换一：账号因「套餐额度耗尽」冷却时，自动用该账号并发烧推广池模型
+  //（长文+大图），按官方活动「1 推广池积分换 1 通用池积分」加速回补。
+  // 控制台「运行参数」里有开关和参数表单，改动即生效并落盘。
+  "flash_lite_exchange": {
+    "enabled": false,             // 总开关
+    "model": "sensenova-6.8-flash-lite",
+    "concurrency": 2,
+    "requests_per_trigger": 4,
+    "min_interval_s": 300,        // 同账号触发最小间隔
+    "long_text_max_tokens": 1024,
+    "image_enabled": true,
+    "image_size": 512,
+    "max_workers": 8              // 全局最多同时烧点的账号数
   ]
 }
 ```
 
 **`rpm_limit` 是账号级配额**：同一账号下的多把 Key 共享同一个 60 秒窗口，撞到上限时整个账号一起停（避免同账号的多把 Key 连环送死）。所以这里填的是**账号总配额**，不要再除以 Key 数量 —— 除以 Key 数量是旧的「每把 Key 各自一个窗口」语义，会让闸门被收窄 N 倍。
+
+**`acquire_fail_fast` 决定"等还是立刻认输"。** 当池子里所有 Key 都在冷却（如套餐额度耗尽、整体 429）时，`acquire()` 会按 `acquire_timeout` 一直等下去——额度耗尽的场景下所有 Key 的冷却往往长达数分钟，干等会把单个请求的首字延迟拖到几十秒甚至超时。设了 `acquire_fail_fast`（秒）后，若「最快可用时刻」仍大于该值，网关立即返回 **429 + `Retry-After`**，让上层立刻改道，而不是傻等。默认 `15`；不想快速失败可设 `0` 恢复旧行为。
+
+> ⚠️ 这是"本地池子不可用"时的快速失败，不影响正常限流路径。它把「全部 Key 都不可用」从上游故障（502）降级成可重试的限流（429），上层按 429 处理即可。
 
 > ⚠️ **`cooldown.base` 是最容易调错、也最该调的一个参数 —— 它应该 ≈ 上游的限流恢复窗口。**
 > 填小了会让一把已经撞墙的 Key 在几秒后被反复重试，全是白打的请求，

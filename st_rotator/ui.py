@@ -45,7 +45,14 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from .client import StRotator
-from .config import STRATEGIES, Config, ConfigStore, RateControlConfig, next_account_name
+from .config import (
+    STRATEGIES,
+    Config,
+    ConfigStore,
+    FlashLiteExchangeConfig,
+    RateControlConfig,
+    next_account_name,
+)
 from .dashboard import DASHBOARD_HTML, LOGIN_HTML, LOGIN_HTML_INVALID
 from .errors import ConfigError, RotatorError
 from .logs import LogBuffer
@@ -68,7 +75,7 @@ def parse_key_list(raw: str) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
     for token in _KEY_SPLIT.split(raw or ""):
-        token = token.strip().strip('"\'')
+        token = token.strip().strip("\"'")
         if not token or token in seen:
             continue
         seen.add(token)
@@ -94,7 +101,9 @@ def parse_import_lines(raw: str) -> list[tuple[int, str, tuple[str, ...]]]:
 class UsageTracker:
     """按小时分桶的 token 用量统计（线程安全，只保留最近 N 小时）。"""
 
-    def __init__(self, *, hours: int = 720, clock: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self, *, hours: int = 720, clock: Callable[[], float] = time.time
+    ) -> None:
         self._hours = max(1, int(hours))
         self._clock = clock
         self._lock = threading.Lock()
@@ -104,7 +113,9 @@ class UsageTracker:
     def _hour_of(ts: float) -> int:
         return int(ts // 3600) * 3600
 
-    def note(self, *, prompt_tokens: int = 0, completion_tokens: int = 0, requests: int = 1) -> None:
+    def note(
+        self, *, prompt_tokens: int = 0, completion_tokens: int = 0, requests: int = 1
+    ) -> None:
         hour = self._hour_of(self._clock())
         with self._lock:
             bucket = self._buckets.get(hour)
@@ -128,13 +139,15 @@ class UsageTracker:
             for i in range(hours):
                 h = start + i * 3600
                 b = self._buckets.get(h)
-                out.append({
-                    "hour": h,
-                    "prompt": b["prompt"] if b else 0,
-                    "completion": b["completion"] if b else 0,
-                    "total": b["total"] if b else 0,
-                    "requests": b["requests"] if b else 0,
-                })
+                out.append(
+                    {
+                        "hour": h,
+                        "prompt": b["prompt"] if b else 0,
+                        "completion": b["completion"] if b else 0,
+                        "total": b["total"] if b else 0,
+                        "requests": b["requests"] if b else 0,
+                    }
+                )
         return out
 
 
@@ -164,8 +177,14 @@ class GatewayMetrics:
         with self._lock:
             self.errors += 1
 
-    def note_usage(self, *, prompt_tokens: int = 0, completion_tokens: int = 0, requests: int = 1) -> None:
-        self.usage.note(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, requests=requests)
+    def note_usage(
+        self, *, prompt_tokens: int = 0, completion_tokens: int = 0, requests: int = 1
+    ) -> None:
+        self.usage.note(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            requests=requests,
+        )
 
     def set_paused(self, paused: bool) -> bool:
         with self._lock:
@@ -210,10 +229,15 @@ class UiResponse:
         return cls(status=status, payload=payload)
 
     @classmethod
-    def error(cls, message: str, status: int = 400, code: str | None = None) -> "UiResponse":
+    def error(
+        cls, message: str, status: int = 400, code: str | None = None
+    ) -> "UiResponse":
         return cls(
             status=status,
-            payload={"ok": False, "error": {"message": message, "code": code, "type": "console_error"}},
+            payload={
+                "ok": False,
+                "error": {"message": message, "code": code, "type": "console_error"},
+            },
         )
 
     @classmethod
@@ -290,7 +314,9 @@ class ConsoleState:
         metrics["upstream_attempts"] = self.rotator.upstream_attempts
         return {
             "version": __version__,
-            "gateway": self.gateway_info(reveal_token=reveal_token, request_base=request_base),
+            "gateway": self.gateway_info(
+                reveal_token=reveal_token, request_base=request_base
+            ),
             "summary": self.rotator.pool.summary(),
             "keys": self.rotator.pool.snapshot(),
             "rate_control": rate,
@@ -311,6 +337,19 @@ class ConsoleState:
                 "max_attempts": self.config.max_attempts,
                 "strategies": list(STRATEGIES),
                 "rate_modes": list(RateControlConfig.MODES),
+                "flash_lite": {
+                    "enabled": self.config.flash_lite_exchange.enabled,
+                    "model": self.config.flash_lite_exchange.model,
+                    "concurrency": self.config.flash_lite_exchange.concurrency,
+                    "requests_per_trigger": self.config.flash_lite_exchange.requests_per_trigger,
+                    "min_interval_s": self.config.flash_lite_exchange.min_interval_s,
+                    "long_text_max_tokens": self.config.flash_lite_exchange.long_text_max_tokens,
+                    "image_enabled": self.config.flash_lite_exchange.image_enabled,
+                    "image_size": self.config.flash_lite_exchange.image_size,
+                    "multi_image_count": self.config.flash_lite_exchange.multi_image_count,
+                    "yield_to_serve": self.config.flash_lite_exchange.yield_to_serve,
+                    "min_available_mb": self.config.flash_lite_exchange.min_available_mb,
+                },
             },
         }
 
@@ -324,21 +363,25 @@ class ConsoleState:
             return {"accounts": [], "consumption": _empty_consumption()}
         accounts: list[dict[str, Any]] = []
         for aq in self.quota.snapshot(force=force):
-            accounts.append({
-                "account": aq.account,
-                "user": aq.user,
-                "phone": aq.phone,
-                "status": aq.status,
-                "error": aq.error,
-                "fetched_at": aq.fetched_at,
-                "general": _pair_payload(aq.general),
-                "flash_lite": _pair_payload(aq.flash_lite),
-            })
+            accounts.append(
+                {
+                    "account": aq.account,
+                    "user": aq.user,
+                    "phone": aq.phone,
+                    "status": aq.status,
+                    "error": aq.error,
+                    "fetched_at": aq.fetched_at,
+                    "general": _pair_payload(aq.general),
+                    "flash_lite": _pair_payload(aq.flash_lite),
+                }
+            )
         cons = dict(self.quota.credits.snapshot())
         cons["series"] = self.quota.credits.series(hours=24)
         return {"accounts": accounts, "consumption": cons}
 
-    def credits_samples_payload(self, *, limit: int = 200, nonzero: bool = False) -> dict[str, Any]:
+    def credits_samples_payload(
+        self, *, limit: int = 200, nonzero: bool = False
+    ) -> dict[str, Any]:
         """最近的积分采样原始值（含消耗增量），用于排查尖峰来源。"""
         if self.quota is None:
             return {"samples": []}
@@ -364,7 +407,9 @@ class ConsoleState:
         if not candidates:
             return UiResponse.error("没有解析出任何 Key")
         if len(candidates) > MAX_KEYS_PER_REQUEST:
-            return UiResponse.error(f"一次最多添加 {MAX_KEYS_PER_REQUEST} 把 Key，当前 {len(candidates)} 把")
+            return UiResponse.error(
+                f"一次最多添加 {MAX_KEYS_PER_REQUEST} 把 Key，当前 {len(candidates)} 把"
+            )
 
         added: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
@@ -379,7 +424,9 @@ class ConsoleState:
 
         for key in candidates:
             if len(key) < 8:
-                rejected.append({"key": _mask(key), "reason": "长度不足 8 位，不像有效 Key"})
+                rejected.append(
+                    {"key": _mask(key), "reason": "长度不足 8 位，不像有效 Key"}
+                )
                 continue
             if self.rotator.pool.find_key(key) is not None:
                 rejected.append({"key": _mask(key), "reason": "已在池中，跳过"})
@@ -389,20 +436,32 @@ class ConsoleState:
             if verify:
                 verdict, detail = self.rotator.probe_key(key)
                 if verdict == "invalid":
-                    rejected.append({"key": _mask(key), "reason": f"凭据无效：{detail}"})
+                    rejected.append(
+                        {"key": _mask(key), "reason": f"凭据无效：{detail}"}
+                    )
                     continue
                 if verdict == "unknown":
-                    warnings.append(f"{_mask(key)} 暂时无法确认（{detail}），已按可用处理")
+                    warnings.append(
+                        f"{_mask(key)} 暂时无法确认（{detail}），已按可用处理"
+                    )
 
             with self.lock:
                 try:
-                    self.store.add_key(key, target_account, max_concurrency=max_concurrency, rpm_limit=rpm_limit)
+                    self.store.add_key(
+                        key,
+                        target_account,
+                        max_concurrency=max_concurrency,
+                        rpm_limit=rpm_limit,
+                    )
                 except ConfigError as exc:
                     rejected.append({"key": _mask(key), "reason": str(exc)})
                     continue
                 try:
                     item = self.rotator.add_key(
-                        key, account=target_account, max_concurrency=max_concurrency, rpm_limit=rpm_limit
+                        key,
+                        account=target_account,
+                        max_concurrency=max_concurrency,
+                        rpm_limit=rpm_limit,
                     )
                 except ConfigError as exc:
                     # 内存池拒绝 → 回滚刚才写进 store 的那一条，保持两边一致
@@ -411,10 +470,14 @@ class ConsoleState:
                     continue
                 self.store.reload()
                 self.rotator.config.accounts = list(self.store.config.accounts)
-            added.append({"id": item.key_id, "key": item.masked, "account": item.account})
+            added.append(
+                {"id": item.key_id, "key": item.masked, "account": item.account}
+            )
 
         if added:
-            self._save_and_log(f"通过控制台新增 {len(added)} 把 Key（账号 {target_account}）")
+            self._save_and_log(
+                f"通过控制台新增 {len(added)} 把 Key（账号 {target_account}）"
+            )
         if not added and not rejected:
             return UiResponse.error("没有可添加的 Key")
         message = f"新增 {len(added)} 把"
@@ -422,16 +485,20 @@ class ConsoleState:
             message += f"（归入账号 {target_account}，同账号共享配额与 429 冷却）"
         if rejected:
             message += f"，跳过 {len(rejected)} 把"
-        return UiResponse.json({
-            "ok": bool(added),
-            "account": target_account,
-            "added": added,
-            "rejected": rejected,
-            "warnings": warnings,
-            "message": message,
-        })
+        return UiResponse.json(
+            {
+                "ok": bool(added),
+                "account": target_account,
+                "added": added,
+                "rejected": rejected,
+                "warnings": warnings,
+                "message": message,
+            }
+        )
 
-    def import_keys(self, raw: str, *, account: str | None, max_concurrency: int) -> UiResponse:
+    def import_keys(
+        self, raw: str, *, account: str | None, max_concurrency: int
+    ) -> UiResponse:
         """批量导入：支持「纯 Key」与「手机--用户名--密码--apikey」两种格式，逐行校验。
 
         整批一次最多 ``MAX_IMPORT_LINES`` 行；重复（本批内 / 已在池中）跳过，
@@ -441,9 +508,13 @@ class ConsoleState:
         if not rows:
             return UiResponse.error("没有解析出任何内容")
         if len(rows) > MAX_IMPORT_LINES:
-            return UiResponse.error(f"一次最多导入 {MAX_IMPORT_LINES} 行，当前 {len(rows)} 行")
+            return UiResponse.error(
+                f"一次最多导入 {MAX_IMPORT_LINES} 行，当前 {len(rows)} 行"
+            )
 
-        def row(line_no: int, parts: tuple[str, ...], status: str, reason: str, masked: str) -> dict[str, Any]:
+        def row(
+            line_no: int, parts: tuple[str, ...], status: str, reason: str, masked: str
+        ) -> dict[str, Any]:
             return {
                 "line": line_no,
                 "input_masked": masked,
@@ -452,7 +523,9 @@ class ConsoleState:
                 "reason": reason,
             }
 
-        format_error = "格式错误：应为 1 段（纯 key）或 4 段（手机--用户名--密码--apikey）"
+        format_error = (
+            "格式错误：应为 1 段（纯 key）或 4 段（手机--用户名--密码--apikey）"
+        )
 
         results: list[dict[str, Any]] = []
         added: list[dict[str, Any]] = []
@@ -477,11 +550,15 @@ class ConsoleState:
                 target = self._import_account_for(user, phone)
 
             if key in seen_keys:
-                results.append(row(line_no, parts, "skipped", "重复：本批已出现", _mask(key)))
+                results.append(
+                    row(line_no, parts, "skipped", "重复：本批已出现", _mask(key))
+                )
                 skipped += 1
                 continue
             if self.rotator.pool.find_key(key) is not None:
-                results.append(row(line_no, parts, "skipped", "重复：已在池中", _mask(key)))
+                results.append(
+                    row(line_no, parts, "skipped", "重复：已在池中", _mask(key))
+                )
                 skipped += 1
                 continue
             seen_keys.add(key)
@@ -489,7 +566,15 @@ class ConsoleState:
             # 格式 2：先校验凭据（用户名/密码需齐全，且需要 jwcrypto）
             if len(parts) == 4:
                 if not (user and password):
-                    results.append(row(line_no, parts, "error", "格式错误：用户名或密码为空", _mask(text)))
+                    results.append(
+                        row(
+                            line_no,
+                            parts,
+                            "error",
+                            "格式错误：用户名或密码为空",
+                            _mask(text),
+                        )
+                    )
                     error += 1
                     continue
                 svc = self.quota or QuotaService(self.config)
@@ -505,7 +590,9 @@ class ConsoleState:
             # 校验 Key 本身（有效性由上游探测决定）
             verdict, detail = self.rotator.probe_key(key)
             if verdict == "invalid":
-                results.append(row(line_no, parts, "error", f"Key 无效：{detail}", _mask(key)))
+                results.append(
+                    row(line_no, parts, "error", f"Key 无效：{detail}", _mask(key))
+                )
                 error += 1
                 continue
 
@@ -514,7 +601,9 @@ class ConsoleState:
                 with self.lock:
                     self.store.add_key(key, target, max_concurrency=max_concurrency)
                     try:
-                        item = self.rotator.add_key(key, account=target, max_concurrency=max_concurrency)
+                        item = self.rotator.add_key(
+                            key, account=target, max_concurrency=max_concurrency
+                        )
                     except Exception:
                         # 内存池拒绝 → 回滚刚落进 store 的那一条（此时尚未写凭据），保持两边一致
                         try:
@@ -523,10 +612,14 @@ class ConsoleState:
                             pass
                         raise
                     if len(parts) == 4:
-                        self.store.set_account_credentials(target, user=user, phone=phone, password=password)
+                        self.store.set_account_credentials(
+                            target, user=user, phone=phone, password=password
+                        )
                     self.store.reload()
                     self.rotator.config.accounts = list(self.store.config.accounts)
-                added.append({"id": item.key_id, "key": item.masked, "account": item.account})
+                added.append(
+                    {"id": item.key_id, "key": item.masked, "account": item.account}
+                )
                 results.append(row(line_no, parts, "ok", "已导入", item.masked))
                 ok += 1
             except Exception as exc:  # noqa: BLE001 - 单行失败不影响其余
@@ -535,12 +628,14 @@ class ConsoleState:
 
         if added:
             self._save_and_log(f"通过控制台批量导入 {len(added)} 把 Key")
-        return UiResponse.json({
-            "ok": bool(added),
-            "added": added,
-            "results": results,
-            "summary": {"ok": ok, "error": error, "skipped": skipped},
-        })
+        return UiResponse.json(
+            {
+                "ok": bool(added),
+                "added": added,
+                "results": results,
+                "summary": {"ok": ok, "error": error, "skipped": skipped},
+            }
+        )
 
     def _import_account_for(self, user: str, phone: str) -> str:
         """格式 2 的归属账号：优先复用已有同名 ``user`` 的账号，否则按 ``user or phone`` 新建。
@@ -561,12 +656,14 @@ class ConsoleState:
             return UiResponse.error("池中找不到这把 Key（可能已被删除）", status=404)
         verdict, detail = self.rotator.probe_key(item.key)
         labels = {"ok": "凭据有效", "invalid": "凭据无效", "unknown": "暂时无法确认"}
-        return UiResponse.json({
-            "ok": verdict != "invalid",
-            "verdict": verdict,
-            "detail": detail,
-            "message": f"{item.account} / {item.masked}：{labels.get(verdict, verdict)}（{detail}）",
-        })
+        return UiResponse.json(
+            {
+                "ok": verdict != "invalid",
+                "verdict": verdict,
+                "detail": detail,
+                "message": f"{item.account} / {item.masked}：{labels.get(verdict, verdict)}（{detail}）",
+            }
+        )
 
     def remove_one(self, identifier: str) -> UiResponse:
         """从内存池和配置文件里同时删除一把 Key。"""
@@ -574,8 +671,13 @@ class ConsoleState:
         if item is None:
             return UiResponse.error("池中找不到这把 Key（可能已被删除）", status=404)
         plain, label = item.key, f"{item.account} / {item.masked}"
-        if self.rotator.pool.find_key(plain) is not None and len(self.rotator.pool) <= 1:
-            return UiResponse.error("这是池里最后一把 Key，删掉后就无法提供服务了；请先添加新 Key")
+        if (
+            self.rotator.pool.find_key(plain) is not None
+            and len(self.rotator.pool) <= 1
+        ):
+            return UiResponse.error(
+                "这是池里最后一把 Key，删掉后就无法提供服务了；请先添加新 Key"
+            )
 
         with self.lock:
             removed = self.rotator.remove_key(plain)
@@ -597,7 +699,9 @@ class ConsoleState:
             self.store.set_default_model(model)
         self._save_and_log(f"默认模型切换为 {model}")
         note = "" if not known or model in known else "（不在上游清单里，请确认拼写）"
-        return UiResponse.json({"ok": True, "model": model, "message": f"默认模型已切换为 {model}{note}"})
+        return UiResponse.json(
+            {"ok": True, "model": model, "message": f"默认模型已切换为 {model}{note}"}
+        )
 
     def set_options(self, payload: Mapping[str, Any]) -> UiResponse:
         """改运行参数：调度策略 / 限速 / 重试预算。改动立即生效并落盘。"""
@@ -616,7 +720,9 @@ class ConsoleState:
         mode = payload.get("rate_mode")
         if mode is not None and mode != self.config.rate_control.mode:
             if mode not in RateControlConfig.MODES:
-                return UiResponse.error(f"限速模式只能是 {list(RateControlConfig.MODES)} 之一")
+                return UiResponse.error(
+                    f"限速模式只能是 {list(RateControlConfig.MODES)} 之一"
+                )
             rate_fields["mode"] = mode
         qps = payload.get("qps")
         if qps is not None:
@@ -628,7 +734,9 @@ class ConsoleState:
                 return UiResponse.error("QPS 不能为负")
             effective_mode = rate_fields.get("mode") or self.config.rate_control.mode
             if effective_mode != "off" and qps <= 0:
-                return UiResponse.error(f"限速模式为 {effective_mode} 时 QPS 必须大于 0")
+                return UiResponse.error(
+                    f"限速模式为 {effective_mode} 时 QPS 必须大于 0"
+                )
             if qps != self.config.rate_control.qps:
                 rate_fields["qps"] = qps
         if rate_fields:
@@ -638,9 +746,14 @@ class ConsoleState:
                     self.store.set_rate_control(**rate_fields)
             except ConfigError as exc:
                 return UiResponse.error(str(exc))
-            changes.append("限速=" + " ".join(f"{k}:{v}" for k, v in rate_fields.items()))
+            changes.append(
+                "限速=" + " ".join(f"{k}:{v}" for k, v in rate_fields.items())
+            )
 
-        for field_name, label in (("max_total_wait", "等待预算"), ("max_attempts", "最大重试")):
+        for field_name, label in (
+            ("max_total_wait", "等待预算"),
+            ("max_attempts", "最大重试"),
+        ):
             value = payload.get(field_name)
             if value is None:
                 continue
@@ -659,6 +772,56 @@ class ConsoleState:
                 self.store.set_scalar(field_name, converted)
             changes.append(f"{label}={converted}")
 
+        fx_payload = payload.get("flash_lite")
+        if fx_payload is not None:
+            if not isinstance(fx_payload, dict):
+                return UiResponse.error("flash_lite 必须是对象")
+            fx_cfg = self.config.flash_lite_exchange
+            fx_changes: dict[str, Any] = {}
+            for f in ("enabled", "image_enabled", "yield_to_serve"):
+                if f in fx_payload:
+                    fx_changes[f] = bool(fx_payload[f])
+            fx_num_fields = (
+                ("concurrency", int, 1, 64, "一换一并发"),
+                ("requests_per_trigger", int, 1, 2048, "一换一单轮上限"),
+                ("min_interval_s", float, 60.0, 86400.0, "一换一触发间隔"),
+                ("long_text_max_tokens", int, 128, 16384, "一换一长文预算"),
+                ("image_size", int, 256, 2048, "一换一大图边长"),
+                ("multi_image_count", int, 1, 9, "一换一每请求图片数"),
+                ("min_available_mb", float, 0.0, 8192.0, "一换一内存下限(MB)"),
+            )
+            for f, typ, lo, hi, label in fx_num_fields:
+                if f not in fx_payload:
+                    continue
+                try:
+                    v = typ(fx_payload[f])
+                except (TypeError, ValueError):
+                    return UiResponse.error(f"{label}不是合法数字：{fx_payload[f]!r}")
+                if not lo <= v <= hi:
+                    return UiResponse.error(f"{label}需在 {lo:g}~{hi:g} 之间")
+                fx_changes[f] = v
+            fx_changes = {
+                k: v for k, v in fx_changes.items() if getattr(fx_cfg, k) != v
+            }
+            if fx_changes:
+                # 先在纯数据上整体校验（不改内存态），通过后再落盘 + 生效
+                candidate = {
+                    f: getattr(fx_cfg, f)
+                    for f in FlashLiteExchangeConfig.__dataclass_fields__
+                }
+                candidate.update(fx_changes)
+                try:
+                    FlashLiteExchangeConfig.from_dict(candidate)
+                except ConfigError as exc:
+                    return UiResponse.error(str(exc))
+                with self.lock:
+                    for k, v in fx_changes.items():
+                        setattr(fx_cfg, k, v)
+                    self.store.set_section("flash_lite_exchange", fx_changes)
+                changes.append(
+                    "一换一 " + "，".join(f"{k}:{v}" for k, v in fx_changes.items())
+                )
+
         if not changes:
             return UiResponse.json({"ok": True, "message": "没有需要改动的参数"})
         self._save_and_log("运行参数已更新：" + "，".join(changes))
@@ -668,11 +831,13 @@ class ConsoleState:
         """暂停 / 恢复对外服务（网关进程和控制台都还活着）。"""
         state = self.metrics.set_paused(paused)
         self._log(f"[控制台] {'暂停' if state else '恢复'}对外接入")
-        return UiResponse.json({
-            "ok": True,
-            "paused": state,
-            "message": "已暂停接入，上层会收到 503" if state else "已恢复接入",
-        })
+        return UiResponse.json(
+            {
+                "ok": True,
+                "paused": state,
+                "message": "已暂停接入，上层会收到 503" if state else "已恢复接入",
+            }
+        )
 
     def refresh_models(self) -> UiResponse:
         try:
@@ -681,11 +846,13 @@ class ConsoleState:
             return UiResponse.error(f"拉取模型清单失败：{exc}", status=502)
         if catalog.get("error") and not catalog.get("models"):
             return UiResponse.error(f"拉取模型清单失败：{catalog['error']}", status=502)
-        return UiResponse.json({
-            "ok": True,
-            "count": len(catalog.get("models", [])),
-            "message": f"已拉取 {len(catalog.get('models', []))} 个模型",
-        })
+        return UiResponse.json(
+            {
+                "ok": True,
+                "count": len(catalog.get("models", [])),
+                "message": f"已拉取 {len(catalog.get('models', []))} 个模型",
+            }
+        )
 
     # ------------------------------------------------------------ 内部
 
@@ -729,14 +896,20 @@ class ConsoleState:
         try:
             if method == "GET":
                 if path == "/api/state":
-                    return UiResponse.json(self.snapshot(reveal_token=reveal_token, request_base=request_base))
+                    return UiResponse.json(
+                        self.snapshot(
+                            reveal_token=reveal_token, request_base=request_base
+                        )
+                    )
                 if path == "/api/usage":
                     hours = _clamp_int(_first_int(query, "hours", 24), 24, 1, 720)
                     return UiResponse.json(self.usage_payload(hours=hours))
                 if path == "/api/credits/samples":
                     limit = _clamp_int(_first_int(query, "limit", 200), 200, 1, 2000)
                     nonzero = bool(_first_int(query, "nonzero", 0))
-                    return UiResponse.json(self.credits_samples_payload(limit=limit, nonzero=nonzero))
+                    return UiResponse.json(
+                        self.credits_samples_payload(limit=limit, nonzero=nonzero)
+                    )
                 if path == "/api/logs":
                     cursor = _first_int(query, "cursor", 0)
                     return UiResponse.json(self.logs_since(cursor))
@@ -757,20 +930,32 @@ class ConsoleState:
                             rpm_limit = None
                     return self.add_keys(
                         str(payload.get("keys") or payload.get("key") or ""),
-                        account=(str(payload.get("account")).strip() or None) if payload.get("account") else None,
-                        max_concurrency=_clamp_int(payload.get("max_concurrency"), 4, 1, 64),
+                        account=(str(payload.get("account")).strip() or None)
+                        if payload.get("account")
+                        else None,
+                        max_concurrency=_clamp_int(
+                            payload.get("max_concurrency"), 4, 1, 64
+                        ),
                         rpm_limit=rpm_limit,
                     )
                 if path == "/api/keys/import":
                     return self.import_keys(
                         str(payload.get("lines") or ""),
-                        account=(str(payload.get("account")).strip() or None) if payload.get("account") else None,
-                        max_concurrency=_clamp_int(payload.get("max_concurrency"), 4, 1, 64),
+                        account=(str(payload.get("account")).strip() or None)
+                        if payload.get("account")
+                        else None,
+                        max_concurrency=_clamp_int(
+                            payload.get("max_concurrency"), 4, 1, 64
+                        ),
                     )
                 if path == "/api/keys/verify":
-                    return self.verify_one(str(payload.get("id") or payload.get("key") or ""))
+                    return self.verify_one(
+                        str(payload.get("id") or payload.get("key") or "")
+                    )
                 if path == "/api/keys/remove":
-                    return self.remove_one(str(payload.get("id") or payload.get("key") or ""))
+                    return self.remove_one(
+                        str(payload.get("id") or payload.get("key") or "")
+                    )
                 if path == "/api/model":
                     return self.set_model(str(payload.get("model") or ""))
                 if path == "/api/models/refresh":
@@ -787,7 +972,9 @@ class ConsoleState:
         except RotatorError as exc:
             return UiResponse.error(f"{type(exc).__name__}: {exc}", status=502)
         except Exception as exc:  # pragma: no cover - 控制台不该把网关搞崩
-            return UiResponse.error(f"控制台内部错误：{type(exc).__name__}: {exc}", status=500)
+            return UiResponse.error(
+                f"控制台内部错误：{type(exc).__name__}: {exc}", status=500
+            )
 
 
 def _mask(key: str) -> str:
@@ -796,7 +983,9 @@ def _mask(key: str) -> str:
     return mask_key(key)
 
 
-def _first_int(query: Mapping[str, Sequence[str]] | None, name: str, default: int) -> int:
+def _first_int(
+    query: Mapping[str, Sequence[str]] | None, name: str, default: int
+) -> int:
     if not query:
         return default
     values = query.get(name)
@@ -901,7 +1090,9 @@ def open_console_window(
     kwargs: dict[str, Any] = {"close_fds": True}
     if detach:
         if sys.platform == "win32":
-            kwargs["creationflags"] = 0x00000008 | 0x08000000  # DETACHED_PROCESS | CREATE_NO_WINDOW
+            kwargs["creationflags"] = (
+                0x00000008 | 0x08000000
+            )  # DETACHED_PROCESS | CREATE_NO_WINDOW
         else:
             kwargs["start_new_session"] = True
     try:
