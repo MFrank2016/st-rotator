@@ -42,7 +42,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from .client import StRotator
 from .config import (
@@ -51,6 +51,7 @@ from .config import (
     ConfigStore,
     FlashLiteExchangeConfig,
     RateControlConfig,
+    ReplenishConfig,
     next_account_name,
 )
 from .dashboard import DASHBOARD_HTML, LOGIN_HTML, LOGIN_HTML_INVALID
@@ -58,7 +59,12 @@ from .errors import ConfigError, RotatorError
 from .logs import LogBuffer
 from .autorenew import AutoRenewWorker
 from .quota import QuotaService, QuotaWindow, WindowPair
+from .replenish import count_available
 from .version import __version__
+
+if TYPE_CHECKING:  # pragma: no cover - 仅类型标注用，运行时字段默认 None
+    from .replenish import ReplenishWorker
+    from .registry import Registry
 
 # 控制台页面路径（免鉴权，内容只是空壳）
 PAGE_PATHS = frozenset({"/", "/ui", "/ui/", "/admin", "/admin/"})
@@ -271,6 +277,8 @@ class ConsoleState:
     metrics: GatewayMetrics = field(default_factory=GatewayMetrics)
     quota: QuotaService | None = None
     auto_renew: AutoRenewWorker | None = None
+    replenish: ReplenishWorker | None = None
+    registry: Registry | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     # ------------------------------------------------------------ 只读
@@ -328,6 +336,10 @@ class ConsoleState:
             "account_status": self.auto_renew.account_status()
             if self.auto_renew
             else {},
+            "replenish_status": self.replenish.account_status()
+            if self.replenish
+            else {},
+            "replenish_state": self._replenish_state_payload(),
             "options": {
                 "strategy": self.config.strategy,
                 "rate_mode": self.config.rate_control.mode,
@@ -350,6 +362,17 @@ class ConsoleState:
                     "multi_image_count": self.config.flash_lite_exchange.multi_image_count,
                     "yield_to_serve": self.config.flash_lite_exchange.yield_to_serve,
                     "min_available_mb": self.config.flash_lite_exchange.min_available_mb,
+                },
+                "replenish": {
+                    "enabled": self.config.replenish.enabled,
+                    "target_count": self.config.replenish.target_count,
+                    "interval_seconds": self.config.replenish.interval_seconds,
+                    "keyword": self.config.replenish.keyword,
+                    "daily_spend_cap": self.config.replenish.daily_spend_cap,
+                    "sms_poll_interval": self.config.replenish.sms_poll_interval,
+                    "sms_poll_timeout": self.config.replenish.sms_poll_timeout,
+                    "key_name": self.config.replenish.key_name,
+                    "key_type": self.config.replenish.key_type,
                 },
             },
         }
@@ -387,6 +410,24 @@ class ConsoleState:
         if self.quota is None:
             return {"samples": []}
         return {"samples": self.quota.credits.samples(limit=limit, nonzero=nonzero)}
+
+    def _replenish_state_payload(self) -> dict[str, Any]:
+        """补号状态：可用数 / 目标 / 当日花销 / 已用号码数 / 是否在跑。
+
+        可用数与 worker 用同一判定来源（auto_renew 的账号状态）：只有密码错误的账号算
+        不可用。无 worker / registry 时给出安全默认（花销与已用号码为空）。
+        """
+        status_source = self.auto_renew.account_status() if self.auto_renew else {}
+        available = count_available(self.config.accounts, status_source)
+        spend = self.registry.spend_state() if self.registry else {}
+        used = len(self.registry.used_phones()) if self.registry else 0
+        return {
+            "available": available,
+            "target": self.config.replenish.target_count,
+            "spend": spend,
+            "used_phones": used,
+            "running": self.replenish is not None,
+        }
 
     # ------------------------------------------------------------ 写操作
 
@@ -821,6 +862,68 @@ class ConsoleState:
                     self.store.set_section("flash_lite_exchange", fx_changes)
                 changes.append(
                     "一换一 " + "，".join(f"{k}:{v}" for k, v in fx_changes.items())
+                )
+
+        rp_payload = payload.get("replenish")
+        if rp_payload is not None:
+            if not isinstance(rp_payload, dict):
+                return UiResponse.error("replenish 必须是对象")
+            rp_cfg = self.config.replenish
+            rp_changes: dict[str, Any] = {}
+            if "enabled" in rp_payload:
+                rp_changes["enabled"] = bool(rp_payload["enabled"])
+            for field_name, label in (
+                ("target_count", "目标账号数"),
+                ("interval_seconds", "检测间隔(秒)"),
+                ("sms_poll_interval", "短信轮询间隔(秒)"),
+                ("sms_poll_timeout", "短信等待超时(秒)"),
+            ):
+                if field_name not in rp_payload:
+                    continue
+                try:
+                    rp_changes[field_name] = int(rp_payload[field_name])
+                except (TypeError, ValueError):
+                    return UiResponse.error(
+                        f"{label}不是合法数字：{rp_payload[field_name]!r}"
+                    )
+            if "daily_spend_cap" in rp_payload:
+                try:
+                    rp_changes["daily_spend_cap"] = float(rp_payload["daily_spend_cap"])
+                except (TypeError, ValueError):
+                    return UiResponse.error(
+                        f"单日消费上限不是合法数字：{rp_payload['daily_spend_cap']!r}"
+                    )
+            for field_name in ("keyword", "key_name", "key_type", "sms_token"):
+                if field_name not in rp_payload or rp_payload[field_name] is None:
+                    continue
+                value = str(rp_payload[field_name]).strip()
+                if field_name == "sms_token" and not value:
+                    continue  # 空 token 忽略，绝不清空既有配置
+                rp_changes[field_name] = value
+            rp_changes = {
+                k: v for k, v in rp_changes.items() if getattr(rp_cfg, k) != v
+            }
+            if rp_changes:
+                # 先在纯数据上整体校验（不改内存态），通过后再落盘 + 生效
+                candidate = {
+                    f: getattr(rp_cfg, f) for f in ReplenishConfig.__dataclass_fields__
+                }
+                candidate.update(rp_changes)
+                try:
+                    ReplenishConfig.from_dict(candidate)
+                except ConfigError as exc:
+                    return UiResponse.error(str(exc))
+                with self.lock:
+                    for k, v in rp_changes.items():
+                        setattr(rp_cfg, k, v)
+                    if self.store is not None:
+                        self.store.set_section("replenish", rp_changes)
+                changes.append(
+                    "补号 "
+                    + "，".join(
+                        f"{k}:***" if k == "sms_token" else f"{k}:{v}"
+                        for k, v in rp_changes.items()
+                    )
                 )
 
         if not changes:

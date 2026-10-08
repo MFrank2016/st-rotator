@@ -3,6 +3,10 @@ config.json
 config.*.json
 !config.example.json
 
+# 补号注册表（已用号码 / 每日花销 / 注册审计）—— 含敏感数据，不要提交
+replenish.json
+replenish.json.tmp
+
 # 运行产物
 .venv/
 __pycache__/

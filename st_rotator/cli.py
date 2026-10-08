@@ -1,12 +1,12 @@
 """命令行入口。
 
-    python -m st_rotator ui                          # 图形控制台（推荐）
-    python -m st_rotator demo                        # 离线演示，不需要真实 Key
-    python -m st_rotator check -c config.json        # 逐把 Key 体检
-    python -m st_rotator status -c config.json       # 看当前池状态
-    python -m st_rotator chat  -c config.json "你好"
-    python -m st_rotator serve -c config.json        # 只起网关，无界面
-    python -m st_rotator bench -c config.json -n 200 -p 16
+python -m st_rotator ui                          # 图形控制台（推荐）
+python -m st_rotator demo                        # 离线演示，不需要真实 Key
+python -m st_rotator check -c config.json        # 逐把 Key 体检
+python -m st_rotator status -c config.json       # 看当前池状态
+python -m st_rotator chat  -c config.json "你好"
+python -m st_rotator serve -c config.json        # 只起网关，无界面
+python -m st_rotator bench -c config.json -n 200 -p 16
 """
 
 from __future__ import annotations
@@ -22,19 +22,31 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from .client import StRotator
-from .config import Config, ConfigStore, RateControlConfig
-from .errors import ApiError, NoAvailableKey, RotationExhausted, RotatorError, StreamInterrupted
+from .config import Config, ConfigStore, RateControlConfig, next_account_name
+from .errors import (
+    ApiError,
+    NoAvailableKey,
+    RotationExhausted,
+    RotatorError,
+    StreamInterrupted,
+)
 from .keypool import mask_key
 
 if TYPE_CHECKING:  # 仅类型标注用，运行时走函数内 lazy import
-    from .autorenew import AutoRenewWorker
+    from .autorenew import AutoRenewWorker, KeyTransport
+    from .authn import AuthnTransport
+    from .registry import Registry
+    from .replenish import ReplenishWorker
+    from .sms import SmsTransport
 
 # ---------------------------------------------------------------- 输出工具
 
 _WIDTHS = {"account": 12, "key": 18, "status": 10}
 
 
-def _print_table(rows: Sequence[dict[str, Any]], columns: Sequence[tuple[str, str]]) -> None:
+def _print_table(
+    rows: Sequence[dict[str, Any]], columns: Sequence[tuple[str, str]]
+) -> None:
     if not rows:
         print("(空)")
         return
@@ -46,7 +58,12 @@ def _print_table(rows: Sequence[dict[str, Any]], columns: Sequence[tuple[str, st
     print(header)
     print("-" * len(header))
     for row in rows:
-        print("  ".join(str(row.get(field, ""))[:w].ljust(w) for (field, _), w in zip(columns, widths)))
+        print(
+            "  ".join(
+                str(row.get(field, ""))[:w].ljust(w)
+                for (field, _), w in zip(columns, widths)
+            )
+        )
 
 
 def _print_pool(rotator: StRotator, title: str = "Key 池状态") -> None:
@@ -71,20 +88,33 @@ def _print_pool(rotator: StRotator, title: str = "Key 池状态") -> None:
     rows = []
     for item in data["keys"]:
         stats = item["stats"]
-        rows.append({
-            "account": item["account"],
-            "key": item["key"],
-            "status": item["status"],
-            "cooldown": f"{item['cooldown_remaining']}s" if item["cooldown_remaining"] else "-",
-            "ok/fail": f"{stats['successes']}/{stats['failures']}",
-            "429": stats["rate_limited"],
-            "avg_ms": stats["avg_latency_ms"],
-            "note": item["last_error"][:40],
-        })
-    _print_table(rows, [
-        ("account", "账号"), ("key", "Key"), ("status", "状态"), ("cooldown", "冷却"),
-        ("ok/fail", "成功/失败"), ("429", "429次数"), ("avg_ms", "平均延迟(ms)"), ("note", "最近错误"),
-    ])
+        rows.append(
+            {
+                "account": item["account"],
+                "key": item["key"],
+                "status": item["status"],
+                "cooldown": f"{item['cooldown_remaining']}s"
+                if item["cooldown_remaining"]
+                else "-",
+                "ok/fail": f"{stats['successes']}/{stats['failures']}",
+                "429": stats["rate_limited"],
+                "avg_ms": stats["avg_latency_ms"],
+                "note": item["last_error"][:40],
+            }
+        )
+    _print_table(
+        rows,
+        [
+            ("account", "账号"),
+            ("key", "Key"),
+            ("status", "状态"),
+            ("cooldown", "冷却"),
+            ("ok/fail", "成功/失败"),
+            ("429", "429次数"),
+            ("avg_ms", "平均延迟(ms)"),
+            ("note", "最近错误"),
+        ],
+    )
 
 
 def _percentile(values: Sequence[float], pct: float) -> float:
@@ -164,15 +194,23 @@ def cmd_check(args: argparse.Namespace) -> int:
     try:
         for key in rotator.pool.keys:
             ok, detail = rotator.verify_key(key)
-            rows.append({
-                "account": key.account,
-                "key": key.masked,
-                "result": "OK" if ok else "FAIL",
-                "detail": detail[:60],
-            })
-        _print_table(rows, [
-            ("account", "账号"), ("key", "Key"), ("result", "结果"), ("detail", "详情"),
-        ])
+            rows.append(
+                {
+                    "account": key.account,
+                    "key": key.masked,
+                    "result": "OK" if ok else "FAIL",
+                    "detail": detail[:60],
+                }
+            )
+        _print_table(
+            rows,
+            [
+                ("account", "账号"),
+                ("key", "Key"),
+                ("result", "结果"),
+                ("detail", "详情"),
+            ],
+        )
         good = sum(1 for r in rows if r["result"] == "OK")
         print(f"\n可用 {good} / {len(rows)} 把")
         return 0 if good == len(rows) else 1
@@ -182,7 +220,9 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 def cmd_chat(args: argparse.Namespace) -> int:
     config = Config.from_file(args.config)
-    with StRotator(config, logger=lambda m: print("  " + m, file=sys.stderr)) as rotator:
+    with StRotator(
+        config, logger=lambda m: print("  " + m, file=sys.stderr)
+    ) as rotator:
         messages = [{"role": "user", "content": args.prompt}]
         if args.stream:
             for piece in rotator.chat_stream(messages, model=args.model):
@@ -258,9 +298,13 @@ def _print_bench(stats: dict[str, Any]) -> None:
     lat = stats["latencies"]
     print(f"\n=== 压测结果 ===")
     print(f"请求总数      : {stats['total']}  (并发 {stats['parallel']})")
-    print(f"max_tokens    : {stats['max_tokens'] if stats['max_tokens'] else '未设限（延迟会含模型生成时间）'}")
+    print(
+        f"max_tokens    : {stats['max_tokens'] if stats['max_tokens'] else '未设限（延迟会含模型生成时间）'}"
+    )
     print(f"耗时          : {stats['wall']:.2f}s  →  实际吞吐 {stats['qps']:.2f} req/s")
-    print(f"成功          : {stats['success']}  ({stats['success'] / stats['total']:.1%})")
+    print(
+        f"成功          : {stats['success']}  ({stats['success'] / stats['total']:.1%})"
+    )
     print(f"重试后仍 429  : {stats['rate_limited']}")
     print(f"其他失败      : {stats['failed']}")
     if lat:
@@ -441,13 +485,126 @@ def build_auto_renew(
     return worker
 
 
+def build_replenish_persist(
+    store: ConfigStore,
+    rotator: StRotator,
+    registry: Registry,
+    *,
+    lock: threading.Lock,
+) -> Callable[[str, str, str, str], None]:
+    """构造「新账号落池 + 落盘 + 登记」的 persist 回调。
+
+    铁律顺序（勿改）：先在内存池加入新 Key → 再写进 store（含凭据与 Key 列表）→
+    把 reload 后的内存配置拷回 ``rotator.config.accounts`` → 登记注册审计 →
+    最后 store / registry 一起落盘。顺序反了会出现「池里有 Key、配置里没有」
+    或「配置与池脱节」的中间态。
+    """
+
+    def persist(
+        user: str, phone: str, password: str, api_key: str, outcome: str = "ok"
+    ) -> None:
+        with lock:
+            name = next_account_name(store.account_names())
+            rotator.pool.add_key(api_key, account=name)  # pool FIRST（铁律）
+            store.add_account(
+                name, user=user, phone=phone, password=password, api_keys=[api_key]
+            )
+            store.reload()
+            rotator.config.accounts = list(store.config.accounts)
+            registry.record_registration(
+                name=name, phone=phone, outcome=outcome, created_at=time.time()
+            )
+            store.save()
+            registry.save()
+
+    return persist
+
+
+def build_replenish(
+    config: Config,
+    store: ConfigStore,
+    rotator: StRotator,
+    registry: Registry,
+    *,
+    lock: threading.Lock,
+    sink: Callable[[str], None],
+    status_source: Callable[[], dict[str, dict[str, str]]] | None = None,
+    sms: SmsTransport | None = None,
+    authn: AuthnTransport | None = None,
+    keys: KeyTransport | None = None,
+) -> ReplenishWorker | None:
+    """仅当 replenish 启用（enabled 且 target_count>0 且 sms_token 非空）时创建并启动补号 worker。"""
+    from typing import cast
+
+    from .autorenew import HttpKeyManager, KeyTransport as _KeyTransport
+    from .authn import HttpAuthn
+    from .replenish import ReplenishWorker as _ReplenishWorker
+    from .sms import EjiemaSms
+
+    rc = config.replenish
+    if not (rc.enabled and rc.target_count > 0 and rc.sms_token):
+        return None
+    if status_source is None:
+        status_source = lambda: {}  # noqa: E731
+    if sms is None:
+        sms = EjiemaSms(rc.sms_token)
+    if authn is None:
+        authn = HttpAuthn()
+    if keys is None:
+        # list_keys 返回类型与协议存在既有偏差，须经 object 过渡 cast（同 replenish.py）
+        keys = cast(_KeyTransport, cast(object, HttpKeyManager()))
+    worker = _ReplenishWorker(
+        accounts=lambda: rotator.config.accounts,
+        status_source=status_source,
+        target=rc.target_count,
+        sms=sms,
+        authn=authn,
+        keys=keys,
+        persist=build_replenish_persist(store, rotator, registry, lock=lock),
+        registry=registry,
+        key_name=rc.key_name,
+        key_type=rc.key_type,
+        keyword=rc.keyword,
+        sms_poll_interval=rc.sms_poll_interval,
+        sms_poll_timeout=rc.sms_poll_timeout,
+        daily_spend_cap=rc.daily_spend_cap,
+        interval=rc.interval_seconds,
+        log=sink,
+    )
+    worker.start()
+    return worker
+
+
+def _load_registry_for(
+    config_path: Path, *, sink: Callable[[str], None] | None = None
+) -> Registry:
+    """补号注册表 ``replenish.json``：与配置文件同目录，缺失时全新创建。
+
+    文件名刻意不同于通用的 ``state.json``，避免与其它工具 / 未来功能同名文件冲突。
+    若文件存在但结构不符（外来文件 / 旧版本），告警并以全新空状态启动，
+    而不是让整个控制台在启动期直接崩溃。
+    """
+    from .registry import Registry as _Registry
+    from .registry import RegistryError as _RegistryError
+
+    path = config_path.resolve().parent / "replenish.json"
+    try:
+        return _Registry.load(path)
+    except _RegistryError as exc:
+        if sink is not None:
+            sink(f"[补号] 忽略无法读取的 {path.name}：{exc}（已按空注册表启动）")
+        return _Registry(path)
+
+
 def cmd_ui(args: argparse.Namespace) -> int:
     """启动网关 + 图形控制台，并自动开一个无地址栏的应用窗口。"""
     from .proxy import serve
     from .ui import ConsoleState, open_console_window, open_in_default_browser
 
     default_log = str(Path(args.config).resolve().parent / "rotator.log")
-    store, config, sink, rotator, buffer = _build_runtime(args, default_log_file=default_log)
+    store, config, sink, rotator, buffer = _build_runtime(
+        args, default_log_file=default_log
+    )
     token = resolve_console_token(args.token, config.console_token)
     if not _check_token_length(token, sink):
         return 1
@@ -464,6 +621,22 @@ def cmd_ui(args: argparse.Namespace) -> int:
     console.auto_renew = build_auto_renew(
         config, store, rotator, lock=console.lock, sink=sink
     )
+    if store is not None:
+        registry = _load_registry_for(Path(args.config), sink=sink)
+        console.replenish = build_replenish(
+            config,
+            store,
+            rotator,
+            registry,
+            lock=console.lock,
+            sink=sink,
+            status_source=(
+                lambda: (
+                    console.auto_renew.account_status() if console.auto_renew else {}
+                )
+            ),
+        )
+        console.registry = registry
 
     sink(
         f"启动控制台 host={args.host} port={args.port} keys={config.total_keys} "
@@ -480,7 +653,9 @@ def cmd_ui(args: argparse.Namespace) -> int:
             return
         # Token 放 URL fragment：fragment 不会发给服务端，也不进 Referer
         target = f"{url}#token={token}" if token else url
-        ok, note = open_console_window(target, browser=args.browser, size=args.window_size)
+        ok, note = open_console_window(
+            target, browser=args.browser, size=args.window_size
+        )
         if not ok:
             sink(f"[警告] {note}")
             if open_in_default_browser(url):
@@ -502,6 +677,8 @@ def cmd_ui(args: argparse.Namespace) -> int:
     finally:
         if console.auto_renew:
             console.auto_renew.stop()
+        if console.replenish:
+            console.replenish.stop()
         rotator.close()
     return 0
 
@@ -539,9 +716,13 @@ def cmd_tray(args: argparse.Namespace) -> int:
 
     config_path = Path(args.config).resolve()
     default_log = str(config_path.parent / "rotator.log")
-    store, config, sink, rotator, buffer = _build_runtime(args, default_log_file=default_log)
+    store, config, sink, rotator, buffer = _build_runtime(
+        args, default_log_file=default_log
+    )
     token = resolve_console_token(
-        args.token, config.console_token, fallback=_load_or_create_token(config_path.parent)
+        args.token,
+        config.console_token,
+        fallback=_load_or_create_token(config_path.parent),
     )
     if not _check_token_length(token, sink):
         return 1
@@ -551,7 +732,9 @@ def cmd_tray(args: argparse.Namespace) -> int:
     if not acquire_single_instance():
         sink(f"[托盘] 已有实例在运行，改为打开它的控制台：{url_base}")
         target = f"{url_base}#token={token}" if token else url_base
-        if not open_console_window(target, browser=args.browser, size=args.window_size)[0]:
+        if not open_console_window(target, browser=args.browser, size=args.window_size)[
+            0
+        ]:
             open_in_default_browser(url_base)
         rotator.close()
         return 0
@@ -569,11 +752,32 @@ def cmd_tray(args: argparse.Namespace) -> int:
     console.auto_renew = build_auto_renew(
         config, store, rotator, lock=console.lock, sink=sink
     )
+    if store is not None:
+        registry = _load_registry_for(config_path, sink=sink)
+        console.replenish = build_replenish(
+            config,
+            store,
+            rotator,
+            registry,
+            lock=console.lock,
+            sink=sink,
+            status_source=(
+                lambda: (
+                    console.auto_renew.account_status() if console.auto_renew else {}
+                )
+            ),
+        )
+        console.registry = registry
 
     try:
         server = create_server(
-            rotator, host=args.host, port=args.port, token=token,
-            verbose=args.verbose, log_sink=sink, console=console,
+            rotator,
+            host=args.host,
+            port=args.port,
+            token=token,
+            verbose=args.verbose,
+            log_sink=sink,
+            console=console,
         )
     except OSError as exc:
         sink(f"[错误] 无法监听 {args.host}:{args.port}：{exc}")
@@ -585,7 +789,9 @@ def cmd_tray(args: argparse.Namespace) -> int:
     base_url = f"http://{host}:{port}/v1"
     url = f"http://{host}:{port}/"
 
-    gateway = threading.Thread(target=server.serve_forever, name="rotator-gateway", daemon=True)
+    gateway = threading.Thread(
+        target=server.serve_forever, name="rotator-gateway", daemon=True
+    )
     gateway.start()
     sink(f"网关已启动: {base_url}")
     sink(f"[托盘] 控制台: {url}（右键托盘图标可操作）")
@@ -611,6 +817,8 @@ def cmd_tray(args: argparse.Namespace) -> int:
         sink("[托盘] 正在停止网关…")
         if console.auto_renew:
             console.auto_renew.stop()
+        if console.replenish:
+            console.replenish.stop()
         server.shutdown()
         server.server_close()
         gateway.join(timeout=5)
@@ -642,11 +850,19 @@ def cmd_bench(args: argparse.Namespace) -> int:
     print(
         f"目标: {config.total_keys} 把 Key / {len(config.accounts)} 个账号 | 策略: {config.strategy}\n"
         f"限速: {rc.mode}"
-        + (f" (起始 {rc.qps} req/s，区间 {rc.min_qps}~{rc.max_qps})" if rc.mode == "adaptive" else
-           f" ({rc.qps} req/s)" if rc.mode == "fixed" else " (关闭)")
+        + (
+            f" (起始 {rc.qps} req/s，区间 {rc.min_qps}~{rc.max_qps})"
+            if rc.mode == "adaptive"
+            else f" ({rc.qps} req/s)"
+            if rc.mode == "fixed"
+            else " (关闭)"
+        )
         + f" | 单请求预算: {config.max_total_wait or '不限'}s | 最大重试: {config.max_attempts}"
     )
-    with StRotator(config, logger=(lambda m: print("  " + m, file=sys.stderr)) if args.verbose else None) as rotator:
+    with StRotator(
+        config,
+        logger=(lambda m: print("  " + m, file=sys.stderr)) if args.verbose else None,
+    ) as rotator:
         print(f"开始压测: {args.requests} 请求 / {args.parallel} 并发…")
         max_tokens = args.max_tokens or None
         stats = _run_bench(rotator, args.requests, args.parallel, max_tokens=max_tokens)
@@ -687,18 +903,36 @@ def build_parser() -> argparse.ArgumentParser:
             if file_log_default_on
             else "日志文件路径；不传则只输出到终端",
         )
-        p.add_argument("--log-lines", type=int, default=500, help="内存中保留的日志行数（控制台用）")
+        p.add_argument(
+            "--log-lines",
+            type=int,
+            default=500,
+            help="内存中保留的日志行数（控制台用）",
+        )
 
     p_ui = sub.add_parser("ui", help="启动图形控制台（推荐入口）")
     add_config(p_ui)
     p_ui.add_argument("--host", default="127.0.0.1", help="监听地址，默认只监听本机")
     p_ui.add_argument("--port", type=int, default=8080, help="监听端口")
-    p_ui.add_argument("--token", default=None, help="本地鉴权 Token；设置后控制台与 API 都需要它")
+    p_ui.add_argument(
+        "--token", default=None, help="本地鉴权 Token；设置后控制台与 API 都需要它"
+    )
     p_ui.add_argument("--no-open", action="store_true", help="只起服务，不自动打开窗口")
-    p_ui.add_argument("--browser", default=None, help="指定浏览器可执行文件（默认自动找 Edge/Chrome）")
-    p_ui.add_argument("--window-size", default="1380,900", help="窗口尺寸，形如 1380,900")
-    p_ui.add_argument("--rate-mode", choices=RateControlConfig.MODES, default=None, help="覆盖限速模式")
-    p_ui.add_argument("-q", "--qps", type=float, default=0.0, help="覆盖 rate_control.qps")
+    p_ui.add_argument(
+        "--browser", default=None, help="指定浏览器可执行文件（默认自动找 Edge/Chrome）"
+    )
+    p_ui.add_argument(
+        "--window-size", default="1380,900", help="窗口尺寸，形如 1380,900"
+    )
+    p_ui.add_argument(
+        "--rate-mode",
+        choices=RateControlConfig.MODES,
+        default=None,
+        help="覆盖限速模式",
+    )
+    p_ui.add_argument(
+        "-q", "--qps", type=float, default=0.0, help="覆盖 rate_control.qps"
+    )
     add_logging(p_ui, file_log_default_on=True)
     p_ui.add_argument("-v", "--verbose", action="store_true", help="同时把日志打到终端")
     p_ui.set_defaults(func=cmd_ui, persist=True)
@@ -711,18 +945,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_tray.add_argument("--host", default="127.0.0.1", help="监听地址，默认只监听本机")
     p_tray.add_argument("--port", type=int, default=8080, help="监听端口")
     p_tray.add_argument(
-        "--token", default=None,
+        "--token",
+        default=None,
         help="本地鉴权 Token；不传则自动生成并复用配置目录下的 .tray-token",
     )
-    p_tray.add_argument("--browser", default=None, help="指定浏览器可执行文件（默认自动找 Edge/Chrome）")
-    p_tray.add_argument("--window-size", default="1380,900", help="控制台窗口尺寸，形如 1380,900")
-    p_tray.add_argument("--rate-mode", choices=RateControlConfig.MODES, default=None, help="覆盖限速模式")
-    p_tray.add_argument("-q", "--qps", type=float, default=0.0, help="覆盖 rate_control.qps")
+    p_tray.add_argument(
+        "--browser", default=None, help="指定浏览器可执行文件（默认自动找 Edge/Chrome）"
+    )
+    p_tray.add_argument(
+        "--window-size", default="1380,900", help="控制台窗口尺寸，形如 1380,900"
+    )
+    p_tray.add_argument(
+        "--rate-mode",
+        choices=RateControlConfig.MODES,
+        default=None,
+        help="覆盖限速模式",
+    )
+    p_tray.add_argument(
+        "-q", "--qps", type=float, default=0.0, help="覆盖 rate_control.qps"
+    )
     add_logging(p_tray, file_log_default_on=True)
-    p_tray.add_argument("-v", "--verbose", action="store_true", help="同时把日志打到终端")
+    p_tray.add_argument(
+        "-v", "--verbose", action="store_true", help="同时把日志打到终端"
+    )
     p_tray.set_defaults(func=cmd_tray, persist=True)
 
-    p_demo = sub.add_parser("demo", help="离线演示：用模拟上游验证轮换逻辑，无需真实 Key")
+    p_demo = sub.add_parser(
+        "demo", help="离线演示：用模拟上游验证轮换逻辑，无需真实 Key"
+    )
     p_demo.add_argument("-n", "--requests", type=int, default=60, help="演示压测请求数")
     p_demo.add_argument("-p", "--parallel", type=int, default=12, help="并发数")
     p_demo.set_defaults(func=cmd_demo)
@@ -740,38 +990,59 @@ def build_parser() -> argparse.ArgumentParser:
     p_chat.add_argument("prompt", help="用户输入")
     p_chat.add_argument("-m", "--model", help="模型名，默认取配置")
     p_chat.add_argument("-s", "--stream", action="store_true", help="流式输出")
-    p_chat.add_argument("-v", "--verbose", action="store_true", help="结束后打印 Key 池状态")
+    p_chat.add_argument(
+        "-v", "--verbose", action="store_true", help="结束后打印 Key 池状态"
+    )
     p_chat.set_defaults(func=cmd_chat)
 
     p_serve = sub.add_parser("serve", help="启动本地 OpenAI 兼容网关（无界面）")
     add_config(p_serve)
     p_serve.add_argument("--host", default="127.0.0.1", help="监听地址，默认只监听本机")
     p_serve.add_argument("--port", type=int, default=8080, help="监听端口")
-    p_serve.add_argument("--token", default=None, help="本地鉴权 Token；不设则任何本机进程都能调用")
-    p_serve.add_argument("--rate-mode", choices=RateControlConfig.MODES, default=None, help="覆盖限速模式")
-    p_serve.add_argument("-q", "--qps", type=float, default=0.0, help="覆盖 rate_control.qps")
+    p_serve.add_argument(
+        "--token", default=None, help="本地鉴权 Token；不设则任何本机进程都能调用"
+    )
+    p_serve.add_argument(
+        "--rate-mode",
+        choices=RateControlConfig.MODES,
+        default=None,
+        help="覆盖限速模式",
+    )
+    p_serve.add_argument(
+        "-q", "--qps", type=float, default=0.0, help="覆盖 rate_control.qps"
+    )
     add_logging(p_serve, file_log_default_on=False)
-    p_serve.add_argument("-v", "--verbose", action="store_true", help="打印每个请求与轮换日志")
+    p_serve.add_argument(
+        "-v", "--verbose", action="store_true", help="打印每个请求与轮换日志"
+    )
     p_serve.set_defaults(func=cmd_serve)
 
     p_bench = sub.add_parser("bench", help="并发压测，验证轮换效果")
     add_config(p_bench)
     p_bench.add_argument("-n", "--requests", type=int, default=200, help="总请求数")
     p_bench.add_argument("-p", "--parallel", type=int, default=16, help="并发数")
-    p_bench.add_argument("-q", "--qps", type=float, default=0.0, help="覆盖 rate_control.qps")
+    p_bench.add_argument(
+        "-q", "--qps", type=float, default=0.0, help="覆盖 rate_control.qps"
+    )
     p_bench.add_argument(
         "--rate-mode",
         choices=RateControlConfig.MODES,
         default=None,
         help="覆盖限速模式：off / fixed / adaptive",
     )
-    p_bench.add_argument("--max-wait", type=float, default=None, help="覆盖单请求等待预算（秒）")
+    p_bench.add_argument(
+        "--max-wait", type=float, default=None, help="覆盖单请求等待预算（秒）"
+    )
     p_bench.add_argument("--attempts", type=int, default=None, help="覆盖最大重试次数")
     p_bench.add_argument(
-        "--max-tokens", type=int, default=64,
+        "--max-tokens",
+        type=int,
+        default=64,
         help="压测请求的 max_tokens（默认 64）。推理模型不设限会让延迟被生成时间主导，量不到真实容量；传 0 表示不设限",
     )
-    p_bench.add_argument("-v", "--verbose", action="store_true", help="打印每次轮换日志")
+    p_bench.add_argument(
+        "-v", "--verbose", action="store_true", help="打印每次轮换日志"
+    )
     p_bench.set_defaults(func=cmd_bench)
 
     return parser
