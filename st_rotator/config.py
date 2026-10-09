@@ -10,6 +10,7 @@ import fnmatch
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -53,6 +54,54 @@ def next_account_name(existing: Iterable[str]) -> str:
     while f"账号{index}" in names:
         index += 1
     return f"账号{index}"
+
+
+def account_name_for(user: str, existing: Iterable[str]) -> str:
+    """给新账号选名字：优先用商汤用户名，为空或已被占用时回退自动编号。
+
+    补号 / 批量新增统一走这里，让新账号以用户名为名（可读、可筛选）；
+    用户名缺失或撞名时才退回 ``账号N``，避免重名。
+    """
+    name = (user or "").strip()
+    names = {str(n) for n in existing}
+    if name and name not in names:
+        return name
+    return next_account_name(names)
+
+
+# 自动编号账号名（补号 / 批量加 Key 的默认命名）：迁移时据此识别。
+_AUTO_ACCOUNT_NAME = re.compile(r"^账号\d+$")
+
+
+def migrate_account_names(raw: dict[str, Any]) -> bool:
+    """把自动编号账号（``账号N``）重命名为其用户名（商汤 username）。
+
+    仅当账号有非空 ``user``、且该用户名未被其它账号占用时才重命名。
+    返回是否有改动（调用方据此决定是否落盘）。
+    """
+    accounts = raw.get("accounts")
+    if not isinstance(accounts, list):
+        return False
+    used = {
+        item.get("name")
+        for item in accounts
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    changed = False
+    for item in accounts:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        user = str(item.get("user") or "").strip()
+        if not isinstance(name, str) or not _AUTO_ACCOUNT_NAME.match(name):
+            continue
+        if not user or user in used:
+            continue
+        used.discard(name)
+        used.add(user)
+        item["name"] = user
+        changed = True
+    return changed
 
 
 @dataclass
@@ -495,6 +544,8 @@ class AccountConfig:
     max_concurrency: int = 4
     weight: float = 1.0
     tags: list[str] = field(default_factory=list)
+    # Key 最近一次被写入的时间（epoch 秒）；None = 未知（老配置）。
+    updated_at: float | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -507,6 +558,14 @@ class AccountConfig:
             raise ConfigError(f"账号 {self.name} 的 max_concurrency 必须 > 0")
         if self.weight <= 0:
             raise ConfigError(f"账号 {self.name} 的 weight 必须 > 0")
+        if self.updated_at is not None:
+            if isinstance(self.updated_at, bool) or not isinstance(
+                self.updated_at, (int, float)
+            ):
+                raise ConfigError(
+                    f"账号 {self.name} 的 updated_at 必须是数值或 null"
+                )
+            self.updated_at = float(self.updated_at)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "AccountConfig":
@@ -541,6 +600,7 @@ class AccountConfig:
             "rpm_limit": self.rpm_limit,
             "max_concurrency": self.max_concurrency,
             "weight": self.weight,
+            "updated_at": self.updated_at,
         }
 
 
@@ -804,6 +864,11 @@ class ConfigStore:
 
     # ------------------------------------------------------------ 定点修改
 
+    @staticmethod
+    def _touch(item: dict[str, Any]) -> None:
+        """把账号的 updated_at 刷新为当前时间（Key 最近一次写入）。"""
+        item["updated_at"] = time.time()
+
     def add_key(
         self,
         key: str,
@@ -830,6 +895,7 @@ class ConfigStore:
                 if any(self._matches(k, key) for k in keys):
                     raise ConfigError(f"账号 {name} 下已存在该 Key")
                 keys.append(key)
+                self._touch(item)
                 return item
         entry = {
             "name": name,
@@ -837,6 +903,7 @@ class ConfigStore:
             "rpm_limit": rpm_limit,
             "max_concurrency": max_concurrency,
             "weight": weight,
+            "updated_at": time.time(),
         }
         accounts.append(entry)
         return entry
@@ -868,6 +935,7 @@ class ConfigStore:
             "rpm_limit": None,
             "max_concurrency": 4,
             "weight": 1.0,
+            "updated_at": time.time(),
         }
         if not [k for k in (api_keys or []) if str(k).strip()]:
             raise ConfigError(f"账号 {name} 的 api_keys 不能为空")
@@ -898,6 +966,7 @@ class ConfigStore:
         for item in accounts:
             if isinstance(item, dict) and item.get("name") == name:
                 item["api_keys"] = cleaned
+                self._touch(item)
                 self.reload()
                 return
         raise ConfigError(f"账号 {name} 不存在")
@@ -926,6 +995,8 @@ class ConfigStore:
                 item["api_keys"] = kept
                 if not kept:
                     accounts.remove(item)
+                else:
+                    self._touch(item)
         return removed
 
     def set_default_model(self, model: str) -> str:

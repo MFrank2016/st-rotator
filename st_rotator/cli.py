@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from .client import StRotator
-from .config import Config, ConfigStore, RateControlConfig, next_account_name
+from .config import Config, ConfigStore, RateControlConfig, account_name_for
 from .errors import (
     ApiError,
     NoAvailableKey,
@@ -515,7 +515,7 @@ def build_replenish_persist(
         user: str, phone: str, password: str, api_key: str, outcome: str = "ok"
     ) -> None:
         with lock:
-            name = next_account_name(store.account_names())
+            name = account_name_for(user, store.account_names())
             rotator.pool.add_key(api_key, account=name)  # pool FIRST（铁律）
             store.add_account(
                 name, user=user, phone=phone, password=password, api_keys=[api_key]

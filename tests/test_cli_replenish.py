@@ -183,7 +183,7 @@ class BuildReplenishPersistTest(unittest.TestCase):
             persist("user_new", "13900000001", "pw_new", NEW_KEY)
 
             new_acct = store.config.accounts[-1]
-            self.assertEqual(new_acct.name, "账号2")
+            self.assertEqual(new_acct.name, "user_new")
             self.assertEqual(new_acct.user, "user_new")
             self.assertEqual(new_acct.phone, "13900000001")
             self.assertEqual(new_acct.password, "pw_new")
@@ -192,13 +192,13 @@ class BuildReplenishPersistTest(unittest.TestCase):
             # 池里带着新 Key（pool first 铁律）
             self.assertIsNotNone(rotator.pool.find_key(NEW_KEY))
             # rotator.config.accounts 与 store 同步
-            self.assertEqual(rotator.config.accounts[-1].name, "账号2")
+            self.assertEqual(rotator.config.accounts[-1].name, "user_new")
             self.assertEqual(rotator.config.accounts[-1].api_keys, [NEW_KEY])
 
             # 磁盘 config.json：新账号字段全齐，明文密码保留
             disk = json.loads(path.read_text(encoding="utf-8"))
             raw_acct = disk["accounts"][-1]
-            self.assertEqual(raw_acct["name"], "账号2")
+            self.assertEqual(raw_acct["name"], "user_new")
             self.assertEqual(raw_acct["user"], "user_new")
             self.assertEqual(raw_acct["phone"], "13900000001")
             self.assertEqual(raw_acct["password"], "pw_new")
@@ -206,6 +206,30 @@ class BuildReplenishPersistTest(unittest.TestCase):
 
             # 注册审计由 worker 统一登记，persist 不再写入 registry
             self.assertEqual(registry.registrations(), [])
+
+    def test_persist_falls_back_to_auto_name_without_user(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, store, rotator, registry = _make_runtime(tmp)
+            persist = build_replenish_persist(store, rotator, lock=threading.Lock())
+            persist("", "13900000002", "pw", NEW_KEY)
+
+            new_acct = store.config.accounts[-1]
+            self.assertEqual(new_acct.name, "账号2")
+            self.assertEqual(new_acct.user, "")
+            self.assertIsNotNone(rotator.pool.find_key(NEW_KEY))
+
+    def test_persist_avoids_username_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, store, rotator, registry = _make_runtime(tmp)
+            persist = build_replenish_persist(store, rotator, lock=threading.Lock())
+            # user 与已有账号名撞车时回退自动编号，避免重名账号
+            persist("账号1", "13900000003", "pw", NEW_KEY)
+
+            new_acct = store.config.accounts[-1]
+            self.assertEqual(new_acct.name, "账号2")
+            self.assertEqual(new_acct.user, "账号1")
+            names = [a.name for a in store.config.accounts]
+            self.assertEqual(names.count("账号1"), 1)
 
 
 class LoadRegistryForTest(unittest.TestCase):

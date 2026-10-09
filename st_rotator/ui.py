@@ -357,7 +357,7 @@ class ConsoleState:
                 reveal_token=reveal_token, request_base=request_base
             ),
             "summary": self.rotator.pool.summary(),
-            "keys": self.rotator.pool.snapshot(),
+            "keys": self._pool_snapshot(),
             "rate_control": rate,
             "metrics": metrics,
             "models": self.rotator.available_models(),
@@ -408,6 +408,17 @@ class ConsoleState:
                 },
             },
         }
+
+    def _pool_snapshot(self) -> list[dict[str, Any]]:
+        """Key 池快照，并补上账号的用户名 / 手机号 / Key 最近写入时间，供控制台展示。"""
+        keys = self.rotator.pool.snapshot()
+        meta = {a.name: a for a in self.config.accounts}
+        for item in keys:
+            acct = meta.get(str(item.get("account")))
+            item["username"] = acct.user if acct else ""
+            item["phone"] = acct.phone if acct else ""
+            item["updated_at"] = acct.updated_at if acct else None
+        return keys
 
     def logs_since(self, cursor: int) -> dict[str, Any]:
         new_cursor, items = self.buffer.since(cursor)

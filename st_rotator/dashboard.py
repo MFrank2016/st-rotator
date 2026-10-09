@@ -371,7 +371,36 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   <div class="card" style="margin-bottom:14px">
     <h2>Key 池 <span class="spacer"></span><span class="muted" id="pool-note" style="text-transform:none;letter-spacing:0"></span><button class="tiny" id="btn-export-accounts">复制全部账号</button><button class="primary" id="btn-import">批量新增</button></h2>
+    <div class="row" style="margin-bottom:10px;align-items:flex-end;flex-wrap:wrap">
+      <label class="field" style="width:150px;margin-bottom:0"><span>用户名</span>
+        <input id="pool-f-user" type="text" placeholder="筛选用户名" autocomplete="off"></label>
+      <label class="field" style="width:140px;margin-bottom:0"><span>手机号</span>
+        <input id="pool-f-phone" type="text" placeholder="筛选手机号" autocomplete="off"></label>
+      <label class="field grow" style="margin-bottom:0;flex:1;min-width:140px"><span>Key</span>
+        <input id="pool-f-key" class="mono" type="text" placeholder="筛选 Key（脱敏片段）" autocomplete="off"></label>
+      <label class="field" style="width:104px;margin-bottom:0"><span>状态</span>
+        <select id="pool-f-status">
+          <option value="">全部</option>
+          <option value="healthy">可用</option>
+          <option value="cooldown">冷却中</option>
+          <option value="invalid">已失效</option>
+        </select></label>
+      <label class="field" style="width:84px;margin-bottom:0"><span>每页</span>
+        <select id="pool-page-size">
+          <option value="10">10</option>
+          <option value="20" selected>20</option>
+          <option value="50">50</option>
+        </select></label>
+      <button class="tiny" id="pool-f-reset" style="height:33px">重置</button>
+    </div>
     <div id="pool"></div>
+    <div class="row" style="margin-top:10px;align-items:center">
+      <button class="tiny" id="pool-prev">上一页</button>
+      <span class="muted" id="pool-page"></span>
+      <button class="tiny" id="pool-next">下一页</button>
+      <span class="spacer"></span>
+      <span class="muted" id="pool-count" style="text-transform:none;letter-spacing:0"></span>
+    </div>
 
     <div style="margin-top:15px;padding-top:14px;border-top:1px solid var(--border)">
       <h2 style="margin-bottom:10px">添加 Key</h2>
@@ -571,7 +600,9 @@ var S = {
   modelTestTimer: null,
   modelTestStart: 0,
   rpRegPage: 1,
-  rpRegSize: 20
+  rpRegSize: 20,
+  poolPage: 1,
+  poolSize: 20
 };
 
 /* 窗口是带 #token=xxx 打开的（fragment 不会发给服务端，也不进 Referer）。
@@ -606,6 +637,14 @@ function toast(message, kind) {
 }
 
 function fmtInt(n) { return Number(n || 0).toLocaleString("en-US"); }
+
+function fmtTime(ts) {
+  if (!ts) return "—";
+  var d = new Date(ts * 1000);
+  function p(n) { return (n < 10 ? "0" : "") + n; }
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+    " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
 
 function fmtDuration(seconds) {
   seconds = Math.max(0, Math.floor(seconds || 0));
@@ -1415,29 +1454,60 @@ async function runModelTest() {
   }
 }
 
+function poolFilteredKeys(keys) {
+  var fu = ($("pool-f-user") ? $("pool-f-user").value : "").trim().toLowerCase();
+  var fp = ($("pool-f-phone") ? $("pool-f-phone").value : "").trim().toLowerCase();
+  var fk = ($("pool-f-key") ? $("pool-f-key").value : "").trim().toLowerCase();
+  var fs = $("pool-f-status") ? $("pool-f-status").value : "";
+  return keys.filter(function (k) {
+    if (fs && k.status !== fs) return false;
+    if (fu) {
+      var u = String(k.username || "").toLowerCase() + " " + String(k.account || "").toLowerCase();
+      if (u.indexOf(fu) === -1) return false;
+    }
+    if (fp && String(k.phone || "").toLowerCase().indexOf(fp) === -1) return false;
+    if (fk && String(k.key || "").toLowerCase().indexOf(fk) === -1) return false;
+    return true;
+  });
+}
+
 function renderPool(state) {
   var keys = state.keys || [];
   var as = (state.account_status) || {};
   if (!keys.length) {
     $("pool").innerHTML = '<div class="empty">池里还没有 Key。在下面添加至少一把才能对外提供服务。</div>';
+    if ($("pool-page")) $("pool-page").textContent = "";
+    if ($("pool-count")) $("pool-count").textContent = "";
+    if ($("pool-prev")) $("pool-prev").disabled = true;
+    if ($("pool-next")) $("pool-next").disabled = true;
   } else {
-    var head = "<tr><th>账号</th><th>Key</th><th>状态</th><th>冷却</th><th>RPM</th>" +
+    var filtered = poolFilteredKeys(keys);
+    var size = S.poolSize || 20;
+    var lastPage = Math.max(1, Math.ceil(filtered.length / size));
+    if (S.poolPage > lastPage) S.poolPage = lastPage;
+    if (S.poolPage < 1) S.poolPage = 1;
+    var start = (S.poolPage - 1) * size;
+    var pageKeys = filtered.slice(start, start + size);
+    var head = "<tr><th>id</th><th>账号</th><th>Key</th><th>状态</th><th>冷却</th><th>RPM</th>" +
       "<th class='num'>成功/失败</th><th class='num'>429</th><th class='num'>延迟</th>" +
       "<th class='num' title='通用积分池 5 小时窗口剩余额度'>通用 5h 余量</th>" +
       "<th class='num' title='通用积分池 5 小时窗口重置倒计时'>通用 5h 重置</th>" +
       "<th class='num' title='通用积分池 7 天窗口剩余额度'>通用 7d 余量</th>" +
       "<th class='num' title='通用积分池 7 天窗口重置倒计时'>通用 7d 重置</th>" +
       "<th class='num' title='Flash-Lite 专属积分池 5 小时窗口剩余额度'>FL 专属 5h 余量</th>" +
-      "<th class='num' title='Flash-Lite 专属积分池 7 天窗口剩余额度'>FL 专属 7d 余量</th><th></th></tr>";
-    var body = keys.map(function (k) {
+      "<th class='num' title='Flash-Lite 专属积分池 7 天窗口剩余额度'>FL 专属 7d 余量</th>" +
+      "<th class='num' title='该账号 Key 最近一次写入时间'>更新时间</th><th></th></tr>";
+    var body = pageKeys.map(function (k) {
       var st = k.stats || {};
       var statusText = { healthy: "可用", cooldown: "冷却中", invalid: "已失效" }[k.status] || k.status;
       var cooldown = k.cooldown_remaining > 0 ? k.cooldown_remaining + "s" : "—";
       var q = quotaFor(k.account);
       var general = q && q.status === "ok" ? q.general : null;
       var flash = q && q.status === "ok" ? q.flash_lite : null;
+      var label = k.username || k.account;
       return "<tr>" +
-        "<td>" + esc(k.account) +
+        '<td class="mono">' + esc(k.id) + "</td>" +
+        "<td>" + esc(label) +
           (as[k.account] && as[k.account].status === "password_error"
             ? ' <span class="pill invalid" title="' + esc(as[k.account].message || "登录失败：密码错误") + '">密码错误</span>'
             : "") +
@@ -1455,9 +1525,10 @@ function renderPool(state) {
         countdownCell(quotaResetAt(general, "d7"), true) +
         '<td class="num">' + esc(quotaRemaining(flash, "h5")) + "</td>" +
         '<td class="num">' + esc(quotaRemaining(flash, "d7")) + "</td>" +
+        '<td class="num" title="' + esc(k.updated_at ? fmtTime(k.updated_at) : "未知") + '">' + esc(fmtTime(k.updated_at)) + "</td>" +
         '<td style="text-align:right;white-space:nowrap">' +
-          '<button class="tiny" data-act="verify" data-id="' + esc(k.id) + '" data-label="' + esc(k.account + " / " + k.key) + '">测试</button> ' +
-          '<button class="tiny danger" data-act="remove" data-id="' + esc(k.id) + '" data-label="' + esc(k.account + " / " + k.key) + '">删除</button>' +
+          '<button class="tiny" data-act="verify" data-id="' + esc(k.id) + '" data-label="' + esc(label + " / " + k.key) + '">测试</button> ' +
+          '<button class="tiny danger" data-act="remove" data-id="' + esc(k.id) + '" data-label="' + esc(label + " / " + k.key) + '">删除</button>' +
         "</td></tr>";
     }).join("");
     $("pool").innerHTML = "<table>" + head + body + "</table>";
@@ -1466,6 +1537,10 @@ function renderPool(state) {
         onPoolAction(button.dataset.act, button.dataset.id, button.dataset.label, button);
       };
     });
+    if ($("pool-page")) $("pool-page").textContent = "第 " + S.poolPage + " / " + lastPage + " 页（共 " + filtered.length + " 把）";
+    if ($("pool-count")) $("pool-count").textContent = filtered.length !== keys.length ? ("已筛选 " + filtered.length + " / " + keys.length + " 把") : "";
+    if ($("pool-prev")) $("pool-prev").disabled = S.poolPage <= 1;
+    if ($("pool-next")) $("pool-next").disabled = S.poolPage >= lastPage;
   }
   var s = state.summary || {};
   $("pool-note").textContent = s.total ? ("在途 " + s.inflight + " / 共 " + s.total + " 把") : "";
@@ -1853,6 +1928,21 @@ function bind() {
   $("rp-reg-q").addEventListener("keydown", function (event) {
     if (event.key === "Enter") { S.rpRegPage = 1; renderReplenishRecords(); }
   });
+  ["pool-f-user", "pool-f-phone", "pool-f-key"].forEach(function (id) {
+    var el = $(id);
+    if (el) el.addEventListener("input", function () { S.poolPage = 1; renderPool(lastState); });
+  });
+  if ($("pool-f-status")) $("pool-f-status").addEventListener("change", function () { S.poolPage = 1; renderPool(lastState); });
+  if ($("pool-page-size")) $("pool-page-size").addEventListener("change", function () {
+    S.poolSize = parseInt($("pool-page-size").value, 10) || 20; S.poolPage = 1; renderPool(lastState);
+  });
+  if ($("pool-prev")) $("pool-prev").onclick = function () { if (S.poolPage > 1) { S.poolPage -= 1; renderPool(lastState); } };
+  if ($("pool-next")) $("pool-next").onclick = function () { if (!$("pool-next").disabled) { S.poolPage += 1; renderPool(lastState); } };
+  if ($("pool-f-reset")) $("pool-f-reset").onclick = function () {
+    ["pool-f-user", "pool-f-phone", "pool-f-key"].forEach(function (id) { if ($(id)) $(id).value = ""; });
+    if ($("pool-f-status")) $("pool-f-status").value = "";
+    S.poolPage = 1; renderPool(lastState);
+  };
   $("btn-autoscroll").onclick = function () {
     S.autoscroll = !S.autoscroll;
     this.textContent = "自动滚动：" + (S.autoscroll ? "开" : "关");

@@ -108,8 +108,10 @@ class ReplaceAccountKeysTest(unittest.TestCase):
                 self.assertEqual(acct["user"], "${SN_USER}")
                 self.assertEqual(acct["password"], "${SN_PW}")
                 self.assertEqual(store.config.accounts[0].api_keys, ["sk-new"])
+                updated_at = acct.pop("updated_at", None)
+                self.assertIsInstance(updated_at, float)
                 expected = {**before["accounts"][0], "api_keys": ["sk-new"]}
-                self.assertEqual(reloaded["accounts"][0], expected)
+                self.assertEqual(acct, expected)
 
     def test_unknown_account_raises(self):
         with mock.patch.dict(os.environ, self.ENV):
