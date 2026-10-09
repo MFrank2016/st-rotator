@@ -58,7 +58,6 @@ SOFT_RETRY_MAX = 10
 
 # 用户名 / 密码字符集：**刻意排除 $ { }** —— 避免 ConfigStore 的 ${ENV}
 # 占位符展开误伤生成的凭据。
-_USER_CHARSET = string.ascii_letters + string.digits
 _SPECIALS = "~!@#%^&*?_+.,;:-"
 _PASSWORD_CLASSES = (
     string.ascii_lowercase,
@@ -66,7 +65,6 @@ _PASSWORD_CLASSES = (
     string.digits,
     _SPECIALS,
 )
-_USER_MIN, _USER_MAX = 6, 24
 _PW_MIN, _PW_MAX = 8, 32
 
 
@@ -114,11 +112,12 @@ def _sample_without_replacement(rng: Any, seq: Sequence[Any], k: int) -> list[An
 
 
 def generate_credentials(
-    rng: Any = None, *, user_length: int = 10, password_length: int = 16
+    rng: Any = None, *, password_length: int = 16
 ) -> tuple[str, str]:
     """生成一对新账号凭据 ``(user, password)``。
 
-    - user: ``[A-Za-z0-9]``，长度 6..24（默认 10）。
+    - user: 固定 8 位随机 ASCII 字母（A-Za-z）+ 4 位随机数字（0-9），如
+      ``abcdefgh1234``。
     - password: 必须同时含小写 / 大写 / 数字 / 特殊字符四类（商汤规则：
       「8–32 位，须含大写、小写、数字与特殊字符」），长度 8..32（默认 16）。
     - 两个字符集都排除 ``$`` ``{`` ``}``，保证 ${ENV} 展开永不误伤。
@@ -128,10 +127,11 @@ def generate_credentials(
     """
     if rng is None:
         rng = secrets
-    ulen = max(_USER_MIN, min(_USER_MAX, int(user_length)))
     plen = max(_PW_MIN, min(_PW_MAX, int(password_length)))
 
-    user = "".join(rng.choice(_USER_CHARSET) for _ in range(ulen))
+    user = "".join(rng.choice(string.ascii_letters) for _ in range(8)) + "".join(
+        rng.choice(string.digits) for _ in range(4)
+    )
 
     # 商汤密码规则要求四类齐全（见上方 docstring），故固定取全部类别，每类至少 1 字符
     picked = _sample_without_replacement(rng, _PASSWORD_CLASSES, len(_PASSWORD_CLASSES))
@@ -338,7 +338,9 @@ class ReplenishWorker:
             )
             return
         need = self._target - available
-        self._log(f"[补号] 可用账号 {available} < 目标 {self._target}，需补充 {need} 个")
+        self._log(
+            f"[补号] 可用账号 {available} < 目标 {self._target}，需补充 {need} 个"
+        )
         soft_retries = 0
         while need > 0:
             try:
@@ -360,7 +362,9 @@ class ReplenishWorker:
                 self._set_status(
                     self.STATUS_CHECK_ERROR,
                     f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT],
-                    log_line=f"[补号] 本轮补充出错：{type(exc).__name__}: {exc}"[:DETAIL_LIMIT],
+                    log_line=f"[补号] 本轮补充出错：{type(exc).__name__}: {exc}"[
+                        :DETAIL_LIMIT
+                    ],
                 )
                 return
 

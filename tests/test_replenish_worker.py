@@ -18,6 +18,7 @@ import base64
 import json
 import random
 import re
+import string
 import tempfile
 import threading
 import time
@@ -41,8 +42,9 @@ from st_rotator.replenish import (
     today_str,
 )
 
-# 生成器参数校验用的字符集正则（与 replenish.py 的字符集一致，排除 $ { }）
-_USER_RE = re.compile(r"^[A-Za-z0-9]{6,24}$")
+# 生成器参数校验用的字符集正则（与 replenish.py 一致，排除 $ { }）
+# 用户名固定为 8 位 ASCII 字母 + 4 位数字
+_USER_RE = re.compile(r"^[A-Za-z]{8}[0-9]{4}$")
 _PW_RE = re.compile(r"^[A-Za-z0-9~!@#%^&*?_+.,;:-]{8,32}$")
 _CLASS_PATS = (r"[a-z]", r"[A-Z]", r"[0-9]", r"[~!@#%^&*?_+.,;:\-]")
 
@@ -368,6 +370,7 @@ class ReplenishWorkerTest(unittest.TestCase):
         for _ in range(50):
             user, password = generate_credentials(rng)
             self.assertRegex(user, _USER_RE)
+            self.assertEqual(len(user), 12)
             self.assertEqual(len(password), 16)  # 默认长度
             self.assertRegex(password, _PW_RE)
             self.assertGreaterEqual(_password_classes(password), 3)
@@ -375,14 +378,21 @@ class ReplenishWorkerTest(unittest.TestCase):
     def test_generate_credentials_excludes_dollar_brace(self):
         rng = random.Random(11)
         for _ in range(300):
-            user, password = generate_credentials(
-                rng, user_length=24, password_length=32
-            )
-            self.assertEqual(len(user), 24)
+            user, password = generate_credentials(rng, password_length=32)
+            self.assertRegex(user, _USER_RE)
             self.assertEqual(len(password), 32)
             for forbidden in ("$", "{", "}"):
                 self.assertNotIn(forbidden, user)
                 self.assertNotIn(forbidden, password)
+
+    def test_generate_credentials_username_fixed_format(self):
+        rng = random.Random(23)
+        for _ in range(100):
+            user, _password = generate_credentials(rng)
+            letters, digits = user[:8], user[8:]
+            self.assertTrue(all(c in string.ascii_letters for c in letters))
+            self.assertTrue(all(c in string.digits for c in digits))
+            self.assertEqual(len(user), 12)
 
     # ------------------------------------------------------------ 3. 纯函数：spend_ok
     def test_spend_ok_first_read_allowed(self):
