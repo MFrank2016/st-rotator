@@ -1055,7 +1055,9 @@ function renderModels(state) {
   } else if (!S.models.length) {
     count.textContent = "暂无清单，点「刷新清单」从上游拉取。";
   } else {
-    count.textContent = "共 " + S.models.length + " 个模型" + (catalog.cached ? "（缓存）" : "（刚拉取）");
+    var hidden = catalog.hidden || [];
+    count.textContent = "共 " + S.models.length + " 个模型" + (catalog.cached ? "（缓存）" : "（刚拉取）")
+      + (hidden.length ? "，已按配置隐藏 " + hidden.length + " 个：" + hidden.join("、") : "");
   }
   updateModelMeta();
 }

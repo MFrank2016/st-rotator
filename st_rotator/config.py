@@ -6,6 +6,7 @@ Key 支持 ``${ENV_VAR}`` / ``${ENV_VAR:-默认值}`` 占位符，避免把密�
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -423,6 +424,56 @@ class ReplenishConfig:
 
 
 @dataclass
+class ModelFilterConfig:
+    """模型清单过滤：把"几乎不可用"的模型从清单里藏掉。
+
+    有些上游会在 ``/v1/models`` 里列出实际几乎跑不通的模型（实测商汤的
+    ``deepseek-v4.1-flash`` 就经常不可用）。把它们配进 ``hidden`` 后，
+    **控制台的选择器和网关透传的 ``/v1/models`` 都不会再列出它们**，
+    省得自己或上层 agent 误选。
+
+    Attributes:
+        hidden: 要隐藏的模型名列表，支持 ``*`` 通配（如 ``deepseek-v4.1-*``）。
+            只影响"清单展示"，**不拦截显式请求**——上层点名要这个模型时，
+            网关照常转发给上游（该报什么错就报什么错），不做额外限制。
+    """
+
+    hidden: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any] | None) -> "ModelFilterConfig":
+        if data is None:
+            return cls()
+        if not isinstance(data, Mapping):
+            raise ConfigError("model_filter 必须是对象")
+        unknown = set(data) - set(cls.__dataclass_fields__)
+        if unknown:
+            raise ConfigError(f"model_filter 存在未知字段: {sorted(unknown)}")
+        raw = data.get("hidden") or []
+        if isinstance(raw, str):
+            raise ConfigError(
+                'model_filter.hidden 必须是数组，例如 ["deepseek-v4.1-flash"]'
+            )
+        if not isinstance(raw, (list, tuple)):
+            raise ConfigError("model_filter.hidden 必须是数组")
+        hidden: list[str] = []
+        for item in raw:
+            if not isinstance(item, str):
+                raise ConfigError(f"model_filter.hidden 只接受字符串，收到 {item!r}")
+            name = item.strip()
+            if name and name not in hidden:  # 去重但保持书写顺序
+                hidden.append(name)
+        return cls(hidden=hidden)
+
+    def is_hidden(self, model_id: str) -> bool:
+        """模型是否命中隐藏规则（精确匹配或 ``*`` 通配）。"""
+        name = (model_id or "").strip()
+        if not name:
+            return False
+        return any(fnmatch.fnmatchcase(name, pattern) for pattern in self.hidden)
+
+
+@dataclass
 class AccountConfig:
     """一个账号（可含多把 Key）。
 
@@ -533,6 +584,9 @@ class Config:
     # 自动补充账号（可用账号数不足时用易码短信注册/接管）
     replenish: ReplenishConfig = field(default_factory=ReplenishConfig)
 
+    # 模型清单过滤（把几乎不可用的模型从清单里藏掉）
+    model_filter: ModelFilterConfig = field(default_factory=ModelFilterConfig)
+
     # 连接池
     max_connections: int = 100
     max_keepalive: int = 20
@@ -591,6 +645,7 @@ class Config:
             data.pop("flash_lite_exchange", None)
         )
         replenish = ReplenishConfig.from_dict(data.pop("replenish", None))
+        model_filter = ModelFilterConfig.from_dict(data.pop("model_filter", None))
         headers = {
             str(k): expand_env(str(v))
             for k, v in (data.pop("extra_headers", None) or {}).items()
@@ -603,6 +658,7 @@ class Config:
             "auto_renew",
             "flash_lite_exchange",
             "replenish",
+            "model_filter",
         }
         unknown = set(data) - known
         if unknown:
@@ -615,6 +671,7 @@ class Config:
             auto_renew=auto_renew,
             flash_lite_exchange=flash_lite,
             replenish=replenish,
+            model_filter=model_filter,
             extra_headers=headers,
             **{k: expand_env(v) if isinstance(v, str) else v for k, v in data.items()},
         )

@@ -21,6 +21,7 @@ from st_rotator.ui import ConsoleState
 
 TOKEN = "testtoken123456"
 
+
 def _read_status(fp) -> int:
     """从 keep-alive 连接按 Content-Length 读一条 HTTP 响应，返回状态码。"""
     status_line = fp.readline().decode("latin-1")
@@ -64,6 +65,9 @@ class FakeRotator:
 
     def available_models(self) -> list:
         return []
+
+    def filter_models_payload(self, payload):
+        return payload
 
     def status(self) -> dict:
         return {"status": "ok", "keys": []}
@@ -335,9 +339,7 @@ class AuthHardeningTest(_ProxyServerTestCase):
         self.assertEqual(resp.status, 413)
 
     def test_oversized_content_length_login_413(self) -> None:
-        resp, _ = self.request(
-            "POST", "/login", headers={"Content-Length": "40000000"}
-        )
+        resp, _ = self.request("POST", "/login", headers={"Content-Length": "40000000"})
         self.assertEqual(resp.status, 413)
 
 
@@ -549,7 +551,11 @@ class _RecordingRotator(FakeRotator):
 
     def request(self, path, method="GET", json_body=None, headers=None) -> dict:
         self.request_calls += 1
-        return {"object": "list", "data": [], "usage": {"prompt_tokens": 4, "completion_tokens": 6}}
+        return {
+            "object": "list",
+            "data": [],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 6},
+        }
 
 
 class ParamsAndUsageTest(_ProxyServerTestCase):
@@ -565,18 +571,27 @@ class ParamsAndUsageTest(_ProxyServerTestCase):
         return self.rec
 
     def _chat(self, body: dict, headers: dict | None = None):
-        h = {"Content-Type": "application/json", "Authorization": f"Bearer {self.token}"}
+        h = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.token}",
+        }
         if headers:
             h.update(headers)
-        return self.request("POST", "/v1/chat/completions", body=json.dumps(body), headers=h)
+        return self.request(
+            "POST", "/v1/chat/completions", body=json.dumps(body), headers=h
+        )
 
     def test_min_max_tokens_floor_raises_small(self) -> None:
-        resp, _ = self._chat({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})
+        resp, _ = self._chat(
+            {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 16}
+        )
         self.assertEqual(resp.status, 200)
         self.assertEqual(self.rec.last_chat_params.get("max_tokens"), 2048)
 
     def test_min_max_tokens_keeps_larger(self) -> None:
-        resp, _ = self._chat({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 9000})
+        resp, _ = self._chat(
+            {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 9000}
+        )
         self.assertEqual(resp.status, 200)
         self.assertEqual(self.rec.last_chat_params.get("max_tokens"), 9000)
 
@@ -589,10 +604,16 @@ class ParamsAndUsageTest(_ProxyServerTestCase):
 
     def test_stream_injects_include_usage_and_records(self) -> None:
         pair = self.login()
-        resp, _ = self._chat({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+        resp, _ = self._chat(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+        )
         self.assertEqual(resp.status, 200)
-        self.assertTrue(self.rec.last_stream_params.get("stream_options", {}).get("include_usage"))
-        resp2, body = self.request("GET", "/api/usage?hours=1", headers={"Cookie": pair})
+        self.assertTrue(
+            self.rec.last_stream_params.get("stream_options", {}).get("include_usage")
+        )
+        resp2, body = self.request(
+            "GET", "/api/usage?hours=1", headers={"Cookie": pair}
+        )
         self.assertEqual(json.loads(body)["buckets"][-1]["total"], 12)
 
     def test_api_usage_requires_auth(self) -> None:
@@ -605,19 +626,27 @@ class ParamsAndUsageTest(_ProxyServerTestCase):
             "POST",
             "/v1/embeddings",
             body=json.dumps({"input": "x", "model": "m"}),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.token}"},
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.token}",
+            },
         )
         self.assertEqual(resp.status, 200)
-        resp2, body = self.request("GET", "/api/usage?hours=1", headers={"Cookie": pair})
+        resp2, body = self.request(
+            "GET", "/api/usage?hours=1", headers={"Cookie": pair}
+        )
         self.assertEqual(json.loads(body)["buckets"][-1]["total"], 10)
 
     def test_credits_samples_endpoint(self) -> None:
         pair = self.login()
-        resp, body = self.request("GET", "/api/credits/samples", headers={"Cookie": pair})
+        resp, body = self.request(
+            "GET", "/api/credits/samples", headers={"Cookie": pair}
+        )
         self.assertEqual(resp.status, 200)
         self.assertIn("samples", json.loads(body))
         resp, _ = self.request("GET", "/api/usage")
         self.assertEqual(resp.status, 401)
+
 
 if __name__ == "__main__":
     unittest.main()

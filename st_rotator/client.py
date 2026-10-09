@@ -664,8 +664,48 @@ class StRotator:
         )
         return self.limiter.stats()
 
+    def model_filter(self) -> Any:
+        """当前的模型清单过滤器（``config.model_filter``；老配置对象可能没有该字段）。"""
+        return getattr(self.config, "model_filter", None)
+
+    def hidden_model(self, model_id: str) -> bool:
+        """该模型是否被配置为"从清单里藏掉"。"""
+        flt = self.model_filter()
+        return bool(flt is not None and flt.is_hidden(model_id))
+
+    def filter_models_payload(self, payload: Any) -> Any:
+        """过滤 OpenAI 风格 ``{"data": [...]}`` 模型清单，其余字段原样保留。
+
+        用于网关把 ``/v1/models`` 透传给上层应用时保持与控制台一致——
+        被隐藏的模型不该出现在任何一份清单里。
+        """
+        if not isinstance(payload, dict):
+            return payload
+        data = payload.get("data")
+        if not isinstance(data, list):
+            return payload
+        kept: list[Any] = []
+        for item in data:
+            if isinstance(item, dict):
+                model_id = item.get("id") or item.get("name")
+            elif isinstance(item, str):
+                model_id = item
+            else:
+                kept.append(item)
+                continue
+            if self.hidden_model(str(model_id or "")):
+                continue
+            kept.append(item)
+        if len(kept) == len(data):
+            return payload
+        filtered = dict(payload)
+        filtered["data"] = kept
+        return filtered
+
     def available_models(self, *, refresh: bool = False, ttl: float = 300.0) -> dict[str, Any]:
-        """取上游模型清单（带缓存），供 UI 的模型选择器使用。
+        """取上游模型清单（带缓存 + 按配置过滤），供 UI 的模型选择器使用。
+
+        过滤在**返回时**做（而不是抓取时），所以改配置后不必等缓存过期即可生效。
 
         这里**故意吞掉所有异常**：模型清单是锦上添花的东西，而上游连不上/限流时，
         恰恰是用户最需要打开控制台排查的时刻。如果让网络错误冒出去，整个状态接口会
@@ -673,17 +713,13 @@ class StRotator:
         由界面负责显示。
 
         Returns:
-            ``{"models": [...], "fetched_at": 时间戳, "cached": bool, "error": str}``
+            ``{"models": [...], "fetched_at": 时间戳, "cached": bool,
+            "error": str, "hidden": [被隐藏的模型名...]}``
         """
         with self._models_lock:
             fresh = self._models_cache and (time.monotonic() - self._models_fetched_at) < ttl
             if fresh and not refresh:
-                return {
-                    "models": list(self._models_cache),
-                    "fetched_at": self._models_fetched_at,
-                    "cached": True,
-                    "error": self._models_error,
-                }
+                return self._models_result(cached=True)
             try:
                 payload = self.models()
                 self._models_cache = _parse_model_list(payload)
@@ -696,12 +732,24 @@ class StRotator:
                 self._models_error = f"{type(exc).__name__}: {exc}"
                 self._log(f"[警告] 拉取模型清单失败: {self._models_error}")
             self._models_fetched_at = time.monotonic()
-            return {
-                "models": list(self._models_cache),
-                "fetched_at": self._models_fetched_at,
-                "cached": False,
-                "error": self._models_error,
-            }
+            return self._models_result(cached=False)
+
+    def _models_result(self, *, cached: bool) -> dict[str, Any]:
+        """把缓存里的模型清单按配置过滤后打包返回（调用方需持 ``_models_lock``）。"""
+        kept: list[dict[str, Any]] = []
+        hidden: list[str] = []
+        for model in self._models_cache:
+            if self.hidden_model(model.get("id", "")):
+                hidden.append(str(model.get("id", "")))
+            else:
+                kept.append(model)
+        return {
+            "models": kept,
+            "fetched_at": self._models_fetched_at,
+            "cached": cached,
+            "error": self._models_error,
+            "hidden": hidden,
+        }
 
     # ------------------------------------------------------------ 内部：载荷
 

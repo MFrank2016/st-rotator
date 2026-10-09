@@ -71,6 +71,10 @@
     "key_type": "API_KEY_TYPE_TOKEN_PLAN"
   },
 
+  "model_filter": {
+    "hidden": ["deepseek-v4.1-flash"]
+  },
+
   "accounts": [
     {
       "name": "账号1",
