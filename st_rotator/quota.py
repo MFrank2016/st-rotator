@@ -414,7 +414,7 @@ class CreditTracker:
         self._hours = max(1, int(hours))
         self._clock = clock
         self._lock = threading.Lock()
-        self._last: dict[tuple[str, str], tuple[int, float]] = {}
+        self._last: dict[tuple[str, str], tuple[int, float, float]] = {}
         self._buckets: dict[int, dict[str, float]] = {}
         self._samples: deque[dict[str, Any]] = deque(maxlen=500)
 
@@ -429,16 +429,19 @@ class CreditTracker:
         now_hour = self._hour_of(ts)
         with self._lock:
             prev = self._last.get(key)
-            self._last[key] = (int(reset_at or 0), float(used))
+            self._last[key] = (int(reset_at or 0), float(used), ts)
             delta = 0.0
+            covered_since = ts
             if prev is not None:
-                prev_reset, prev_used = prev
+                prev_reset, prev_used, prev_ts = prev
+                covered_since = prev_ts
                 if int(reset_at or 0) == prev_reset and used >= prev_used:
                     delta = used - prev_used
                 else:
                     delta = used  # 窗口复位或回退 → 新窗口，消耗即当前 used
             self._samples.append({
                 "ts": ts,
+                "since": covered_since,
                 "account": account,
                 "pool": pool_type,
                 "reset_at": int(reset_at or 0),
@@ -495,6 +498,34 @@ class CreditTracker:
         if nonzero:
             items = [s for s in items if s["delta"] > 0]
         return items[-limit:]
+
+    def accounts_with_delta_since(
+        self, ts: float, *, pool: str = "general", idle_since: float | None = None
+    ) -> list[str]:
+        """返回在 ``ts`` 之后（含）该池有消耗增量（delta>0）的账号名，按出现顺序去重。
+
+        用于「网关空转却有积分变动」的泄漏检测：只看指定池（默认 general），
+        以规避一换一烧点只动 flash_lite 池造成的误判。
+
+        每条采样都带 ``since``（该增量覆盖区间的起点 = 上一次采样时刻）；当传入
+        ``idle_since``（网关最近一次 token 消耗时刻）时，**只在覆盖区间整体晚于
+        ``idle_since`` 时才计入** —— 否则该增量可能来自网关自身刚发生的请求
+        （采样最长有一个采样周期的滞后），会造成误判。
+        """
+        with self._lock:
+            items = list(self._samples)
+        seen: set[str] = set()
+        out: list[str] = []
+        for s in items:
+            if s["ts"] < ts or s["delta"] <= 0 or s["pool"] != pool:
+                continue
+            if idle_since is not None and idle_since >= s["since"]:
+                continue
+            account = s["account"]
+            if account not in seen:
+                seen.add(account)
+                out.append(account)
+        return out
 
 
 class QuotaService:
