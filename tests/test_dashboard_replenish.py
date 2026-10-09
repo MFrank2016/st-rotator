@@ -65,7 +65,11 @@ class DashboardReplenishTest(unittest.TestCase):
         # 且渲染时密码框永远置空（不泄露已存密钥）。
         self.assertIn("replenish: {", DASHBOARD_HTML)
         self.assertIn("body.replenish.sms_token", DASHBOARD_HTML)
-        self.assertIn('$("opt-rp-sms-token").value = ""', DASHBOARD_HTML)
+        # sms_token 渲染时置空，但必须跳过正在输入的输入框（否则 2 秒轮询会抹掉用户输入）
+        self.assertIn('var rps = $("opt-rp-sms-token");', DASHBOARD_HTML)
+        self.assertIn(
+            'if (document.activeElement !== rps) rps.value = "";', DASHBOARD_HTML
+        )
 
 
 if __name__ == "__main__":

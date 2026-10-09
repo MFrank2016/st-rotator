@@ -535,9 +535,7 @@ def build_replenish(
     keys: KeyTransport | None = None,
 ) -> ReplenishWorker | None:
     """仅当 replenish 启用（enabled 且 target_count>0 且 sms_token 非空）时创建并启动补号 worker。"""
-    from typing import cast
-
-    from .autorenew import HttpKeyManager, KeyTransport as _KeyTransport
+    from .autorenew import HttpKeyManager
     from .authn import HttpAuthn
     from .replenish import ReplenishWorker as _ReplenishWorker
     from .sms import EjiemaSms
@@ -552,8 +550,7 @@ def build_replenish(
     if authn is None:
         authn = HttpAuthn()
     if keys is None:
-        # list_keys 返回类型与协议存在既有偏差，须经 object 过渡 cast（同 replenish.py）
-        keys = cast(_KeyTransport, cast(object, HttpKeyManager()))
+        keys = HttpKeyManager()
     worker = _ReplenishWorker(
         accounts=lambda: rotator.config.accounts,
         status_source=status_source,

@@ -150,7 +150,7 @@ def _reasoning_text(chunk: Any) -> str:
     choices = chunk.get("choices") or []
     if not choices:
         return ""
-    delta = choices[0].get("delta") or {}
+    delta = (choices[0] or {}).get("delta") or {}
     return delta.get("reasoning_content") or ""
 
 

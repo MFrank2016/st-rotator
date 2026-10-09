@@ -6,7 +6,9 @@ OIDC 重定向；register / change_password 按文档观测为明文密码（无
 
 只 import quota 的公开常量与 TokenBundle（quota.py 零修改）。
 
-失败语义：``AuthnError``，``status=0`` 表示网络层错误，其余为 HTTP 状态码；
+失败语义：``AuthnError``，``status=0`` 表示「无 HTTP 状态码」（网络层失败，或
+``_query_param`` / 缺 redirect 等客户端逻辑错误），其余为 HTTP 状态码。判断是否
+网络层请以 ``reason == "network"`` 为准，不要用 ``status == 0``。
 ``reason`` 取自封闭集合 {invalid_captcha, incorrect_sms_code, invalid,
 already_registered, username_taken, tenant_list, challenge_expired, network, unknown}。
 
@@ -46,7 +48,6 @@ from .quota import (
 # 勘误（docs §B.1）：SPA 的 token 交换打向 {signinUrl}/oauth2/token =
 # platform.sensenova.cn，而非 quota.OIDC_TOKEN（signin.sensecore.cn）。
 OIDC_BASE = OIDC_AUTH.removesuffix("/oauth2/auth")
-OIDC_TOKEN_URL = OIDC_BASE + "/oauth2/token"
 
 # 错误原因识别标记（匹配于 gRPC 信封的 message/reason 合并文本）
 _CAPTCHA_MARKERS = ("captcha", "验证码")
@@ -63,7 +64,22 @@ _USERNAME_TAKEN_MARKERS = (
     "用户名已占用",
     "用户名已被",
 )
-_REGISTERED_MARKERS = ("already_registered", "registered", "exist", "已注册", "存在")
+_REGISTERED_MARKERS = (
+    "already_registered",
+    "already registered",
+    "registered",
+    "已注册",
+)
+# 否定式（「不存在 / 未注册」）：这些文本会命中上面的裸词，必须先排除，否则
+# 「用户不存在 / tenant not exist」会被误判为 already_registered，把 not-found
+# 错误导向「接管」恢复路径。
+_REGISTERED_NEGATIONS = (
+    "not exist",
+    "does not exist",
+    "not registered",
+    "不存在",
+    "未注册",
+)
 _TENANT_MARKERS = ("tenant_list", "tenant list", "租户")
 _CHALLENGE_MARKERS = (
     "challenge_expired",
@@ -244,7 +260,9 @@ def _classify_reason(text: str) -> str:
         return "invalid_captcha"
     if _contains_any(text, _USERNAME_TAKEN_MARKERS):
         return "username_taken"
-    if _contains_any(text, _REGISTERED_MARKERS):
+    if _contains_any(text, _REGISTERED_MARKERS) and not _contains_any(
+        text, _REGISTERED_NEGATIONS
+    ):
         return "already_registered"
     if _contains_any(text, _TENANT_MARKERS):
         return "tenant_list"
@@ -393,9 +411,17 @@ class HttpAuthn:
         location: str | None,
         predicate: Callable[[str], bool],
         *,
+        param: str,
         max_hops: int = 6,
     ) -> str | None:
-        """手动跟随重定向直到 predicate(url) 命中（或返回 None）。"""
+        """手动跟随重定向直到 predicate(url) 命中（或返回 None）。
+
+        ``param`` 是兜底正则要抽取的查询参数名（login_challenge / code），用于
+        响应体里直接内嵌目标 URL（无 Location 头）的情形。
+        """
+        body_re = re.compile(
+            r"(https?://[^\"'\s<>]+[?&]" + re.escape(param) + r"=[^&\"'\s<>]+)"
+        )
         for _ in range(max_hops):
             if not location:
                 return None
@@ -413,7 +439,7 @@ class HttpAuthn:
             new_loc = resp.headers.get("Location")
             if not new_loc:
                 text = resp.read().decode("utf-8", "replace")
-                found = re.search(r"(https?://[^\"'\s<>]+[?&]code=[^&\"'\s<>]+)", text)
+                found = body_re.search(text)
                 if found and predicate(found.group(1)):
                     return found.group(1)
             location = new_loc
@@ -424,9 +450,13 @@ class HttpAuthn:
         location: str | None,
         predicate: Callable[[str], bool],
         *,
+        param: str,
         max_hops: int = 6,
     ) -> str | None:
         """curl 会话版重定向跟随：复用同一 Cookie 罐（与 register/smsLogin 同会话）。"""
+        body_re = re.compile(
+            r"(https?://[^\"'\s<>]+[?&]" + re.escape(param) + r"=[^&\"'\s<>]+)"
+        )
         headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
         for _ in range(max_hops):
             if not location:
@@ -444,9 +474,7 @@ class HttpAuthn:
                 raise AuthnError(0, "network", f"{type(exc).__name__}: {exc}") from exc
             new_loc = resp.headers.get("Location")
             if not new_loc:
-                found = re.search(
-                    r"(https?://[^\"'\s<>]+[?&]code=[^&\"'\s<>]+)", resp.text or ""
-                )
+                found = body_re.search(resp.text or "")
                 if found and predicate(found.group(1)):
                     return found.group(1)
                 return None
@@ -481,7 +509,9 @@ class HttpAuthn:
             params["intent"] = "register"
         url = self._oidc_auth + "?" + urllib.parse.urlencode(params)
         if self._curl is not None:
-            loc = self._follow_until_curl(url, lambda u: "login_challenge=" in u)
+            loc = self._follow_until_curl(
+                url, lambda u: "login_challenge=" in u, param="login_challenge"
+            )
         else:
             opener = self._shared_opener
             resp = self._open(
@@ -491,7 +521,10 @@ class HttpAuthn:
                 ),
             )
             loc = self._follow_until(
-                opener, resp.geturl(), lambda u: "login_challenge=" in u
+                opener,
+                resp.geturl(),
+                lambda u: "login_challenge=" in u,
+                param="login_challenge",
             )
         if not loc:
             raise AuthnError(0, "unknown", "未能获取 login_challenge")
@@ -505,10 +538,12 @@ class HttpAuthn:
         必须与 register/smsLogin 复用同一会话（Cookie），否则 OIDC 授权端点不返回 code。
         """
         if self._curl is not None:
-            loc = self._follow_until_curl(redirect_url, lambda u: "code=" in u)
+            loc = self._follow_until_curl(
+                redirect_url, lambda u: "code=" in u, param="code"
+            )
         else:
             loc = self._follow_until(
-                self._shared_opener, redirect_url, lambda u: "code=" in u
+                self._shared_opener, redirect_url, lambda u: "code=" in u, param="code"
             )
         if not loc:
             raise AuthnError(0, "unknown", "未能获取 authorization code")

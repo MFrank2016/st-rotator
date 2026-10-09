@@ -1343,8 +1343,10 @@ function renderOptions(state) {
   });
   var rpk = $("opt-rp-keytype");
   if (document.activeElement !== rpk && rp.key_type) rpk.value = rp.key_type;
-  // sms_token 是密钥：渲染时永远置空（服务端 snapshot 本就不回显），仅在用户重新输入后随请求发送。
-  $("opt-rp-sms-token").value = "";
+  // sms_token 是密钥：渲染时置空（服务端 snapshot 本就不回显），仅在用户重新输入后随请求发送。
+  // 必须跳过正在输入的输入框，否则 2 秒轮询会把用户刚敲进去的 token 抹掉。
+  var rps = $("opt-rp-sms-token");
+  if (document.activeElement !== rps) rps.value = "";
 }
 
 /* ------------------------------------------------------------------ 日志 */

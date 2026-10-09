@@ -881,7 +881,8 @@ class ConsoleState:
                 if field_name not in rp_payload:
                     continue
                 try:
-                    rp_changes[field_name] = int(rp_payload[field_name])
+                    caster = int if field_name == "target_count" else float
+                    rp_changes[field_name] = caster(rp_payload[field_name])
                 except (TypeError, ValueError):
                     return UiResponse.error(
                         f"{label}不是合法数字：{rp_payload[field_name]!r}"
@@ -899,6 +900,8 @@ class ConsoleState:
                 value = str(rp_payload[field_name]).strip()
                 if field_name == "sms_token" and not value:
                     continue  # 空 token 忽略，绝不清空既有配置
+                if field_name == "keyword" and not value:
+                    return UiResponse.error("短信关键词不能为空")
                 rp_changes[field_name] = value
             rp_changes = {
                 k: v for k, v in rp_changes.items() if getattr(rp_cfg, k) != v

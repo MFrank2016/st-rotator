@@ -811,6 +811,8 @@ class ConfigStore:
             "max_concurrency": 4,
             "weight": 1.0,
         }
+        if not [k for k in (api_keys or []) if str(k).strip()]:
+            raise ConfigError(f"账号 {name} 的 api_keys 不能为空")
         accounts.append(entry)
         self.reload()
         return entry

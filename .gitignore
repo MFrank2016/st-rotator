@@ -1,6 +1,7 @@
 # 真实密钥配置 —— 绝对不要提交
 config.json
 config.*.json
+config.json.tmp
 !config.example.json
 
 # 补号注册表（已用号码 / 每日花销 / 注册审计）—— 含敏感数据，不要提交

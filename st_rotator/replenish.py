@@ -31,11 +31,11 @@ persist / registry）都通过注入的协议与回调提供，因此可无网�
 
 from __future__ import annotations
 
-import random
+import secrets
 import string
 import threading
 import time
-from typing import Any, Callable, Mapping, Sequence, cast
+from typing import Any, Callable, Mapping, Sequence
 
 from .authn import (
     AuthnError,
@@ -44,7 +44,7 @@ from .authn import (
     sms_login_redirect,
     sms_login_tenants,
 )
-from .autorenew import KeyInfo, KeyTransport
+from .autorenew import KeyTransport
 from .config import AccountConfig
 from .registry import Registry
 from .sms import SmsTransport, wait_sms_code
@@ -53,6 +53,8 @@ from .sms import SmsTransport, wait_sms_code
 DETAIL_LIMIT = 200
 # 取号去重循环上限：连续拿到已用号码超过此数即放弃本轮
 DEDUPE_MAX = 20
+# 软重试上限：短信持续超时（need 不递减）时，连续超过此数即放弃本轮，避免死循环
+SOFT_RETRY_MAX = 10
 
 # 用户名 / 密码字符集：**刻意排除 $ { }** —— 避免 ConfigStore 的 ${ENV}
 # 占位符展开误伤生成的凭据。
@@ -114,11 +116,11 @@ def generate_credentials(
       「8–32 位，须含大写、小写、数字与特殊字符」），长度 8..32（默认 16）。
     - 两个字符集都排除 ``$`` ``{`` ``}``，保证 ${ENV} 展开永不误伤。
 
-    ``rng`` 可注入（``secrets`` / ``random.Random(seed)`` / ``random`` 模块）；
-    缺省用 ``random`` 模块，便于测试固定种子。
+    ``rng`` 可注入（``secrets`` / ``random.Random(seed)``）；缺省用 ``secrets``
+    （密码学安全），测试可注入 ``random.Random(seed)`` 固定种子。
     """
     if rng is None:
-        rng = random
+        rng = secrets
     ulen = max(_USER_MIN, min(_USER_MAX, int(user_length)))
     plen = max(_PW_MIN, min(_PW_MAX, int(password_length)))
 
@@ -282,10 +284,20 @@ class ReplenishWorker:
             )
             return
         need = self._target - available
+        soft_retries = 0
         while need > 0:
             try:
                 if self._replenish_one():
                     need -= 1
+                    soft_retries = 0
+                    continue
+                soft_retries += 1
+                if soft_retries >= SOFT_RETRY_MAX:
+                    self._set_status(
+                        self.STATUS_CHECK_ERROR,
+                        f"连续 {SOFT_RETRY_MAX} 次短信超时，本轮放弃",
+                    )
+                    return
             except _StopCycle:
                 return
             except Exception as exc:  # noqa: BLE001 - 单次迭代失败不拖垮循环
@@ -468,10 +480,7 @@ class ReplenishWorker:
             self._set_status(self.STATUS_CHECK_ERROR, "接管后无法解析 user_id")
             raise _StopCycle()
         # 先吊销全部旧 key（该手机号归我们所有，旧凭据一律作废）。
-        # KeyTransport 协议把 list_keys 声明为 (list, next_page_token)，而具体实现
-        # HttpKeyManager.list_keys 已在内部翻页并直接返回 list —— 按实现语义取全部
-        # key（cast 仅消除协议与实现间的既有类型偏差，同 autorenew.py:373）。
-        for item in cast(Sequence[KeyInfo], self._keys.list_keys(bundle.access_token)):
+        for item in self._keys.list_keys(bundle.access_token):
             self._keys.delete_key(bundle.access_token, key_id=item.id)
         created = self._keys.create_key(
             bundle.access_token, displayname=self._key_name, key_type=self._key_type
@@ -487,9 +496,11 @@ class ReplenishWorker:
             clock=self._clock,
         )
         if code2 is None:
-            # 二次短信超时：账号已在平台接管成功（新 key 已建）。尽量保住成果——
-            # 仍把 key 与新密码落账，但标记 check_error（真实密码未知，可能登录失败，
-            # 下一轮 auto_renew 会如实报 password_error / 或直接走 check_error）。
+            # 二次短信超时：账号已在平台接管成功（新 key 已建），但真实密码未知。
+            # 为保住成果仍把 key 与新密码落账，user 落空串（拿不到用户名）。
+            # 已知限制：user 为空时 auto_renew 记为 no_credentials（跳过，而非
+            # password_error），count_available 又把它算作可用 —— 该账号 key 到期后
+            # 既不会自动续期、也不会触发补号，需人工补录用户名。
             self._persist(
                 "", phone, new_pw, created.api_key, outcome="takeover_password_unset"
             )

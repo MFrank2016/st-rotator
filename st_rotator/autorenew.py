@@ -413,7 +413,7 @@ class AutoRenewWorker:
         self._rotate(account)
 
     def _rotate(self, account: AccountConfig) -> None:
-        """登录 → 先 create 后 delete-all → persist；异常分类到对应状态。"""
+        """登录 → 先 delete-all 后 create → persist；异常分类到对应状态。"""
         try:
             bundle = self._login(account.user, account.password)
         except QuotaAuthError as exc:
