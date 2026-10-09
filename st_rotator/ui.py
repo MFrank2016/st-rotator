@@ -64,6 +64,7 @@ from .version import __version__
 
 if TYPE_CHECKING:  # pragma: no cover - 仅类型标注用，运行时字段默认 None
     from .replenish import ReplenishWorker
+    from .guard import LeakGuardWorker
     from .registry import Registry
 
 # 控制台页面路径（免鉴权，内容只是空壳）
@@ -114,6 +115,8 @@ class UsageTracker:
         self._clock = clock
         self._lock = threading.Lock()
         self._buckets: dict[int, dict[str, int]] = {}
+        # 最近一次记录用量的墙钟时间（None = 从未记录），供「自某时刻起是否有用量」查询
+        self._last_at: float | None = None
 
     @staticmethod
     def _hour_of(ts: float) -> int:
@@ -124,6 +127,7 @@ class UsageTracker:
     ) -> None:
         hour = self._hour_of(self._clock())
         with self._lock:
+            self._last_at = self._clock()
             bucket = self._buckets.get(hour)
             if bucket is None:
                 bucket = {"prompt": 0, "completion": 0, "total": 0, "requests": 0}
@@ -155,6 +159,16 @@ class UsageTracker:
                     }
                 )
         return out
+
+    def last_at(self) -> float | None:
+        """最近一次记录用量的墙钟时间；从未记录过则为 None。"""
+        with self._lock:
+            return self._last_at
+
+    def has_usage_since(self, ts: float) -> bool:
+        """自 ``ts`` 起是否记录过用量（``_last_at >= ts``，含相等边界）。"""
+        with self._lock:
+            return self._last_at is not None and self._last_at >= ts
 
 
 class GatewayMetrics:
@@ -191,6 +205,10 @@ class GatewayMetrics:
             completion_tokens=completion_tokens,
             requests=requests,
         )
+
+    def has_usage_since(self, ts: float) -> bool:
+        """自 ``ts`` 起是否记录过用量（薄代理，转发给 ``usage``）。"""
+        return self.usage.has_usage_since(ts)
 
     def set_paused(self, paused: bool) -> bool:
         with self._lock:
@@ -280,6 +298,7 @@ class ConsoleState:
     replenish: ReplenishWorker | None = None
     replenish_factory: Callable[[], ReplenishWorker | None] | None = None
     registry: Registry | None = None
+    leak_guard: LeakGuardWorker | None = None
     # 补号保存后行为：sms_factory(token) 构造易码传输；sms_token_ok 记录最近一次
     # 校验结果（None=未配置 / True=可用 / False=已标记不可用）
     sms_factory: Callable[[str], Any] | None = None
@@ -369,6 +388,7 @@ class ConsoleState:
             "replenish_status": self.replenish.account_status()
             if self.replenish
             else {},
+            "leak_guard_status": self.leak_guard_payload(),
             "replenish_state": self._replenish_state_payload(),
             "options": {
                 "strategy": self.config.strategy,
@@ -453,6 +473,31 @@ class ConsoleState:
         if self.quota is None:
             return {"samples": []}
         return {"samples": self.quota.credits.samples(limit=limit, nonzero=nonzero)}
+
+    def leak_guard_payload(self) -> dict[str, Any]:
+        """泄漏守卫状态；无 worker 时给出安全默认（含「已开启但未运行」提示）。"""
+        if self.leak_guard is not None:
+            return self.leak_guard.status()
+        cfg = self.config.leak_guard
+        enabled = bool(cfg.enabled)
+        return {
+            "enabled": enabled,
+            "status": "not_running" if enabled else "disabled",
+            "message": (
+                "已开启但未运行：需配置账号登录凭据（user/password），或重启 ui / tray 后生效"
+                if enabled
+                else "未启用"
+            ),
+            "pending": [],
+            "pending_count": 0,
+            "last_scan_at": None,
+            "last_rotate_at": None,
+            "last_rotate_date": "",
+            "next_rotate_at": None,
+            "window_seconds": cfg.window_seconds,
+            "rotate_hour": cfg.rotate_hour,
+            "rotate_minute": cfg.rotate_minute,
+        }
 
     def _replenish_state_payload(self) -> dict[str, Any]:
         """补号状态：可用/目标、当日花销、取号数、注册成功数、轮换数、失效账号数。
