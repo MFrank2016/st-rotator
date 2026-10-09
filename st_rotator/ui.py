@@ -59,7 +59,7 @@ from .errors import ConfigError, RotatorError
 from .logs import LogBuffer
 from .autorenew import AutoRenewWorker
 from .quota import QuotaService, QuotaWindow, WindowPair
-from .replenish import count_available, count_unavailable
+from .replenish import count_available, count_unavailable, today_str
 from .version import __version__
 
 if TYPE_CHECKING:  # pragma: no cover - 仅类型标注用，运行时字段默认 None
@@ -518,6 +518,7 @@ class ConsoleState:
             "available": available,
             "target": self.config.replenish.target_count,
             "spend": spend,
+            "consumed": _consumed_today(spend),
             "used_phones": used,
             "registrations_ok": registrations_ok,
             "rotations": rotations,
@@ -1332,6 +1333,27 @@ def _empty_consumption() -> dict[str, Any]:
     """没有配额服务时返回全 0 的消耗结构，保持前端字段稳定。"""
     zeros = {k: 0.0 for k in ("h1", "h5", "h24", "d7", "d30")}
     return {"general": dict(zeros), "flash_lite": dict(zeros), "series": []}
+
+
+def _consumed_today(
+    spend: Mapping[str, Any], *, today: str | None = None
+) -> float:
+    """今日已用（元）：换天后视为 0，避免沿用昨天的余额差。
+
+    与 ``replenish.spend_ok`` 同一口径：只有 ``spend["date"] == today`` 时才用
+    ``start_balance - last_balance`` 计算；否则（无基线 / 尚未跨到新一天的前值）返回 0。
+    """
+    today = today or today_str()
+    if not spend or spend.get("date") != today:
+        return 0.0
+    start = spend.get("start_balance")
+    last = spend.get("last_balance")
+    if start is None or last is None:
+        return 0.0
+    try:
+        return max(0.0, float(start) - float(last))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 # ---------------------------------------------------------------- 开窗

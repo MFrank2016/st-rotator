@@ -607,5 +607,53 @@ class SaveTimeReplenishTest(unittest.TestCase):
             self.assertTrue(resp.payload["ok"])
 
 
+class ConsumedTodayTest(unittest.TestCase):
+    """「今日已用」按服务端口径计算：换天（date != today）归零，避免沿用昨天余额差。"""
+
+    def test_helper_same_day(self):
+        from st_rotator.ui import _consumed_today
+
+        spend = {"date": "2026-01-02", "start_balance": 10.0, "last_balance": 8.5}
+        self.assertAlmostEqual(_consumed_today(spend, today="2026-01-02"), 1.5)
+
+    def test_helper_new_day_zero(self):
+        from st_rotator.ui import _consumed_today
+
+        spend = {"date": "2000-01-01", "start_balance": 10.0, "last_balance": 8.0}
+        self.assertEqual(_consumed_today(spend, today="2026-01-02"), 0.0)
+
+    def test_helper_missing_baseline_zero(self):
+        from st_rotator.ui import _consumed_today
+
+        self.assertEqual(_consumed_today({}, today="2026-01-02"), 0.0)
+        self.assertEqual(
+            _consumed_today(
+                {"date": "2026-01-02", "start_balance": None, "last_balance": None},
+                today="2026-01-02",
+            ),
+            0.0,
+        )
+
+    def test_payload_consumed_zero_for_stale_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = _FakeRegistry(
+                {"date": "2000-01-01", "start_balance": 10.0, "last_balance": 8.0}, []
+            )
+            console = _console(tmp, replenish=_FakeWorker({}), registry=registry)
+            self.assertEqual(console.snapshot()["replenish_state"]["consumed"], 0.0)
+
+    def test_payload_consumed_today(self):
+        from st_rotator.replenish import today_str
+
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = _FakeRegistry(
+                {"date": today_str(), "start_balance": 10.0, "last_balance": 8.5}, []
+            )
+            console = _console(tmp, replenish=_FakeWorker({}), registry=registry)
+            self.assertAlmostEqual(
+                console.snapshot()["replenish_state"]["consumed"], 1.5
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

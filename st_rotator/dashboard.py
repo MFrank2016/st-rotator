@@ -1061,16 +1061,13 @@ function renderReplenish(state) {
 
   var balance = spend.last_balance != null
     ? "¥" + Number(spend.last_balance).toFixed(2) : "—";
-  var consumed = "—";
-  if (spend.start_balance != null && spend.last_balance != null) {
-    consumed = "¥" + (Number(spend.start_balance) - Number(spend.last_balance)).toFixed(2);
-  }
+  var consumed = "¥" + Number(rp.consumed || 0).toFixed(2);
   var avail = rp.available != null ? fmtInt(rp.available) : "—";
   var target = rp.target != null ? fmtInt(rp.target) : "—";
   var invalid = Number(rp.invalid_accounts || 0);
   var cards = [
     ["当前余额", balance, "", "易码短信平台"],
-    ["今日已用", consumed, "", "当日余额差"],
+    ["今日已用", consumed, "", "当日余额差（换天自动归零）"],
     ["可用 / 目标", avail + " / " + target, "", "账号余量"],
     ["取号数量", fmtInt(rp.used_phones), "", "累计已用手机号"],
     ["注册成功", fmtInt(rp.registrations_ok), "", "累计成功建号"],

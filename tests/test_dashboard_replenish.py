@@ -58,7 +58,12 @@ class DashboardReplenishTest(unittest.TestCase):
         # 状态卡读取 state.replenish_state 的 available / target / used_phones / spend。
         self.assertIn("state.replenish_state", DASHBOARD_HTML)
         self.assertIn("used_phones", DASHBOARD_HTML)
-        self.assertIn("start_balance", DASHBOARD_HTML)
+        self.assertIn("last_balance", DASHBOARD_HTML)
+
+    def test_consumed_uses_server_computed_value(self):
+        # 「今日已用」直接用服务端算好的 rp.consumed（换天归零），不在前端用余额差。
+        self.assertIn("rp.consumed", DASHBOARD_HTML)
+        self.assertIn("换天自动归零", DASHBOARD_HTML)
 
     def test_settings_wired_to_api_options(self):
         # onApplyOptions 的 POST body 带 replenish 对象；sms_token 仅在非空时发送，
