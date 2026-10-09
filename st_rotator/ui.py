@@ -1032,11 +1032,20 @@ class ConsoleState:
         self._log(f"[控制台] {note}")
 
     def _log(self, message: str) -> None:
-        self.buffer.append(message)
+        """写一条日志。
+
+        复用网关的日志出口（``rotator._log`` → 文件 + 环形缓冲 + echo）。
+        ⚠️ 出口本身已经写环形缓冲，所以这里**不能**再直接 ``buffer.append``，
+        否则同一条日志会在控制台出现两遍。出口缺失/不可用时退回直接写缓冲。
+        """
+        sink = getattr(self.rotator, "_log", None)
+        if sink is None:
+            self.buffer.append(message)
+            return
         try:
-            self.rotator._log(message)  # noqa: SLF001 - 复用同一套日志出口
+            sink(message)
         except Exception:  # pragma: no cover
-            pass
+            self.buffer.append(message)
 
     # ------------------------------------------------------------ 路由
 
