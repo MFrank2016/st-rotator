@@ -95,6 +95,40 @@ class BuildReplenishGateTest(unittest.TestCase):
             )
             self.assertIsNone(worker)
 
+    def test_enabled_without_token_logs_startup_notice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, store, rotator, registry = _make_runtime(
+                tmp, replenish={"enabled": True, "target_count": 2, "sms_token": ""}
+            )
+            logs: list[str] = []
+            worker = build_replenish(
+                store.config,
+                store,
+                rotator,
+                registry,
+                lock=threading.Lock(),
+                sink=logs.append,
+            )
+            self.assertIsNone(worker)
+            self.assertEqual(logs, ["[补号] 未配置易码 Token，补号未运行"])
+
+    def test_disabled_does_not_log_missing_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, store, rotator, registry = _make_runtime(
+                tmp, replenish={"enabled": False, "target_count": 2, "sms_token": ""}
+            )
+            logs: list[str] = []
+            worker = build_replenish(
+                store.config,
+                store,
+                rotator,
+                registry,
+                lock=threading.Lock(),
+                sink=logs.append,
+            )
+            self.assertIsNone(worker)
+            self.assertEqual(logs, [])
+
     def test_enabled_without_target_returns_none(self):
         with tempfile.TemporaryDirectory() as tmp:
             path, store, rotator, registry = _make_runtime(

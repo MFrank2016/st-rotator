@@ -547,7 +547,11 @@ def build_replenish(
     from .sms import EjiemaSms
 
     rc = config.replenish
-    if not (rc.enabled and rc.target_count > 0 and rc.sms_token):
+    if not rc.enabled:
+        return None
+    if not (rc.target_count > 0 and rc.sms_token):
+        if not rc.sms_token:
+            sink("[补号] 未配置易码 Token，补号未运行")
         return None
     if status_source is None:
         status_source = lambda: {}  # noqa: E731
