@@ -487,8 +487,8 @@ class LeakGuardConfig:
     """
 
     enabled: bool = False
-    interval_seconds: float = 600.0
-    window_seconds: float = 600.0
+    interval_seconds: float = 3600.0
+    window_seconds: float = 3600.0
     rotate_hour: int = 2
     rotate_minute: int = 0
     key_name: str = "auto"

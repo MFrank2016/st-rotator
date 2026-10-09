@@ -230,7 +230,7 @@ pip install -r requirements-quota.txt     # 即 jwcrypto>=1.5
 网关是池里这些 Key 的**唯一合法使用者**。若某段时间内网关**完全没有** token 消耗记录
 （空转），却有账号的积分在减少，说明该账号的 Key 很可能被网关之外的第三方使用（泄漏 / 被共享）。
 
-开启后，网关**每 10 分钟**扫描一次：窗口内「网关无 token 消耗」且「某账号**通用池积分**
+开启后，网关**每小时**扫描一次：窗口内「网关无 token 消耗」且「某账号**通用池积分**
 采样增量 > 0」→ 把该账号记入**待轮换清单**（持久化到配置同目录的 `guard.json`）；
 每天 **02:00（本地时间）** 统一对清单里的每个账号执行一次
 「重新登录 → 注销该账号全部 Key → 新建一把 Key → 更新配置并落盘」，随后清空清单。
@@ -238,8 +238,8 @@ pip install -r requirements-quota.txt     # 即 jwcrypto>=1.5
 ```jsonc
 "leak_guard": {
   "enabled": false,               // 默认关闭；开启后仅 ui / tray 模式生效
-  "interval_seconds": 600,        // 扫描间隔（秒），默认 600 = 10 分钟
-  "window_seconds": 600,          // 回看窗口（秒），默认 600 = 10 分钟
+  "interval_seconds": 3600,       // 扫描间隔（秒），默认 3600 = 1 小时
+  "window_seconds": 3600,         // 回看窗口（秒），默认 3600 = 1 小时
   "rotate_hour": 2,               // 每日统一轮换时刻（本地时间，0~23）
   "rotate_minute": 0,             // 分钟（0~59）
   "key_name": "auto",             // 新建 Key 的名称（≤64，仅中文/字母/数字/连字符）
@@ -399,8 +399,8 @@ pip install -r requirements-quota.txt     # 即 jwcrypto>=1.5
 
   "leak_guard": { // 网关空转却有积分消耗时记录账号，每日 02:00 统一轮换（默认关闭，详见「泄漏守卫」）
     "enabled": false,
-    "interval_seconds": 600,
-    "window_seconds": 600,
+    "interval_seconds": 3600,
+    "window_seconds": 3600,
     "rotate_hour": 2,
     "rotate_minute": 0,
     "key_name": "auto",

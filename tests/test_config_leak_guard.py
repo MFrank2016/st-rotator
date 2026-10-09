@@ -23,8 +23,8 @@ class LeakGuardDefaultsTest(unittest.TestCase):
     def test_defaults(self):
         cfg = LeakGuardConfig()
         self.assertEqual(cfg.enabled, False)
-        self.assertEqual(cfg.interval_seconds, 600.0)
-        self.assertEqual(cfg.window_seconds, 600.0)
+        self.assertEqual(cfg.interval_seconds, 3600.0)
+        self.assertEqual(cfg.window_seconds, 3600.0)
         self.assertEqual(cfg.rotate_hour, 2)
         self.assertEqual(cfg.rotate_minute, 0)
         self.assertEqual(cfg.key_name, "auto")
@@ -37,7 +37,7 @@ class LeakGuardDefaultsTest(unittest.TestCase):
         cfg = Config.from_dict(_cfg())
         self.assertIsInstance(cfg.leak_guard, LeakGuardConfig)
         self.assertEqual(cfg.leak_guard.enabled, False)
-        self.assertEqual(cfg.leak_guard.interval_seconds, 600.0)
+        self.assertEqual(cfg.leak_guard.interval_seconds, 3600.0)
 
 
 class LeakGuardParseTest(unittest.TestCase):
@@ -48,7 +48,7 @@ class LeakGuardParseTest(unittest.TestCase):
         self.assertEqual(cfg.leak_guard.enabled, True)
         self.assertEqual(cfg.leak_guard.interval_seconds, 30.0)
         self.assertEqual(cfg.leak_guard.rotate_hour, 5)
-        self.assertEqual(cfg.leak_guard.window_seconds, 600.0)
+        self.assertEqual(cfg.leak_guard.window_seconds, 3600.0)
         self.assertEqual(cfg.leak_guard.key_name, "auto")
         self.assertEqual(cfg.leak_guard.key_type, "API_KEY_TYPE_TOKEN_PLAN")
 

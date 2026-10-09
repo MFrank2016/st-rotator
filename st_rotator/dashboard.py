@@ -348,7 +348,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="grid kpis" id="leak-guard-stats" style="margin-bottom:14px"></div>
     <div id="leak-guard-pending"></div>
     <div class="muted" style="font-size:11.5px;margin-top:8px;line-height:1.6">
-      每 10 分钟扫描一次：若窗口内网关无 token 消耗、却有账号通用池积分被消耗，判定该账号疑似泄漏并记入待轮换清单；
+      每小时扫描一次：若窗口内网关无 token 消耗、却有账号通用池积分被消耗，判定该账号疑似泄漏并记入待轮换清单；
       每天 02:00 统一「重新登录 → 注销全部 Key → 新建 Key」并更新配置。
     </div>
   </div>
