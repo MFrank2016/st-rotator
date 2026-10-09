@@ -582,11 +582,12 @@ class ReplenishWorkerTest(unittest.TestCase):
         )
         worker.run_once()
 
-        # 改密二次短信超时：账号已接管（新 key 已建）-> 仍落账，但 outcome 如实标记未改密
+        # 改密二次短信超时：账号已接管（新 key 已建）-> 仍落账；兜底取回用户名、密码留空
         self.assertEqual(keys.ops, ["list", "delete", "create"])
         self.assertEqual(len(self.persist_calls), 1)
         user, phone, password, api_key = self.persist_calls[0]
-        self.assertEqual(user, "")  # 用户名未知
+        self.assertEqual(user, "接管实名")  # 兜底用已有 access_token 取回用户名
+        self.assertEqual(password, "")  # 改密未生效，不落一个假密码
         self.assertEqual(phone, "13800000013")
         self.assertEqual(api_key, "sk-new-plain")
         self.assertEqual(self.persist_outcomes, ["takeover_password_unset"])
