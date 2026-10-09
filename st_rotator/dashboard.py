@@ -1531,13 +1531,21 @@ function classifyLog(text) {
   return "";
 }
 
+function logLine(item) {
+  var line = document.createElement("div");
+  line.className = classifyLog(item.text);
+  var stamp = document.createElement("span");
+  stamp.className = "dim";
+  stamp.textContent = (item.time || "") + "  ";
+  line.appendChild(stamp);
+  line.appendChild(document.createTextNode(item.text));
+  return line;
+}
+
 function appendReplenishLog(item) {
   var box = $("replenish-logbox");
   if (!box) return;
-  var line = document.createElement("div");
-  line.className = classifyLog(item.text);
-  line.textContent = item.text;
-  box.appendChild(line);
+  box.appendChild(logLine(item));
   while (box.childElementCount > 300) box.removeChild(box.firstChild);
   if (S.autoscroll) box.scrollTop = box.scrollHeight;
 }
@@ -1545,12 +1553,9 @@ function appendReplenishLog(item) {
 function appendLogs(items) {
   var box = $("logbox");
   items.forEach(function (item) {
-    var line = document.createElement("div");
-    line.className = classifyLog(item.text);
-    line.textContent = item.text;
-    box.appendChild(line);
-    // [补号] 前缀的日志同时镜像到「自动补号」面板内的日志框。
-    if (item.text.indexOf("[补号]") !== -1) appendReplenishLog(item);
+    // 补号日志只在「自动补号」面板内显示，不进主「实时日志」
+    if (item.text.indexOf("[补号]") !== -1) { appendReplenishLog(item); return; }
+    box.appendChild(logLine(item));
   });
   while (box.childElementCount > 800) box.removeChild(box.firstChild);
   if (S.autoscroll) box.scrollTop = box.scrollHeight;

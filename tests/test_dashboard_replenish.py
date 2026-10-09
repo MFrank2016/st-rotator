@@ -115,10 +115,16 @@ class DashboardReplenishTest(unittest.TestCase):
             self.assertIn(text, DASHBOARD_HTML)
 
     def test_replenish_logs_routed_to_panel(self):
-        # [补号] 前缀的日志行同时投递到面板内日志框。
+        # [补号] 前缀的日志行投递到面板内日志框。
         self.assertIn("[补号]", DASHBOARD_HTML)
         self.assertIn("function appendReplenishLog", DASHBOARD_HTML)
         self.assertIn('item.text.indexOf("[补号]")', DASHBOARD_HTML)
+
+    def test_main_log_hides_replenish_and_shows_datetime(self):
+        # 主「实时日志」不显示 [补号] 行（只在补号面板显示）；每行前缀日期时间。
+        self.assertIn("appendReplenishLog(item); return;", DASHBOARD_HTML)
+        self.assertIn("function logLine", DASHBOARD_HTML)
+        self.assertIn("item.time", DASHBOARD_HTML)
 
 
 class DashboardReplenishRecordsTest(unittest.TestCase):

@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from logging.handlers import RotatingFileHandler
 
-from st_rotator.logs import build_logger, make_log_sink
+from st_rotator.logs import LogBuffer, build_logger, make_log_sink
 
 
 def _has_file_handler(logger: logging.Logger) -> bool:
@@ -49,6 +49,22 @@ class BuildLoggerTest(unittest.TestCase):
         self.assertIsInstance(logger, logging.Logger)
         self.assertFalse(_has_file_handler(logger))
 
+
+class LogBufferTimestampTest(unittest.TestCase):
+    _TS = r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$"
+
+    def test_since_entries_carry_datetime(self) -> None:
+        buf = LogBuffer()
+        buf.append("hello")
+        _cursor, items = buf.since(0)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["text"], "hello")
+        self.assertRegex(items[0]["time"], self._TS)
+
+    def test_tail_entries_carry_datetime(self) -> None:
+        buf = LogBuffer()
+        buf.append("world")
+        self.assertRegex(buf.tail(10)[0]["time"], self._TS)
 
 if __name__ == "__main__":
     unittest.main()
