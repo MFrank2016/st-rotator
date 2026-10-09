@@ -217,6 +217,27 @@ class PersistEndToEndTest(unittest.TestCase):
             finally:
                 rotator.close()
 
+    def test_persist_increments_registry_rotation_count(self):
+        from st_rotator.cli import build_auto_renew_persist
+        from st_rotator.registry import Registry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_config(tmp, credentials=True)
+            store = ConfigStore.load(path)
+            rotator = StRotator(store.config)
+            registry = Registry.load(Path(tmp) / "replenish.json")
+            persist = build_auto_renew_persist(
+                store, rotator, registry=registry, lock=threading.Lock()
+            )
+            try:
+                persist("账号1", ["sk-old1", "sk-old2"], "sk-new")
+                self.assertEqual(registry.rotation_count(), 1)
+                self.assertEqual(
+                    Registry.load(Path(tmp) / "replenish.json").rotation_count(), 1
+                )
+            finally:
+                rotator.close()
+
 
 if __name__ == "__main__":
     unittest.main()

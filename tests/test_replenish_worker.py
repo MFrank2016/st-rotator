@@ -35,6 +35,7 @@ from st_rotator.registry import Registry
 from st_rotator.replenish import (
     ReplenishWorker,
     count_available,
+    count_unavailable,
     generate_credentials,
     spend_ok,
     today_str,
@@ -348,6 +349,18 @@ class ReplenishWorkerTest(unittest.TestCase):
             # c 无状态记录 -> 视为可用
         }
         self.assertEqual(count_available(accounts, statuses), 2)
+        self.assertEqual(count_unavailable(accounts, statuses), 1)
+
+    def test_count_unavailable_only_password_error(self):
+        accounts = [
+            AccountConfig(name="a", api_keys=["sk-a"]),
+            AccountConfig(name="b", api_keys=["sk-b"]),
+        ]
+        statuses = {
+            "a": {"status": "check_error", "message": "瞬时"},
+            "b": {"status": "password_error", "message": "密码错"},
+        }
+        self.assertEqual(count_unavailable(accounts, statuses), 1)
 
     # ------------------------------------------------------------ 2. 纯函数：generate_credentials
     def test_generate_credentials_charset_and_classes(self):
@@ -459,6 +472,22 @@ class ReplenishWorkerTest(unittest.TestCase):
         self.assertEqual(self._status(worker), ReplenishWorker.STATUS_OK)
         # 号码已被占用登记
         self.assertTrue(registry.is_phone_used("13800000001"))
+
+    def test_register_path_emits_prefixed_logs(self):
+        registry = self._registry()
+        sms = _FakeSms(phones=["13800000001"])
+        authn = _FakeAuthn()
+        keys = _FakeKeys()
+        worker = self._worker(
+            sms=sms, authn=authn, keys=keys, registry=registry, target=1
+        )
+        worker.run_once()
+        joined = "\n".join(self.log_lines)
+        self.assertTrue(self.log_lines)
+        self.assertTrue(all(line.startswith("[补号]") for line in self.log_lines))
+        self.assertIn("已取号 13800000001", joined)
+        self.assertIn("未注册", joined)
+        self.assertIn("已注册新账号", joined)
 
     # ------------------------------------------------------------ 5. S2 接管
     def test_takeover_path_revokes_all_creates_key_and_changes_password(self):

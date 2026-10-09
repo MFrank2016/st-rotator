@@ -52,17 +52,32 @@ class _FakeWorker:
 
 
 class _FakeRegistry:
-    """假注册表：spend_state() / used_phones()。"""
+    """假注册表：spend_state() / used_phones() / count_registrations() / rotation_count()。"""
 
-    def __init__(self, spend: dict, used: list[str]) -> None:
+    def __init__(
+        self,
+        spend: dict,
+        used: list[str],
+        *,
+        registrations_ok: int = 0,
+        rotations: int = 0,
+    ) -> None:
         self._spend = dict(spend)
         self._used = frozenset(used)
+        self._registrations_ok = registrations_ok
+        self._rotations = rotations
 
     def spend_state(self) -> dict:
         return dict(self._spend)
 
     def used_phones(self) -> frozenset:
         return self._used
+
+    def count_registrations(self, outcome: str | None = None) -> int:
+        return self._registrations_ok if outcome == "ok" else 0
+
+    def rotation_count(self) -> int:
+        return self._rotations
 
 
 class _FakePool:
@@ -184,6 +199,27 @@ class SnapshotReplenishTest(unittest.TestCase):
             )
             self.assertEqual(state["used_phones"], 2)
 
+    def test_snapshot_replenish_state_reports_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            auto_renew = _FakeWorker(
+                {
+                    "账号1": {"status": "password_error", "message": ""},
+                    "账号2": {"status": "ok", "message": ""},
+                }
+            )
+            registry = _FakeRegistry({}, [], registrations_ok=7, rotations=3)
+            console = _console(
+                tmp,
+                replenish=_FakeWorker({}),
+                auto_renew=auto_renew,
+                registry=registry,
+                replenish_cfg={"target_count": 3},
+            )
+            state = console.snapshot()["replenish_state"]
+            self.assertEqual(state["invalid_accounts"], 1)
+            self.assertEqual(state["registrations_ok"], 7)
+            self.assertEqual(state["rotations"], 3)
+
     def test_snapshot_replenish_state_defaults_without_worker_and_registry(self):
         with tempfile.TemporaryDirectory() as tmp:
             console = _console(tmp, replenish_cfg={"target_count": 4})
@@ -192,6 +228,9 @@ class SnapshotReplenishTest(unittest.TestCase):
             self.assertEqual(state["target"], 4)
             self.assertEqual(state["spend"], {})
             self.assertEqual(state["used_phones"], 0)
+            self.assertEqual(state["invalid_accounts"], 0)
+            self.assertEqual(state["registrations_ok"], 0)
+            self.assertEqual(state["rotations"], 0)
 
 
 class SetOptionsReplenishTest(unittest.TestCase):

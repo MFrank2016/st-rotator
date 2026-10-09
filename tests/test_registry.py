@@ -17,6 +17,7 @@ def test_load_missing_file_returns_fresh_state(tmp_path):
         "last_balance": None,
     }
     assert reg.registrations() == []
+    assert reg.rotation_count() == 0
 
 
 def test_spend_state_defaults():
@@ -145,22 +146,47 @@ def test_injected_lock_is_used(tmp_path):
     assert reg.is_phone_used("13700000000")
 
 
+def test_note_rotation_increments_and_persists(tmp_path):
+    path = tmp_path / "state.json"
+    reg = Registry.load(path)
+    assert reg.rotation_count() == 0
+    reg.note_rotation()
+    reg.note_rotation()
+    assert reg.rotation_count() == 2
+    assert Registry.load(path).rotation_count() == 2
+
+
+def test_count_registrations_filters_by_outcome(tmp_path):
+    reg = Registry.load(tmp_path / "state.json")
+    reg.record_registration(name="a", phone="130", outcome="ok", created_at=1.0)
+    reg.record_registration(name="b", phone="131", outcome="ok", created_at=2.0)
+    reg.record_registration(
+        name="c", phone="132", outcome="takeover_password_unset", created_at=3.0
+    )
+    assert reg.count_registrations("ok") == 2
+    assert reg.count_registrations("takeover_password_unset") == 1
+    assert reg.count_registrations() == 3
+    assert reg.count_registrations("nope") == 0
+
+
 def test_snapshot_shape(tmp_path):
     reg = Registry.load(tmp_path / "state.json")
     reg.claim_phone("13900000000")
     reg.claim_phone("13800000000")
     reg.note_balance("2026-10-09", 100.0)
+    reg.note_rotation()
     reg.record_registration(
         name="账号1", phone="13800000000", outcome="ok", created_at=1.0
     )
     snap = reg.snapshot()
-    assert set(snap) == {"used_phones", "spend", "registrations"}
+    assert set(snap) == {"used_phones", "spend", "registrations", "rotations"}
     assert snap["used_phones"] == ["13800000000", "13900000000"]
     assert snap["spend"] == {
         "date": "2026-10-09",
         "start_balance": 100.0,
         "last_balance": 100.0,
     }
+    assert snap["rotations"] == 1
     assert snap["registrations"] == [
         {"name": "账号1", "phone": "13800000000", "outcome": "ok", "created_at": 1.0}
     ]

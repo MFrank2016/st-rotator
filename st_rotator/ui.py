@@ -59,7 +59,7 @@ from .errors import ConfigError, RotatorError
 from .logs import LogBuffer
 from .autorenew import AutoRenewWorker
 from .quota import QuotaService, QuotaWindow, WindowPair
-from .replenish import count_available
+from .replenish import count_available, count_unavailable
 from .version import __version__
 
 if TYPE_CHECKING:  # pragma: no cover - 仅类型标注用，运行时字段默认 None
@@ -438,20 +438,28 @@ class ConsoleState:
         return {"samples": self.quota.credits.samples(limit=limit, nonzero=nonzero)}
 
     def _replenish_state_payload(self) -> dict[str, Any]:
-        """补号状态：可用数 / 目标 / 当日花销 / 已用号码数 / 是否在跑。
+        """补号状态：可用/目标、当日花销、取号数、注册成功数、轮换数、失效账号数。
 
         可用数与 worker 用同一判定来源（auto_renew 的账号状态）：只有密码错误的账号算
-        不可用。无 worker / registry 时给出安全默认（花销与已用号码为空）。
+        不可用。无 worker / registry 时给出安全默认（花销与计数为空）。
         """
         status_source = self.auto_renew.account_status() if self.auto_renew else {}
         available = count_available(self.config.accounts, status_source)
+        invalid = count_unavailable(self.config.accounts, status_source)
         spend = self.registry.spend_state() if self.registry else {}
         used = len(self.registry.used_phones()) if self.registry else 0
+        registrations_ok = (
+            self.registry.count_registrations("ok") if self.registry else 0
+        )
+        rotations = self.registry.rotation_count() if self.registry else 0
         return {
             "available": available,
             "target": self.config.replenish.target_count,
             "spend": spend,
             "used_phones": used,
+            "registrations_ok": registrations_ok,
+            "rotations": rotations,
+            "invalid_accounts": invalid,
             "running": self.replenish is not None,
         }
 

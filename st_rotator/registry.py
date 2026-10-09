@@ -1,7 +1,8 @@
-"""已用号码 / 每日花销 / 注册审计的原子 JSON 注册表。
+"""已用号码 / 每日花销 / 注册审计 / 轮换计数的原子 JSON 注册表。
 
-持久化结构：``{"version":1,"used_phones":[...],"spend":{...},"registrations":[...]}``。
-写入沿用 ``ConfigStore.save`` 的「临时文件 + 原子替换」模式，避免写坏原文件。
+持久化结构：``{"version":1,"used_phones":[...],"spend":{...},"registrations":[...],
+"rotations":N}``。写入沿用 ``ConfigStore.save`` 的「临时文件 + 原子替换」模式，
+避免写坏原文件。``rotations`` 为 auto_renew 累计轮换成功次数（跨重启持久化）。
 """
 
 from __future__ import annotations
@@ -26,6 +27,15 @@ class SpendState:
     date: str = ""
     start_balance: float | None = None
     last_balance: float | None = None
+
+
+def _as_count(value: Any) -> int:
+    """把 JSON 里的计数规范成非负 ``int``，不合法即抛 RegistryError。"""
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RegistryError(f"计数必须是非负整数，当前为 {value!r}")
+    return value
 
 
 def _as_balance(value: Any) -> float | None:
@@ -55,6 +65,7 @@ class Registry:
         self._used: set[str] = set()
         self._spend: SpendState = SpendState()
         self._registrations: list[dict[str, Any]] = []
+        self._rotations: int = 0
 
     # ------------------------------------------------------------ 加载 / 保存
 
@@ -95,6 +106,7 @@ class Registry:
             last_balance=_as_balance(spend_raw.get("last_balance")),
         )
         reg._registrations = [dict(e) for e in regs_raw]
+        reg._rotations = _as_count(raw.get("rotations"))
         return reg
 
     def save(self) -> None:
@@ -108,6 +120,7 @@ class Registry:
             "used_phones": sorted(self._used),
             "spend": self._spend_dict(),
             "registrations": self._registrations,
+            "rotations": self._rotations,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
@@ -189,12 +202,40 @@ class Registry:
             newest_first = list(reversed(self._registrations))
         return newest_first[:limit]
 
+    def count_registrations(self, outcome: str | None = None) -> int:
+        """注册审计记录数；``outcome`` 非空时只计该结果的条数。"""
+        with self._lock:
+            if outcome is None:
+                return len(self._registrations)
+            return sum(
+                1 for e in self._registrations if e.get("outcome") == outcome
+            )
+
+    # ------------------------------------------------------------ 轮换计数
+
+    def note_rotation(self) -> None:
+        """累计一次 auto_renew 轮换成功并落盘（跨重启持久化）。"""
+        with self._lock:
+            self._rotations += 1
+            self._save()
+
+    def rotation_count(self) -> int:
+        """累计轮换成功次数。"""
+        with self._lock:
+            return self._rotations
+
     # ------------------------------------------------------------ 快照
 
     def snapshot(self) -> dict[str, Any]:
-        """注册表全量快照：已用号码（排序）、花销状态、审计记录（最新在前）。"""
+        """注册表全量快照：已用号码（排序）、花销状态、审计记录（最新在前）、轮换计数。"""
         with self._lock:
             used = sorted(self._used)
             spend = self._spend_dict()
             regs = list(reversed(self._registrations))
-        return {"used_phones": used, "spend": spend, "registrations": regs}
+            rotations = self._rotations
+        return {
+            "used_phones": used,
+            "spend": spend,
+            "registrations": regs,
+            "rotations": rotations,
+        }

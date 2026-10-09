@@ -74,10 +74,10 @@ class _StopCycle(Exception):
     """硬性终止本轮补充（blocked_cap / captcha / check_error / 去重耗尽）。"""
 
 
-def count_available(
+def count_unavailable(
     accounts: Sequence[AccountConfig], statuses: Mapping[str, Mapping[str, str]]
 ) -> int:
-    """可用账号数 = 账号总数 - 密码错误（password_error）账号数。
+    """不可用账号数 = 密码错误（password_error）账号数。
 
     只有 ``auto_renew.account_status()`` 标为密码错误的账号才算「不可用」；
     其它状态（ok / check_error / unavailable / 无记录）都算可用。
@@ -87,7 +87,14 @@ def count_available(
         entry = statuses.get(account.name)
         if entry is not None and entry.get("status") == "password_error":
             unavailable += 1
-    return len(accounts) - unavailable
+    return unavailable
+
+
+def count_available(
+    accounts: Sequence[AccountConfig], statuses: Mapping[str, Mapping[str, str]]
+) -> int:
+    """可用账号数 = 账号总数 - 密码错误（password_error）账号数。"""
+    return len(accounts) - count_unavailable(accounts, statuses)
 
 
 def _randbelow(rng: Any, n: int) -> int:
@@ -302,6 +309,7 @@ class ReplenishWorker:
             self._set_status(
                 self.STATUS_CHECK_ERROR,
                 f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT],
+                log_line=f"[补号] 本轮异常：{type(exc).__name__}: {exc}"[:DETAIL_LIMIT],
             )
 
     def _loop(self) -> None:
@@ -326,10 +334,11 @@ class ReplenishWorker:
             self._set_status(
                 self.STATUS_IDLE,
                 "",
-                log_line=f"可用账号 {available} >= 目标 {self._target}，无需补充",
+                log_line=f"[补号] 可用账号 {available} >= 目标 {self._target}，无需补充",
             )
             return
         need = self._target - available
+        self._log(f"[补号] 可用账号 {available} < 目标 {self._target}，需补充 {need} 个")
         soft_retries = 0
         while need > 0:
             try:
@@ -342,6 +351,7 @@ class ReplenishWorker:
                     self._set_status(
                         self.STATUS_CHECK_ERROR,
                         f"连续 {SOFT_RETRY_MAX} 次短信超时，本轮放弃",
+                        log_line=f"[补号] 连续 {SOFT_RETRY_MAX} 次短信超时，本轮放弃",
                     )
                     return
             except _StopCycle:
@@ -350,6 +360,7 @@ class ReplenishWorker:
                 self._set_status(
                     self.STATUS_CHECK_ERROR,
                     f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT],
+                    log_line=f"[补号] 本轮补充出错：{type(exc).__name__}: {exc}"[:DETAIL_LIMIT],
                 )
                 return
 
@@ -369,24 +380,38 @@ class ReplenishWorker:
         )
         self._registry.note_balance(today, balance)
         if not allowed:
-            self._set_status(self.STATUS_BLOCKED_CAP, "今日短信消费已达上限")
+            self._set_status(
+                self.STATUS_BLOCKED_CAP,
+                "今日短信消费已达上限",
+                log_line=f"[补号] 今日短信消费已达上限（已用 ¥{_consumed:.2f}），本轮停止",
+            )
             raise _StopCycle()
 
         # b. 取号 + 去重（已用号码跳过，不 claim；连续 20 个已用即放弃）
         phone = self._fetch_fresh_phone()
         self._registry.claim_phone(phone)
+        self._log(f"[补号] 已取号 {phone}")
 
         # c. 发短信验证码；None -> 需要滑块（不花钱），除非有 solver 带 code_key 重发
         token_code = self._authn.send_sms_code(phone)
         if token_code is None:
             if self._captcha_solver is None:
-                self._set_status(self.STATUS_CAPTCHA, "需要滑块验证码（未配置 solver）")
+                self._set_status(
+                    self.STATUS_CAPTCHA,
+                    "需要滑块验证码（未配置 solver）",
+                    log_line=f"[补号] 号码 {phone} 需要滑块验证码（未配置 solver），本轮停止",
+                )
                 raise _StopCycle()
             code_key = self._captcha_solver()
             token_code = self._authn.send_sms_code(phone, code_key=code_key)
             if token_code is None:
-                self._set_status(self.STATUS_CAPTCHA, "滑块验证后仍未下发验证码")
+                self._set_status(
+                    self.STATUS_CAPTCHA,
+                    "滑块验证后仍未下发验证码",
+                    log_line=f"[补号] 号码 {phone} 滑块验证后仍未下发验证码，本轮停止",
+                )
                 raise _StopCycle()
+        self._log(f"[补号] 已向 {phone} 发送短信验证码，等待接收…")
 
         # d. 等短信；超时 -> 软重试（换新号，重跑 spend gate）
         code = wait_sms_code(
@@ -398,6 +423,9 @@ class ReplenishWorker:
             clock=self._clock,
         )
         if code is None:
+            self._log(
+                f"[补号] 号码 {phone} 短信超时（{self._sms_poll_timeout:g}s），换号重试"
+            )
             return False
 
         # e. mint login challenge（challenge_expired 重 mint 一次）
@@ -422,9 +450,11 @@ class ReplenishWorker:
 
         # 手机号已被注册（tenant_list 非空）-> S2 接管
         if sms_login_tenants(login_data):
+            self._log(f"[补号] 号码 {phone} 已注册，走接管流程")
             return self._takeover(login_data, challenge, verifier, phone)
 
         # g. S1 新注册；username_taken -> 重试一次
+        self._log(f"[补号] 号码 {phone} 未注册，走注册流程")
         user, password = generate_credentials()
         try:
             redirect = self._authn.register(
@@ -447,7 +477,7 @@ class ReplenishWorker:
         self._set_status(
             self.STATUS_OK,
             "",
-            log_line=f"已注册新账号 {user}（{phone}）",
+            log_line=f"[补号] 已注册新账号 {user}（{phone}）",
         )
         return True
 
@@ -457,7 +487,11 @@ class ReplenishWorker:
             phone = self._sms.get_phone(keyword=self._keyword)
             if not self._registry.is_phone_used(phone):
                 return phone
-        self._set_status(self.STATUS_CHECK_ERROR, f"取号去重超过 {DEDUPE_MAX} 次")
+        self._set_status(
+            self.STATUS_CHECK_ERROR,
+            f"取号去重超过 {DEDUPE_MAX} 次",
+            log_line=f"[补号] 取号去重超过 {DEDUPE_MAX} 次，本轮放弃",
+        )
         raise _StopCycle()
 
     def _mint_challenge(self) -> tuple[str, str]:
@@ -485,6 +519,7 @@ class ReplenishWorker:
             self._set_status(
                 self.STATUS_CHECK_ERROR,
                 f"用户名重试仍失败: {exc.detail}"[:DETAIL_LIMIT],
+                log_line=f"[补号] 用户名重试仍失败：{exc.detail}"[:DETAIL_LIMIT],
             )
             raise _StopCycle() from exc
         return new_user, redirect
@@ -507,7 +542,9 @@ class ReplenishWorker:
             tenant = pick_tenant(sms_login_tenants(login_data))
             if tenant is None:
                 self._set_status(
-                    self.STATUS_CHECK_ERROR, "接管：smsLogin 无 redirect 且无租户"
+                    self.STATUS_CHECK_ERROR,
+                    "接管：smsLogin 无 redirect 且无租户",
+                    log_line=f"[补号] 号码 {phone} 接管失败：smsLogin 无 redirect 且无租户",
                 )
                 raise _StopCycle()
             nxt = self._authn.login_next(
@@ -518,12 +555,20 @@ class ReplenishWorker:
             )
             redirect = sms_login_redirect(nxt)
         if not redirect:
-            self._set_status(self.STATUS_CHECK_ERROR, "接管：登录未返回 redirect")
+            self._set_status(
+                self.STATUS_CHECK_ERROR,
+                "接管：登录未返回 redirect",
+                log_line=f"[补号] 号码 {phone} 接管失败：登录未返回 redirect",
+            )
             raise _StopCycle()
         bundle = self._authn.exchange_code(redirect, verifier)
         user_id = jwt_sub(bundle.access_token)
         if not user_id:
-            self._set_status(self.STATUS_CHECK_ERROR, "接管后无法解析 user_id")
+            self._set_status(
+                self.STATUS_CHECK_ERROR,
+                "接管后无法解析 user_id",
+                log_line=f"[补号] 号码 {phone} 接管失败：无法解析 user_id",
+            )
             raise _StopCycle()
         # 先吊销全部旧 key（该手机号归我们所有，旧凭据一律作废）。
         for item in self._keys.list_keys(bundle.access_token):
@@ -531,6 +576,7 @@ class ReplenishWorker:
         created = self._keys.create_key(
             bundle.access_token, displayname=self._key_name, key_type=self._key_type
         )
+        self._log(f"[补号] 号码 {phone} 接管中：已吊销旧 Key 并新建，等待改密短信…")
         new_pw = generate_credentials()[1]
         tok2 = self._authn.request_change_password_code(bundle.access_token, user_id)
         code2 = wait_sms_code(
@@ -551,7 +597,9 @@ class ReplenishWorker:
                 "", phone, new_pw, created.api_key, outcome="takeover_password_unset"
             )
             self._set_status(
-                self.STATUS_CHECK_ERROR, "改密短信超时，账号已接管但未改密"
+                self.STATUS_CHECK_ERROR,
+                "改密短信超时，账号已接管但未改密",
+                log_line=f"[补号] 号码 {phone} 改密短信超时，账号已接管但未改密",
             )
             raise _StopCycle()
         self._authn.change_password(
@@ -570,7 +618,7 @@ class ReplenishWorker:
         self._set_status(
             self.STATUS_OK,
             "",
-            log_line=f"已接管账号 {username or phone}（{phone}）并改密",
+            log_line=f"[补号] 已接管账号 {username or phone}（{phone}）并改密",
         )
         return True
 

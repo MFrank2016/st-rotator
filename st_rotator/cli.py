@@ -427,13 +427,19 @@ def build_quota_service(config: Config) -> QuotaService | None:
 
 
 def build_auto_renew_persist(
-    store: ConfigStore, rotator: StRotator, *, lock: threading.Lock
+    store: ConfigStore,
+    rotator: StRotator,
+    *,
+    lock: threading.Lock,
+    registry: Registry | None = None,
 ) -> Callable[[str, Sequence[str], str], None]:
     """构造「轮换成功后落池 + 落盘」的 persist 回调。
 
     铁律顺序（勿改）：先在内存池加入新 Key → 再移除旧 Key → 整体替换 store 里该账号的
     Key 列表 → 把 reload 后的内存配置拷回 ``rotator.config.accounts`` → 最后落盘保存。
     顺序反了会出现「池里有两套 Key」或「配置与池脱节」的中间态。
+
+    传入 ``registry`` 时，每次成功落账额外累加一次「轮换成功」计数（供控制台展示）。
     """
 
     def persist(account_name: str, old_keys: Sequence[str], new_key: str) -> None:
@@ -451,6 +457,8 @@ def build_auto_renew_persist(
             store.replace_account_keys(account_name, [new_key])
             rotator.config.accounts = list(store.config.accounts)
             store.save()
+        if registry is not None:
+            registry.note_rotation()
 
     return persist
 
@@ -462,6 +470,7 @@ def build_auto_renew(
     *,
     lock: threading.Lock,
     sink: Callable[[str], None],
+    registry: Registry | None = None,
 ) -> AutoRenewWorker | None:
     """仅当 auto_renew.enabled 且存在配置了 user+password 的账号时，创建并启动 AutoRenewWorker。"""
     from .autorenew import AutoRenewWorker, HttpKeyManager
@@ -476,7 +485,9 @@ def build_auto_renew(
         probe=rotator.probe_key,
         login=HttpQuotaTransport().login,
         keys=HttpKeyManager(),
-        persist=build_auto_renew_persist(store, rotator, lock=lock),
+        persist=build_auto_renew_persist(
+            store, rotator, lock=lock, registry=registry
+        ),
         key_name=config.auto_renew.key_name,
         key_type=config.auto_renew.key_type,
         interval=config.auto_renew.interval_seconds,
@@ -646,11 +657,11 @@ def cmd_ui(args: argparse.Namespace) -> int:
         log_file=args.log_file or default_log,
         quota=build_quota_service(config),
     )
+    registry = _load_registry_for(Path(args.config), sink=sink)
     console.auto_renew = build_auto_renew(
-        config, store, rotator, lock=console.lock, sink=sink
+        config, store, rotator, lock=console.lock, sink=sink, registry=registry
     )
     if store is not None:
-        registry = _load_registry_for(Path(args.config), sink=sink)
         _wire_replenish(console, config, store, rotator, registry, sink=sink)
         console.registry = registry
 
@@ -765,11 +776,11 @@ def cmd_tray(args: argparse.Namespace) -> int:
         log_file=args.log_file or default_log,
         quota=build_quota_service(config),
     )
+    registry = _load_registry_for(config_path, sink=sink)
     console.auto_renew = build_auto_renew(
-        config, store, rotator, lock=console.lock, sink=sink
+        config, store, rotator, lock=console.lock, sink=sink, registry=registry
     )
     if store is not None:
-        registry = _load_registry_for(config_path, sink=sink)
         _wire_replenish(console, config, store, rotator, registry, sink=sink)
         console.registry = registry
 

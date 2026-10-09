@@ -173,16 +173,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .tabs button { padding: 4px 11px; font-size: 11.5px; }
   .tabs button.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600; }
 
-  #logbox {
+  #logbox, #replenish-logbox {
     height: 208px; overflow-y: auto; background: var(--bg);
     border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px;
     font-family: var(--mono); font-size: 11.5px; line-height: 1.65;
   }
-  #logbox div { white-space: pre-wrap; word-break: break-all; }
-  #logbox .warn { color: var(--amber); }
-  #logbox .err { color: var(--red); }
-  #logbox .ok { color: var(--green); }
-  #logbox .dim { color: var(--muted); }
+  #replenish-logbox { height: 168px; }
+  #logbox div, #replenish-logbox div { white-space: pre-wrap; word-break: break-all; }
+  #logbox .warn, #replenish-logbox .warn { color: var(--amber); }
+  #logbox .err, #replenish-logbox .err { color: var(--red); }
+  #logbox .ok, #replenish-logbox .ok { color: var(--green); }
+  #logbox .dim, #replenish-logbox .dim { color: var(--muted); }
 
   .toast {
     position: fixed; right: 22px; bottom: 22px; z-index: 50;
@@ -242,7 +243,65 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   <div style="display:flex;justify-content:flex-end;margin-bottom:6px"><button class="tiny" id="btn-refresh-quota">刷新余量</button></div>
   <div class="grid kpis" id="kpis"></div>
-  <div id="replenish" style="display:none"></div>
+  <div id="replenish">
+    <div class="card" style="margin-bottom:14px">
+      <h2>自动补号 <span class="spacer"></span><span id="replenish-badge"></span><span class="muted" id="replenish-note" style="text-transform:none;letter-spacing:0;margin-left:8px"></span></h2>
+      <div class="grid kpis" id="replenish-stats" style="margin-bottom:14px"></div>
+      <div class="row" style="margin-bottom:12px;align-items:flex-end;flex-wrap:wrap;padding-top:14px;border-top:1px solid var(--border)">
+        <label class="field" style="width:auto;margin-bottom:0;flex-direction:row;align-items:center;gap:6px">
+          <input id="opt-rp-enabled" type="checkbox" style="width:auto;margin:0">
+          <span style="font-weight:600">启用自动补号</span>
+        </label>
+        <label class="field" style="width:96px;margin-bottom:0">
+          <span>目标账号数</span>
+          <input id="opt-rp-target" type="number" min="0">
+        </label>
+        <label class="field" style="width:110px;margin-bottom:0">
+          <span>检查间隔(秒)</span>
+          <input id="opt-rp-interval" type="number" min="60" step="60">
+        </label>
+        <label class="field" style="width:120px;margin-bottom:0">
+          <span>短信关键词</span>
+          <input id="opt-rp-keyword" type="text">
+        </label>
+        <label class="field" style="width:104px;margin-bottom:0">
+          <span>每日额度上限</span>
+          <input id="opt-rp-cap" type="number" min="0" step="0.5">
+        </label>
+        <label class="field" style="width:104px;margin-bottom:0">
+          <span>短信轮询间隔</span>
+          <input id="opt-rp-sms-interval" type="number" min="1">
+        </label>
+        <label class="field" style="width:104px;margin-bottom:0">
+          <span>短信超时(秒)</span>
+          <input id="opt-rp-sms-timeout" type="number" min="5" step="5">
+        </label>
+        <label class="field" style="width:104px;margin-bottom:0">
+          <span>新 Key 名称</span>
+          <input id="opt-rp-keyname" type="text">
+        </label>
+        <label class="field" style="width:158px;margin-bottom:0">
+          <span>新 Key 类型</span>
+          <select id="opt-rp-keytype">
+            <option value="API_KEY_TYPE_TOKEN_PLAN">API_KEY_TYPE_TOKEN_PLAN</option>
+            <option value="API_KEY_TYPE_METERED">API_KEY_TYPE_METERED</option>
+          </select>
+        </label>
+        <label class="field" style="width:150px;margin-bottom:0">
+          <span>易码 Token（留空不修改）</span>
+          <input id="opt-rp-sms-token" type="password" autocomplete="off" placeholder="已配置则留空">
+        </label>
+        <button class="primary" id="btn-save-replenish" style="height:33px">保存并应用</button>
+        <span class="opt-dirty" id="opt-dirty-hint" style="display:none">● 有未保存的改动</span>
+      </div>
+      <div class="muted" style="font-size:11.5px;margin-bottom:8px">
+        自动补号：可用账号数低于目标时，通过易码短信平台自动注册新账号并换绑 Key；
+        每日消费达到上限后停止，次日重置。「易码 Token」为密钥，回填时不显示，仅在你重新输入时才会提交。
+      </div>
+      <h2 style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">补号日志 <span class="spacer"></span><button class="tiny" id="btn-clear-replenish-log">清屏</button></h2>
+      <div id="replenish-logbox"></div>
+    </div>
+  </div>
 
   <div class="card" style="margin-bottom:14px">
     <h2>Token 消耗（近 24 小时）<span class="spacer"></span><span class="muted" id="usage-note" style="text-transform:none;letter-spacing:0"></span></h2>
@@ -429,57 +488,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="muted" style="font-size:11.5px">
         AIMD 模式下「目标 QPS」是**起始速率**；工具会自己往上下界之间收敛，撞 429 就降、
         长时间干净就升。改参数会重置收敛点，从起始速率重新探测。
-      </div>
-      <div class="row" style="margin-bottom:12px;align-items:flex-end;flex-wrap:wrap;padding-top:14px;border-top:1px solid var(--border)">
-        <label class="field" style="width:auto;margin-bottom:0;flex-direction:row;align-items:center;gap:6px">
-          <input id="opt-rp-enabled" type="checkbox" style="width:auto;margin:0">
-          <span style="font-weight:600">自动补号</span>
-        </label>
-        <label class="field" style="width:96px;margin-bottom:0">
-          <span>目标账号数</span>
-          <input id="opt-rp-target" type="number" min="0">
-        </label>
-        <label class="field" style="width:110px;margin-bottom:0">
-          <span>检查间隔(秒)</span>
-          <input id="opt-rp-interval" type="number" min="60" step="60">
-        </label>
-        <label class="field" style="width:120px;margin-bottom:0">
-          <span>短信关键词</span>
-          <input id="opt-rp-keyword" type="text">
-        </label>
-        <label class="field" style="width:104px;margin-bottom:0">
-          <span>每日额度上限</span>
-          <input id="opt-rp-cap" type="number" min="0" step="0.5">
-        </label>
-        <label class="field" style="width:104px;margin-bottom:0">
-          <span>短信轮询间隔</span>
-          <input id="opt-rp-sms-interval" type="number" min="1">
-        </label>
-        <label class="field" style="width:104px;margin-bottom:0">
-          <span>短信超时(秒)</span>
-          <input id="opt-rp-sms-timeout" type="number" min="5" step="5">
-        </label>
-        <label class="field" style="width:104px;margin-bottom:0">
-          <span>新 Key 名称</span>
-          <input id="opt-rp-keyname" type="text">
-        </label>
-        <label class="field" style="width:158px;margin-bottom:0">
-          <span>新 Key 类型</span>
-          <select id="opt-rp-keytype">
-            <option value="API_KEY_TYPE_TOKEN_PLAN">API_KEY_TYPE_TOKEN_PLAN</option>
-            <option value="API_KEY_TYPE_METERED">API_KEY_TYPE_METERED</option>
-          </select>
-        </label>
-        <label class="field" style="width:150px;margin-bottom:0">
-          <span>易码 Token（留空不修改）</span>
-          <input id="opt-rp-sms-token" type="password" autocomplete="off" placeholder="已配置则留空">
-        </label>
-        <button class="primary" id="btn-save-replenish" style="height:33px">保存并应用</button>
-        <span class="opt-dirty" id="opt-dirty-hint" style="display:none">● 有未保存的改动</span>
-      </div>
-      <div class="muted" style="font-size:11.5px;margin-bottom:8px">
-        自动补号：可用账号数低于目标时，通过易码短信平台自动注册新账号并换绑 Key；
-        每日消费达到上限后停止，次日重置。「易码 Token」为密钥，回填时不显示，仅在你重新输入时才会提交。
       </div>
     </div>
 
@@ -892,38 +900,49 @@ var REPLENISH_BADGES = {
 };
 
 function renderReplenish(state) {
-  var host = $("replenish");
-  if (!host) return;
   var rs = (state.replenish_status || {})._replenish || {};
   var rp = state.replenish_state || {};
   var spend = rp.spend || {};
   var enabled = !!(state.options && state.options.replenish && state.options.replenish.enabled);
-  var has = !!(enabled || rp.running || rs.status);
-  host.style.display = has ? "" : "none";
-  if (!has) return;
   var badge = "";
   var known = REPLENISH_BADGES[rs.status];
   if (known) badge = '<span class="pill ' + known[1] + '">' + known[0] + "</span>";
   else if (rs.status) badge = '<span class="pill neutral">' + esc(rs.status) + "</span>";
   else if (rp.running === false) badge = '<span class="pill neutral">未启动</span>';
   var note = rs.message
-    ? '<span class="muted" style="margin-left:8px">' + esc(rs.message) + "</span>"
-    : (enabled && rp.running === false
-      ? '<span class="muted" style="margin-left:8px">已开启，重启 ui / tray 后生效</span>'
-      : "");
-  var avail = rp.available != null ? fmtInt(rp.available) : "—";
-  var target = rp.target != null ? fmtInt(rp.target) : "—";
-  var used = rp.used_phones != null ? fmtInt(rp.used_phones) : "—";
+    ? esc(rs.message)
+    : (enabled && rp.running === false ? "已开启，重启 ui / tray 后生效" : "");
+  var badgeEl = $("replenish-badge");
+  if (badgeEl) badgeEl.innerHTML = badge;
+  var noteEl = $("replenish-note");
+  if (noteEl) noteEl.textContent = note;
+
+  var balance = spend.last_balance != null
+    ? "¥" + Number(spend.last_balance).toFixed(2) : "—";
   var consumed = "—";
   if (spend.start_balance != null && spend.last_balance != null) {
-    consumed = "¥" + (spend.start_balance - spend.last_balance).toFixed(2);
+    consumed = "¥" + (Number(spend.start_balance) - Number(spend.last_balance)).toFixed(2);
   }
-  host.innerHTML = '<div class="card" style="margin-bottom:14px">' +
-    "<h2>自动补号 <span class=\"spacer\"></span>" + badge + note + "</h2>" +
-    '<div class="kv"><span class="k">可用 / 目标</span><span class="v grow">' + avail + " / " + target + "</span></div>" +
-    '<div class="kv"><span class="k">已用手机号</span><span class="v grow">' + used + "</span></div>" +
-    '<div class="kv"><span class="k">今日短信消费</span><span class="v grow">' + consumed + "</span></div>" +
-    "</div>";
+  var avail = rp.available != null ? fmtInt(rp.available) : "—";
+  var target = rp.target != null ? fmtInt(rp.target) : "—";
+  var invalid = Number(rp.invalid_accounts || 0);
+  var cards = [
+    ["当前余额", balance, "", "易码短信平台"],
+    ["今日已用", consumed, "", "当日余额差"],
+    ["可用 / 目标", avail + " / " + target, "", "账号余量"],
+    ["取号数量", fmtInt(rp.used_phones), "", "累计已用手机号"],
+    ["注册成功", fmtInt(rp.registrations_ok), "", "累计成功建号"],
+    ["已重置 Key", fmtInt(rp.rotations), "", "auto_renew 轮换次数"],
+    ["已失效账号", fmtInt(rp.invalid_accounts), invalid ? "red" : "", "密码错误账号"]
+  ];
+  var host = $("replenish-stats");
+  if (host) {
+    host.innerHTML = cards.map(function (c) {
+      return '<div class="card kpi"><div class="label">' + esc(c[0]) + '</div>' +
+        '<div class="value ' + c[2] + '">' + esc(c[1]) + '</div>' +
+        '<div class="label" style="margin-top:2px">' + esc(c[3]) + '</div></div>';
+    }).join("");
+  }
 }
 
 function renderGateway(state) {
@@ -1427,6 +1446,17 @@ function classifyLog(text) {
   return "";
 }
 
+function appendReplenishLog(item) {
+  var box = $("replenish-logbox");
+  if (!box) return;
+  var line = document.createElement("div");
+  line.className = classifyLog(item.text);
+  line.textContent = item.text;
+  box.appendChild(line);
+  while (box.childElementCount > 300) box.removeChild(box.firstChild);
+  if (S.autoscroll) box.scrollTop = box.scrollHeight;
+}
+
 function appendLogs(items) {
   var box = $("logbox");
   items.forEach(function (item) {
@@ -1434,6 +1464,8 @@ function appendLogs(items) {
     line.className = classifyLog(item.text);
     line.textContent = item.text;
     box.appendChild(line);
+    // [补号] 前缀的日志同时镜像到「自动补号」面板内的日志框。
+    if (item.text.indexOf("[补号]") !== -1) appendReplenishLog(item);
   });
   while (box.childElementCount > 800) box.removeChild(box.firstChild);
   if (S.autoscroll) box.scrollTop = box.scrollHeight;
@@ -1571,8 +1603,9 @@ function updateOptionsDirtyUi() {
     el.textContent = dirty ? "保存并应用 *" : "保存并应用";
     el.title = dirty ? "有未保存的改动，点击保存并立即生效" : "";
   });
-  var hint = $("opt-dirty-hint");
-  if (hint) hint.style.display = dirty ? "" : "none";
+  Array.prototype.forEach.call(document.querySelectorAll(".opt-dirty"), function (hint) {
+    hint.style.display = dirty ? "" : "none";
+  });
 }
 
 async function onApplyOptions() {
@@ -1719,6 +1752,7 @@ function bind() {
   $("model-select").onchange = updateModelMeta;
   $("new-key").addEventListener("keydown", function (event) { if (event.key === "Enter") onAddKeys(); });
   $("btn-clearlog").onclick = function () { $("logbox").innerHTML = ""; };
+  $("btn-clear-replenish-log").onclick = function () { $("replenish-logbox").innerHTML = ""; };
   $("btn-autoscroll").onclick = function () {
     S.autoscroll = !S.autoscroll;
     this.textContent = "自动滚动：" + (S.autoscroll ? "开" : "关");

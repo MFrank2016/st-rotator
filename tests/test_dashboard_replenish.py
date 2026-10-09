@@ -86,6 +86,40 @@ class DashboardReplenishTest(unittest.TestCase):
         self.assertIn('el.addEventListener("input", markOptionsDirty);', DASHBOARD_HTML)
         self.assertIn('"opt-rp-enabled", "opt-rp-target"', DASHBOARD_HTML)
 
+    def test_separate_panel_markup(self):
+        # 独立「自动补号」面板：统计卡片容器 + 面板内日志框 + 徽标 / 备注；
+        # 配置表单（opt-rp-*）从「运行参数」卡片移入同一面板。
+        for text in [
+            'id="replenish-stats"',
+            'id="replenish-logbox"',
+            'id="replenish-badge"',
+            'id="replenish-note"',
+            'id="btn-clear-replenish-log"',
+        ]:
+            self.assertIn(text, DASHBOARD_HTML)
+
+    def test_replenish_stats_render_six_metrics(self):
+        # renderReplenish 往 #replenish-stats 填 6 项统计。
+        self.assertIn('$("replenish-stats")', DASHBOARD_HTML)
+        for text in [
+            "当前余额",
+            "今日已用",
+            "取号数量",
+            "注册成功",
+            "已重置 Key",
+            "已失效账号",
+            "registrations_ok",
+            "rotations",
+            "invalid_accounts",
+        ]:
+            self.assertIn(text, DASHBOARD_HTML)
+
+    def test_replenish_logs_routed_to_panel(self):
+        # [补号] 前缀的日志行同时投递到面板内日志框。
+        self.assertIn("[补号]", DASHBOARD_HTML)
+        self.assertIn("function appendReplenishLog", DASHBOARD_HTML)
+        self.assertIn('item.text.indexOf("[补号]")', DASHBOARD_HTML)
+
 
 if __name__ == "__main__":
     unittest.main()
