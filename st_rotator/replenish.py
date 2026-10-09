@@ -718,18 +718,22 @@ class ReplenishWorker:
             clock=self._clock,
         )
         if code2 is None:
-            # 二次短信超时：账号已在平台接管成功（新 key 已建），但真实密码未知。
-            # 为保住成果仍把 key 与新密码落账，user 落空串（拿不到用户名）。
-            # 已知限制：user 为空时 auto_renew 记为 no_credentials（跳过，而非
-            # password_error），count_available 又把它算作可用 —— 该账号 key 到期后
-            # 既不会自动续期、也不会触发补号，需人工补录用户名。
+            # 二次短信超时：账号已在平台接管成功（新 key 已建），但改密未完成、真实密码未知。
+            # 兜底：
+            # 1) 用已有 access_token 取回用户名，避免 user 落空（否则余量 / 自动续期彻底用不了）；
+            # 2) 密码落空串 —— new_pw 从未被服务端接受，写进去只会让余量面板误报「登录失败」，
+            #    空密码则如实记为「未配置凭据」，等人工重发改密短信补录即可恢复。
+            username = self._recover_username(bundle.access_token, user_id)
             self._persist(
-                "", phone, new_pw, created.api_key, outcome="takeover_password_unset"
+                username, phone, "", created.api_key, outcome="takeover_password_unset"
             )
             self._set_status(
                 self.STATUS_CHECK_ERROR,
                 "改密短信超时，账号已接管但未改密",
-                log_line=f"[补号] 号码 {phone} 改密短信超时，账号已接管但未改密",
+                log_line=(
+                    f"[补号] 号码 {phone} 改密短信超时：已接管并保留 Key，"
+                    f"用户名={username or '未取到'}（密码未改，需人工补录）"
+                ),
             )
             raise _StopCycle(
                 record=dict(
@@ -750,11 +754,7 @@ class ReplenishWorker:
             verify_code=code2,
             password=new_pw,
         )
-        try:
-            profile = self._authn.get_user_info(bundle.access_token, user_id)
-            username = str(profile.get("user_name") or profile.get("username") or "")
-        except Exception:  # noqa: BLE001 - 用户名可缺省，不影响落账
-            username = ""
+        username = self._recover_username(bundle.access_token, user_id)
         self._persist(username, phone, new_pw, created.api_key)
         self._record_registration(
             phone=phone,
@@ -809,6 +809,14 @@ class ReplenishWorker:
         if isinstance(exc, AuthnError):
             return _AUTHN_EXC_REASONS.get(exc.reason, "authn_error")
         return "unknown"
+
+    def _recover_username(self, access_token: str, user_id: str) -> str:
+        """尽力取回用户名；失败返回空串（不抛错，仅用于落账）。"""
+        try:
+            profile = self._authn.get_user_info(access_token, user_id)
+        except Exception:  # noqa: BLE001 - 用户名可缺省，不影响落账
+            return ""
+        return str(profile.get("user_name") or profile.get("username") or "")
 
     # ------------------------------------------------------------ 状态
     def _set_status(
