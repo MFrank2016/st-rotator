@@ -225,6 +225,50 @@ pip install -r requirements-quota.txt     # 即 jwcrypto>=1.5
 - 依赖与既有 `账号余量` 相同：需要 `user` / `password` 与可选的 `jwcrypto`
   （登录换取控制台 JWT）。未配置凭据的账号不参与轮换，也不产生任何网络行为。
 
+## 泄漏守卫（leak_guard）
+
+网关是池里这些 Key 的**唯一合法使用者**。若某段时间内网关**完全没有** token 消耗记录
+（空转），却有账号的积分在减少，说明该账号的 Key 很可能被网关之外的第三方使用（泄漏 / 被共享）。
+
+开启后，网关**每 10 分钟**扫描一次：窗口内「网关无 token 消耗」且「某账号**通用池积分**
+采样增量 > 0」→ 把该账号记入**待轮换清单**（持久化到配置同目录的 `guard.json`）；
+每天 **02:00（本地时间）** 统一对清单里的每个账号执行一次
+「重新登录 → 注销该账号全部 Key → 新建一把 Key → 更新配置并落盘」，随后清空清单。
+
+```jsonc
+"leak_guard": {
+  "enabled": false,               // 默认关闭；开启后仅 ui / tray 模式生效
+  "interval_seconds": 600,        // 扫描间隔（秒），默认 600 = 10 分钟
+  "window_seconds": 600,          // 回看窗口（秒），默认 600 = 10 分钟
+  "rotate_hour": 2,               // 每日统一轮换时刻（本地时间，0~23）
+  "rotate_minute": 0,             // 分钟（0~59）
+  "key_name": "auto",             // 新建 Key 的名称（≤64，仅中文/字母/数字/连字符）
+  "key_type": "API_KEY_TYPE_TOKEN_PLAN"   // 仅 TOKEN_PLAN / METERED
+}
+```
+
+行为要点：
+
+- **判定口径（全局）**：「没有 token 消耗记录」= 窗口内网关整体没有任何 token 用量；
+  「积分变动」= 该账号**通用池（general）**采样增量 `delta > 0`。
+- **只看通用池**：`flash_lite_exchange` 的「一换一烧点」只消耗专属池且**绕过 HTTP 代理**，
+  不会被 token 统计记录；只看通用池可避免把正在烧点的账号误判为泄漏（模型测试同理，属手动操作）。
+- **轮换动作**：与 `auto_renew` 相同（登录 → 注销全部 Key → 新建 Key → 落盘），但由独立 worker 执行，
+  **不依赖** `auto_renew` 是否开启；只轮换被记录的账号。
+- **每日幂等**：同一天只轮换一次；进程若在 02:00 之后启动且当日未轮换，下一轮扫描会立即补轮换。
+- **失败处理**：某个账号轮换失败（如未配置凭据 / 瞬时网络错误）只记日志，不影响其它账号；
+  清单在每轮结束后清空，若积分仍在变动，下一次扫描会重新记录。
+- **依赖**：需要 `user` / `password`（登录换 JWT）与可选的 `jwcrypto`，以及 `账号余量` 服务
+  （积分采样来源）。未配置凭据的账号不参与，也不产生任何网络行为。
+- **敏感数据**：`guard.json` 仅含账号名与日期、不含任何密钥，但属运行产物，已加入 `.gitignore`。
+- **全局口径的代价**：只要窗口内有**任意**账号在用网关，就不会记录任何账号；因此某个空闲账号
+  真被外部盗用时，这一轮可能漏判（待网关再次空闲的窗口仍会捕获）。
+- **模型测试是例外**：控制台「模型测试」直连上游、消耗通用池积分却不经网关 token 统计；
+  若在网关空转时跑测试，可能把该账号误记为疑似泄漏（属手动操作，留意即可）。
+- **流式用量依赖注入**：若关闭 `track_stream_usage` 或上游不返回 `usage`，纯流式流量可能不更新
+  token 记录从而误判；建议保持 `track_stream_usage=true`。
+- **不累加补号轮换计数**：守卫的轮换不计入 `replenish.json` 的 `rotations`（那是 `auto_renew` 的口径）。
+
 ## 自动补充账号（auto replenish）
 
 配置了 `replenish` 之后，可以在**可用账号数低于目标**时自动补号：通过**易码（易接码）
@@ -349,6 +393,16 @@ pip install -r requirements-quota.txt     # 即 jwcrypto>=1.5
     "enabled": false,
     "interval_seconds": 180,
     "cleanup_interval_seconds": 1800,
+    "key_name": "auto",
+    "key_type": "API_KEY_TYPE_TOKEN_PLAN"
+  },
+
+  "leak_guard": { // 网关空转却有积分消耗时记录账号，每日 02:00 统一轮换（默认关闭，详见「泄漏守卫」）
+    "enabled": false,
+    "interval_seconds": 600,
+    "window_seconds": 600,
+    "rotate_hour": 2,
+    "rotate_minute": 0,
     "key_name": "auto",
     "key_type": "API_KEY_TYPE_TOKEN_PLAN"
   },
@@ -689,6 +743,7 @@ st_rotator/
 ├── sms.py          # 易码（易接码）短信平台客户端 + 验证码轮询
 ├── registry.py     # 补号注册表：已用号码 / 每日花销 / 注册审计（原子落盘）
 ├── replenish.py    # 自动补号：可用账号不足时自动注册 / 接管新账号
+├── guard.py        # 泄漏守卫：网关空转却有积分消耗 → 记录账号，每日 02:00 统一轮换
 ├── logs.py         # 日志环形缓冲 + 文件轮转
 ├── cli.py          # 命令行
 └── demo.py         # 内置模拟上游
