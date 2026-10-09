@@ -606,6 +606,9 @@ def _wire_replenish(
 
     console.replenish_factory = _factory
     console.replenish = _factory()
+    from .sms import EjiemaSms
+
+    console.sms_factory = EjiemaSms  # 保存补号配置后校验易码 Token 可用性
 
 
 def _load_registry_for(

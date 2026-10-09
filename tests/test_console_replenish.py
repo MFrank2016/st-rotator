@@ -485,5 +485,115 @@ class SnapshotSmsTokenFlagsTest(unittest.TestCase):
             self.assertIsNone(opts["sms_token_ok"])
 
 
+class SmsCheckRunner:
+    """set_options 保存时用的假易码传输：``left_amount`` 可控成功 / 抛错。"""
+
+    def __init__(self, *, ok: bool) -> None:
+        self.ok = ok
+        self.calls: list[str] = []
+
+    def left_amount(self) -> float:
+        self.calls.append("left")
+        if not self.ok:
+            raise RuntimeError("token 无效")
+        return 99.0
+
+
+class SaveTimeReplenishTest(unittest.TestCase):
+    """保存补号配置后的 token 校验与立即对账（失败不破坏落盘）。"""
+
+    def test_save_with_valid_token_marks_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            console = _console(
+                tmp,
+                replenish_cfg={"enabled": True, "target_count": 0, "sms_token": "old"},
+            )
+            console.sms_factory = lambda token: SmsCheckRunner(ok=True)
+            resp = console.set_options({"replenish": {"sms_token": "newtok"}})
+            self.assertEqual(resp.status, 200)
+            self.assertTrue(console.sms_token_ok)
+            self.assertEqual(console.config.replenish.sms_token, "newtok")
+            self.assertNotIn("易码 Token 校验失败", resp.payload["message"])
+
+    def test_save_with_invalid_token_keeps_save_marks_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_config(tmp)
+            store = ConfigStore.load(path)
+            rotator = _FakeRotator(store.config)
+            console = ConsoleState(store=store, rotator=rotator)  # type: ignore[arg-type]
+            console.sms_factory = lambda token: SmsCheckRunner(ok=False)
+            resp = console.set_options(
+                {"replenish": {"enabled": True, "target_count": 5, "sms_token": "bad"}}
+            )
+            self.assertEqual(resp.status, 200)
+            self.assertFalse(console.sms_token_ok)
+            self.assertIn("易码 Token 校验失败", resp.payload["message"])
+            reloaded = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(reloaded["replenish"]["sms_token"], "bad")
+
+    def test_save_with_valid_token_marks_unavailable_using_existing_token(self):
+        # 未提交新 token 时，用已存 token 校验
+        with tempfile.TemporaryDirectory() as tmp:
+            console = _console(
+                tmp,
+                replenish_cfg={
+                    "enabled": True,
+                    "target_count": 0,
+                    "sms_token": "stored",
+                },
+            )
+            console.sms_factory = lambda token: SmsCheckRunner(ok=False)
+            resp = console.set_options({"replenish": {"enabled": True}})
+            self.assertEqual(resp.status, 200)
+            self.assertFalse(console.sms_token_ok)
+
+    def test_save_with_no_token_sets_ok_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            console = _console(
+                tmp, replenish_cfg={"enabled": True, "target_count": 0, "sms_token": ""}
+            )
+            console.sms_factory = lambda token: SmsCheckRunner(ok=True)
+            resp = console.set_options({"replenish": {"enabled": True}})
+            self.assertEqual(resp.status, 200)
+            self.assertIsNone(console.sms_token_ok)
+
+    def test_save_triggers_immediate_reconcile_when_short(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = _StoppableWorker()
+            logs: list[str] = []
+            store = _load_store(
+                tmp,
+                replenish={
+                    "enabled": True,
+                    "target_count": 3,
+                    "sms_token": "tok",
+                },
+            )
+            rotator = _FakeRotator(store.config)
+            console = ConsoleState(store=store, rotator=rotator)  # type: ignore[arg-type]
+            console.replenish = worker
+            console._log = logs.append
+            resp = console.set_options({"replenish": {"target_count": 5}})
+            self.assertEqual(resp.status, 200)
+            self.assertTrue(any("已开启自动补号" in line for line in logs), logs)
+
+    def test_reconcile_failure_never_breaks_save(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _load_store(
+                tmp,
+                replenish={
+                    "enabled": True,
+                    "target_count": 5,
+                    "sms_token": "tok",
+                },
+            )
+            rotator = _FakeRotator(store.config)
+            console = ConsoleState(store=store, rotator=rotator)  # type: ignore[arg-type]
+            console.replenish = object()  # 无 run_once -> 对账失败必须被吞掉
+            resp = console.set_options({"replenish": {"target_count": 6}})
+            self.assertEqual(resp.status, 200)
+            self.assertTrue(resp.payload["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()

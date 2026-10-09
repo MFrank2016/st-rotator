@@ -280,9 +280,10 @@ class ConsoleState:
     replenish: ReplenishWorker | None = None
     replenish_factory: Callable[[], ReplenishWorker | None] | None = None
     registry: Registry | None = None
-    sms_token_ok: bool | None = (
-        None  # 最近一次保存时的易码 Token 校验结果（None=未配置）
-    )
+    # 补号保存后行为：sms_factory(token) 构造易码传输；sms_token_ok 记录最近一次
+    # 校验结果（None=未配置 / True=可用 / False=已标记不可用）
+    sms_factory: Callable[[str], Any] | None = None
+    sms_token_ok: bool | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     # ------------------------------------------------------------ 只读
@@ -904,6 +905,7 @@ class ConsoleState:
                 )
 
         rp_payload = payload.get("replenish")
+        token_msg = ""
         if rp_payload is not None:
             if not isinstance(rp_payload, dict):
                 return UiResponse.error("replenish 必须是对象")
@@ -968,11 +970,44 @@ class ConsoleState:
                     )
                 )
                 self._sync_replenish(rebuild="sms_token" in rp_changes)
+                self._reconcile_replenish_after_save()
+                if not self.config.replenish.sms_token:
+                    self.sms_token_ok = None
+                elif self.sms_factory is not None:
+                    try:
+                        self.sms_factory(self.config.replenish.sms_token).left_amount()
+                        self.sms_token_ok = True
+                    except Exception:  # noqa: BLE001 - Token 校验失败只标记不可用，不打断落盘
+                        self.sms_token_ok = False
+                        token_msg = "；易码 Token 校验失败，已标记不可用"
 
         if not changes:
             return UiResponse.json({"ok": True, "message": "没有需要改动的参数"})
         self._save_and_log("运行参数已更新：" + "，".join(changes))
-        return UiResponse.json({"ok": True, "message": "已更新：" + "，".join(changes)})
+        return UiResponse.json(
+            {"ok": True, "message": "已更新：" + "，".join(changes) + token_msg}
+        )
+
+    def _reconcile_replenish_after_save(self) -> None:
+        """保存补号配置后立即对账：可用数仍低于目标则确保 worker 并跑一轮。
+
+        全程吞异常——对账失败绝不能让配置保存失败。
+        """
+        try:
+            available = count_available(
+                self.config.accounts,
+                self.auto_renew.account_status() if self.auto_renew else {},
+            )
+            target = self.config.replenish.target_count
+            if self.config.replenish.enabled and available < target:
+                if self.replenish is None and self.replenish_factory is not None:
+                    self.replenish = self.replenish_factory()
+                run = getattr(self.replenish, "run_once", None)
+                if run is not None:
+                    run()
+                self._log(f"[补号] 可用 {available} < 目标 {target}，已开启自动补号")
+        except Exception:  # noqa: BLE001 - 对账失败不阻止保存
+            pass
 
     def _sync_replenish(self, *, rebuild: bool = False) -> None:
         """把运行中的补号 worker 与最新 config.replenish 对齐（保存后即时生效）。
