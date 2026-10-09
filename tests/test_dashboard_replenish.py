@@ -121,5 +121,44 @@ class DashboardReplenishTest(unittest.TestCase):
         self.assertIn('item.text.indexOf("[补号]")', DASHBOARD_HTML)
 
 
+class DashboardReplenishRecordsTest(unittest.TestCase):
+    """自动补号卡片内的注册记录分节 + 易码 Token 状态提示。"""
+
+    def test_records_section_markup(self):
+        for text in [
+            "注册记录",
+            'id="rp-reg-q"',
+            'id="rp-reg-status"',
+            'id="rp-reg-kind"',
+            'id="rp-reg-search"',
+            'id="rp-reg-table"',
+            'id="rp-reg-prev"',
+            'id="rp-reg-next"',
+            'id="rp-reg-page"',
+            "注册时间",
+            "手机号",
+            "用户名",
+            "密码",
+            "新号",
+            "重置密码",
+            "成功",
+            "失败原因",
+            "失败详情",
+        ]:
+            self.assertIn(text, DASHBOARD_HTML)
+
+    def test_records_render_function_and_pagination_state(self):
+        self.assertIn("function renderReplenishRecords", DASHBOARD_HTML)
+        self.assertIn("/api/replenish/registrations", DASHBOARD_HTML)
+        self.assertIn("S.rpRegPage", DASHBOARD_HTML)
+        self.assertIn("S.rpRegSize", DASHBOARD_HTML)
+
+    def test_sms_token_flags_in_panel(self):
+        self.assertIn("sms_token_configured", DASHBOARD_HTML)
+        self.assertIn("sms_token_ok", DASHBOARD_HTML)
+        self.assertIn("未配置易码 Token，补号未运行", DASHBOARD_HTML)
+        self.assertIn("易码 Token 不可用", DASHBOARD_HTML)
+
+
 if __name__ == "__main__":
     unittest.main()

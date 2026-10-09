@@ -300,6 +300,36 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       </div>
       <h2 style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">补号日志 <span class="spacer"></span><button class="tiny" id="btn-clear-replenish-log">清屏</button></h2>
       <div id="replenish-logbox"></div>
+      <h2 style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">注册记录</h2>
+      <div class="row" style="margin-bottom:10px;align-items:flex-end;flex-wrap:wrap">
+        <label class="field grow" style="margin-bottom:0;flex:1;min-width:160px">
+          <span>搜索</span>
+          <input id="rp-reg-q" type="text" placeholder="手机号 / 用户名">
+        </label>
+        <label class="field" style="width:92px;margin-bottom:0">
+          <span>结果</span>
+          <select id="rp-reg-status">
+            <option value="">全部</option>
+            <option value="ok">成功</option>
+            <option value="fail">失败</option>
+          </select>
+        </label>
+        <label class="field" style="width:92px;margin-bottom:0">
+          <span>类型</span>
+          <select id="rp-reg-kind">
+            <option value="">全部</option>
+            <option value="new">新号</option>
+            <option value="takeover">接管</option>
+          </select>
+        </label>
+        <button class="primary" id="rp-reg-search" style="height:33px">查询</button>
+      </div>
+      <div id="rp-reg-table" style="overflow-x:auto"></div>
+      <div class="row" style="margin-top:10px;align-items:center">
+        <button class="tiny" id="rp-reg-prev">上一页</button>
+        <span class="muted" id="rp-reg-page"></span>
+        <button class="tiny" id="rp-reg-next">下一页</button>
+      </div>
     </div>
   </div>
 
@@ -539,7 +569,9 @@ var S = {
   modelTestGrid: null,
   modelTestCards: null,
   modelTestTimer: null,
-  modelTestStart: 0
+  modelTestStart: 0,
+  rpRegPage: 1,
+  rpRegSize: 20
 };
 
 /* 窗口是带 #token=xxx 打开的（fragment 不会发给服务端，也不进 Referer）。
@@ -902,16 +934,25 @@ var REPLENISH_BADGES = {
 function renderReplenish(state) {
   var rs = (state.replenish_status || {})._replenish || {};
   var rp = state.replenish_state || {};
+  var rpo = (state.options && state.options.replenish) || {};
   var spend = rp.spend || {};
   var enabled = !!(state.options && state.options.replenish && state.options.replenish.enabled);
   var badge = "";
   var known = REPLENISH_BADGES[rs.status];
-  if (known) badge = '<span class="pill ' + known[1] + '">' + known[0] + "</span>";
-  else if (rs.status) badge = '<span class="pill neutral">' + esc(rs.status) + "</span>";
-  else if (rp.running === false) badge = '<span class="pill neutral">未启动</span>';
-  var note = rs.message
-    ? esc(rs.message)
-    : (enabled && rp.running === false ? "已开启，重启 ui / tray 后生效" : "");
+  if (rpo.sms_token_ok === false) {
+    badge = '<span class="pill invalid">易码 Token 不可用</span>';
+  } else if (known) {
+    badge = '<span class="pill ' + known[1] + '">' + known[0] + "</span>";
+  } else if (rs.status) {
+    badge = '<span class="pill neutral">' + esc(rs.status) + "</span>";
+  } else if (rp.running === false) {
+    badge = '<span class="pill neutral">未启动</span>';
+  }
+  var note = "";
+  if (rs.message) note = esc(rs.message);
+  else if (rpo.sms_token_configured === false) note = "未配置易码 Token，补号未运行";
+  else if (rpo.sms_token_ok === false) note = "易码 Token 不可用";
+  else if (enabled && rp.running === false) note = "已开启，重启 ui / tray 后生效";
   var badgeEl = $("replenish-badge");
   if (badgeEl) badgeEl.innerHTML = badge;
   var noteEl = $("replenish-note");
@@ -943,6 +984,48 @@ function renderReplenish(state) {
         '<div class="label" style="margin-top:2px">' + esc(c[3]) + '</div></div>';
     }).join("");
   }
+}
+
+async function renderReplenishRecords() {
+  var host = $("rp-reg-table");
+  if (!host) return;
+  var q = encodeURIComponent(($("rp-reg-q").value || "").trim());
+  var status = encodeURIComponent($("rp-reg-status").value || "");
+  var kind = encodeURIComponent($("rp-reg-kind").value || "");
+  var data;
+  try {
+    data = await api("/api/replenish/registrations?page=" + S.rpRegPage +
+      "&size=" + S.rpRegSize + "&q=" + q + "&status=" + status + "&kind=" + kind);
+  } catch (err) {
+    host.innerHTML = '<div class="empty">' + esc(err.message) + "</div>";
+    return;
+  }
+  var items = data.items || [];
+  if (!items.length) {
+    host.innerHTML = '<div class="empty">暂无注册记录</div>';
+  } else {
+    host.innerHTML = "<table><tr><th>注册时间</th><th>手机号</th><th>用户名</th><th>密码</th>" +
+      "<th>新号</th><th>重置密码</th><th>成功</th><th>失败原因</th><th>失败详情</th></tr>" +
+      items.map(function (e) {
+        var when = new Date((e.created_at || 0) * 1000);
+        var time = isNaN(when.getTime()) ? "" : when.toLocaleString();
+        var isNew = e.is_new
+          ? '<span class="pill healthy">新号</span>'
+          : '<span class="pill cooldown">接管</span>';
+        var ok = e.success
+          ? '<span class="pill healthy">成功</span>'
+          : '<span class="pill invalid">失败</span>';
+        return "<tr><td>" + esc(time) + "</td><td>" + esc(e.phone) + "</td><td>" + esc(e.username) +
+          "</td><td class='mono'>" + esc(e.password) + "</td><td>" + isNew + "</td><td>" +
+          (e.password_reset ? "是" : "") + "</td><td>" + ok + "</td><td>" + esc(e.reason) +
+          "</td><td>" + esc(e.detail) + "</td></tr>";
+      }).join("") + "</table>";
+  }
+  var total = Number(data.total || 0);
+  var lastPage = Math.max(1, Math.ceil(total / S.rpRegSize));
+  $("rp-reg-page").textContent = "第 " + S.rpRegPage + " / " + lastPage + " 页（共 " + total + " 条）";
+  $("rp-reg-prev").disabled = S.rpRegPage <= 1;
+  $("rp-reg-next").disabled = S.rpRegPage >= lastPage;
 }
 
 function renderGateway(state) {
@@ -1755,6 +1838,16 @@ function bind() {
   $("new-key").addEventListener("keydown", function (event) { if (event.key === "Enter") onAddKeys(); });
   $("btn-clearlog").onclick = function () { $("logbox").innerHTML = ""; };
   $("btn-clear-replenish-log").onclick = function () { $("replenish-logbox").innerHTML = ""; };
+  $("rp-reg-search").onclick = function () { S.rpRegPage = 1; renderReplenishRecords(); };
+  $("rp-reg-prev").onclick = function () {
+    if (S.rpRegPage > 1) { S.rpRegPage -= 1; renderReplenishRecords(); }
+  };
+  $("rp-reg-next").onclick = function () {
+    if (!$("rp-reg-next").disabled) { S.rpRegPage += 1; renderReplenishRecords(); }
+  };
+  $("rp-reg-q").addEventListener("keydown", function (event) {
+    if (event.key === "Enter") { S.rpRegPage = 1; renderReplenishRecords(); }
+  });
   $("btn-autoscroll").onclick = function () {
     S.autoscroll = !S.autoscroll;
     this.textContent = "自动滚动：" + (S.autoscroll ? "开" : "关");
@@ -1772,6 +1865,7 @@ function bind() {
 
 bind();
 refreshState().then(function () { refreshQuota(false); refreshUsage(); refreshSamples(); });
+renderReplenishRecords();  // 注册记录只在启动时拉一次，不做 2 秒轮询
 pollLogs();
 S.timerState = setInterval(refreshState, 2000);
 S.timerLog = setInterval(pollLogs, 1200);
