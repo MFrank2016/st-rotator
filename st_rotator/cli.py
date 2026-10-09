@@ -22,7 +22,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from .client import StRotator
-from .config import Config, ConfigStore, RateControlConfig, account_name_for
+from .config import (
+    AccountConfig,
+    Config,
+    ConfigStore,
+    RateControlConfig,
+    account_name_for,
+)
 from .errors import (
     ApiError,
     NoAvailableKey,
@@ -39,6 +45,8 @@ if TYPE_CHECKING:  # 仅类型标注用，运行时走函数内 lazy import
     from .replenish import ReplenishWorker
     from .sms import SmsTransport
     from .ui import ConsoleState
+    from .guard import LeakGuardWorker
+    from .quota import TokenBundle
 
 # ---------------------------------------------------------------- 输出工具
 
@@ -496,6 +504,74 @@ def build_auto_renew(
     return worker
 
 
+def build_leak_guard(
+    config: Config,
+    store: ConfigStore,
+    rotator: StRotator,
+    console: "ConsoleState",
+    *,
+    lock: threading.Lock,
+    sink: Callable[[str], None],
+    login: Callable[[str, str], TokenBundle] | None = None,
+    keys: "KeyTransport | None" = None,
+) -> "LeakGuardWorker | None":
+    """仅当 leak_guard.enabled 且存在带凭据的账号（余量服务可用）时创建并启动泄漏守卫。
+
+    判定口径见 ``st_rotator.guard``：窗口内网关空转（无 token 消耗）却有账号
+    通用池积分消耗 → 记入待轮换清单；每天到 ``rotate_hour:rotate_minute`` 统一轮换
+    （重新登录 → 注销该账号全部 Key → 新建 Key → 更新配置并落盘）。
+    """
+    from .autorenew import HttpKeyManager, RotationOutcome, rotate_account
+    from .guard import GuardError, GuardStore, LeakGuardWorker
+    from .quota import HttpQuotaTransport
+
+    if not config.leak_guard.enabled:
+        return None
+    quota = console.quota
+    if quota is None:
+        sink("[泄漏守卫] 未配置账号登录凭据，无法检测积分变动，未运行")
+        return None
+    if login is None:
+        login = HttpQuotaTransport().login
+    if keys is None:
+        keys = HttpKeyManager()
+    persist = build_auto_renew_persist(store, rotator, lock=lock)
+
+    def rotate(account: AccountConfig) -> RotationOutcome:
+        return rotate_account(
+            account,
+            login=login,
+            keys=keys,
+            persist=persist,
+            key_name=config.leak_guard.key_name,
+            key_type=config.leak_guard.key_type,
+        )
+
+    path = Path(store.path).resolve().parent / "guard.json"
+    try:
+        guard_store = GuardStore.load(path)
+    except GuardError as exc:
+        sink(f"[泄漏守卫] 忽略无法读取的 {path.name}：{exc}（已按空状态启动）")
+        guard_store = GuardStore(path)
+
+    worker = LeakGuardWorker(
+        accounts=lambda: rotator.config.accounts,
+        token_usage_last=console.metrics.usage.last_at,
+        credit_changes=lambda since, idle_since: quota.credits.accounts_with_delta_since(
+            since, idle_since=idle_since
+        ),
+        rotate=rotate,
+        store=guard_store,
+        interval=config.leak_guard.interval_seconds,
+        window=config.leak_guard.window_seconds,
+        rotate_hour=config.leak_guard.rotate_hour,
+        rotate_minute=config.leak_guard.rotate_minute,
+        log=sink,
+    )
+    worker.start()
+    return worker
+
+
 def build_replenish_persist(
     store: ConfigStore,
     rotator: StRotator,
@@ -665,6 +741,9 @@ def cmd_ui(args: argparse.Namespace) -> int:
     if store is not None:
         _wire_replenish(console, config, store, rotator, registry, sink=sink)
         console.registry = registry
+        console.leak_guard = build_leak_guard(
+            config, store, rotator, console, lock=console.lock, sink=sink
+        )
 
     sink(
         f"启动控制台 host={args.host} port={args.port} keys={config.total_keys} "
@@ -707,6 +786,8 @@ def cmd_ui(args: argparse.Namespace) -> int:
             console.auto_renew.stop()
         if console.replenish:
             console.replenish.stop()
+        if console.leak_guard:
+            console.leak_guard.stop()
         rotator.close()
     return 0
 
@@ -784,6 +865,9 @@ def cmd_tray(args: argparse.Namespace) -> int:
     if store is not None:
         _wire_replenish(console, config, store, rotator, registry, sink=sink)
         console.registry = registry
+        console.leak_guard = build_leak_guard(
+            config, store, rotator, console, lock=console.lock, sink=sink
+        )
 
     try:
         server = create_server(
@@ -835,6 +919,8 @@ def cmd_tray(args: argparse.Namespace) -> int:
             console.auto_renew.stop()
         if console.replenish:
             console.replenish.stop()
+        if console.leak_guard:
+            console.leak_guard.stop()
         server.shutdown()
         server.server_close()
         gateway.join(timeout=5)
