@@ -58,6 +58,24 @@ class DashboardModelTestTest(unittest.TestCase):
         # 思考内容（reasoning_content）以 reasoning 事件单独淡色渲染，不混入正文。
         self.assertIn('name === "reasoning"', DASHBOARD_HTML)
 
+    def test_account_dropdown_multiselect(self):
+        # 账号改为「下拉多选」（按钮 + 复选菜单），不再是 <select multiple>。
+        self.assertIn('id="modeltest-accounts"', DASHBOARD_HTML)
+        self.assertIn('id="modeltest-accounts-menu"', DASHBOARD_HTML)
+        self.assertIn("function mtSelectedAccounts", DASHBOARD_HTML)
+
+    def test_response_timer(self):
+        # 点击开始后展示响应计时。
+        self.assertIn("function mtStartTimer", DASHBOARD_HTML)
+        self.assertIn("测试中… ", DASHBOARD_HTML)
+
+    def test_result_metrics(self):
+        # 结果展示 首字/处理/输入/缓存/输出，首字来自后端 ttft_ms。
+        self.assertIn("function modelTestMetrics", DASHBOARD_HTML)
+        self.assertIn("ttft_ms", DASHBOARD_HTML)
+        for label in ("首字", "处理", "输入", "缓存", "输出"):
+            self.assertIn(label, DASHBOARD_HTML)
+
 
 if __name__ == "__main__":
     unittest.main()

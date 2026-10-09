@@ -533,6 +533,8 @@ class StreamTest(unittest.TestCase):
         self.assertEqual(events[4]["type"], "done")
         self.assertEqual(events[4]["status"], "ok")
         self.assertGreaterEqual(events[4]["latency_ms"], 0)
+        self.assertIsNotNone(events[4].get("ttft_ms"))
+        self.assertIsNotNone(result.ttft_ms)
         self.assertEqual(events[5], {"type": "complete"})
 
     def test_stream_error_isolation(self):

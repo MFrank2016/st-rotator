@@ -51,6 +51,7 @@ class ModelTestResult:
     text: str = ""
     usage: dict[str, Any] | None = None
     error: dict[str, Any] | None = None  # {"code":..., "message":...}
+    ttft_ms: int | None = None  # 首字响应时长（流式：首个 token 用时；非流式：None）
 
 
 def payload_for(
@@ -170,21 +171,38 @@ def _run_stream(
         return _http_error(name, started, resp, safe_text(resp), emit)
     emit({"type": "start", "account": name, "model": req.model})
     pieces: list[str] = []
+    ttft_ms: int | None = None
     for chunk in StRotator._iter_sse_chunks(resp):
         reasoning = _reasoning_text(chunk)
         if reasoning:
+            if ttft_ms is None:
+                ttft_ms = round((time.monotonic() - started) * 1000)
             emit({"type": "reasoning", "account": name, "text": reasoning})
         piece = StRotator._chunk_text(chunk)
         if piece:
+            if ttft_ms is None:
+                ttft_ms = round((time.monotonic() - started) * 1000)
             pieces.append(piece)
             emit({"type": "token", "account": name, "token": piece})
         usage = chunk.get("usage")
         if usage:
             emit({"type": "usage", "account": name, "usage": usage})
     latency_ms = round((time.monotonic() - started) * 1000)
-    emit({"type": "done", "account": name, "status": "ok", "latency_ms": latency_ms})
+    emit(
+        {
+            "type": "done",
+            "account": name,
+            "status": "ok",
+            "latency_ms": latency_ms,
+            "ttft_ms": ttft_ms,
+        }
+    )
     return ModelTestResult(
-        account=name, status="ok", latency_ms=latency_ms, text="".join(pieces)
+        account=name,
+        status="ok",
+        latency_ms=latency_ms,
+        text="".join(pieces),
+        ttft_ms=ttft_ms,
     )
 
 

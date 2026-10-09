@@ -312,10 +312,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <span>模型</span>
         <select id="modeltest-model"></select>
       </label>
-      <label class="field" style="width:200px;margin-bottom:0">
-        <span>账号（可多选，服务端并发）</span>
-        <select id="modeltest-accounts" multiple size="4"></select>
-      </label>
+      <div style="width:200px;position:relative">
+        <span style="display:block;font-size:11.5px;color:var(--muted);margin-bottom:4px">账号（可多选，服务端并发）</span>
+        <button type="button" id="modeltest-accounts" style="width:100%;box-sizing:border-box;height:33px;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:var(--card);color:var(--text);border:1px solid var(--border-strong);border-radius:7px;padding:0 10px;font-size:13px;cursor:pointer">选择账号…</button>
+        <div id="modeltest-accounts-menu" style="display:none;position:absolute;top:100%;left:0;right:0;z-index:30;margin-top:4px;max-height:220px;overflow:auto;background:var(--card);border:1px solid var(--border-strong);border-radius:8px;padding:4px;box-shadow:0 8px 24px rgba(0,0,0,.18)"></div>
+      </div>
       <label class="field" style="width:112px;margin-bottom:0">
         <span>推理强度</span>
         <select id="modeltest-effort">
@@ -523,7 +524,9 @@ var S = {
   timerSamples: null,
   modelTestController: null,
   modelTestGrid: null,
-  modelTestCards: null
+  modelTestCards: null,
+  modelTestTimer: null,
+  modelTestStart: 0
 };
 
 /* 窗口是带 #token=xxx 打开的（fragment 不会发给服务端，也不进 Referer）。
@@ -1062,12 +1065,65 @@ function renderModelTest(state) {
   modelSel.innerHTML = ids.map(function (id) {
     return '<option value="' + esc(id) + '">' + esc(id) + '</option>';
   }).join("") || '<option value="">（无可用模型）</option>';
-  $("modeltest-accounts").innerHTML = names.map(function (a) {
-    return '<option value="' + esc(a) + '">' + esc(a) + '</option>';
-  }).join("") || '<option value="">（无账号）</option>';
+  var prev = mtSelectedAccounts();
+  $("modeltest-accounts-menu").innerHTML = names.map(function (a) {
+    return '<label style="display:flex;align-items:center;gap:6px;padding:5px 8px;border-radius:6px;cursor:pointer">' +
+      '<input type="checkbox" value="' + esc(a) + '"' + (prev.indexOf(a) !== -1 ? " checked" : "") +
+      ' style="width:auto;margin:0"><span>' + esc(a) + '</span></label>';
+  }).join("") || '<div class="muted" style="padding:6px 8px">（无账号）</div>';
+  mtUpdateAccountsLabel();
   var current = state.default_model;
   if (current && ids.indexOf(current) !== -1) modelSel.value = current;
   modelSel.dataset.built = key;
+}
+
+/* 账号下拉多选：已勾选账号 / 更新按钮文案。 */
+function mtSelectedAccounts() {
+  var menu = $("modeltest-accounts-menu");
+  if (!menu) return [];
+  return Array.prototype.slice
+    .call(menu.querySelectorAll('input[type=checkbox]:checked'))
+    .map(function (c) { return c.value; });
+}
+
+function mtUpdateAccountsLabel() {
+  var btn = $("modeltest-accounts");
+  if (!btn) return;
+  var names = mtSelectedAccounts();
+  btn.textContent = !names.length
+    ? "选择账号…"
+    : (names.length <= 2 ? names.join("、") : "已选 " + names.length + " 个账号");
+}
+
+/* 响应计时：点击开始后实时刷新 #modeltest-note。 */
+function mtStartTimer() {
+  mtStopTimer();
+  S.modelTestStart = Date.now();
+  var note = $("modeltest-note");
+  if (note) note.textContent = "测试中… 0.0s";
+  S.modelTestTimer = setInterval(function () {
+    if (note) note.textContent = "测试中… " + ((Date.now() - S.modelTestStart) / 1000).toFixed(1) + "s";
+  }, 100);
+}
+
+function mtStopTimer() {
+  if (S.modelTestTimer) { clearInterval(S.modelTestTimer); S.modelTestTimer = null; }
+}
+
+/* 结果度量：首字 / 处理 / 输入 / 缓存 / 输出。 */
+function modelTestMetrics(usage, latencyMs, ttftMs) {
+  var u = usage || {};
+  var details = u.prompt_tokens_details || {};
+  var cached = null;
+  if (details.cached_tokens != null) cached = details.cached_tokens;
+  else if (u.cached_tokens != null) cached = u.cached_tokens;
+  else if (u.prompt_cache_hit_tokens != null) cached = u.prompt_cache_hit_tokens;
+  var n = function (v) { return v == null ? "—" : v; };
+  return "首字 " + (ttftMs == null ? "—" : ttftMs + " ms") +
+    " · 处理 " + (latencyMs == null ? "—" : latencyMs + " ms") +
+    " · 输入 " + n(u.prompt_tokens) +
+    " · 缓存 " + n(cached) +
+    " · 输出 " + n(u.completion_tokens);
 }
 
 /* 每账号一张结果卡；流式与非流式共用这一渲染路径。 */
@@ -1083,9 +1139,9 @@ function modelTestCard(account) {
   card.className = "card";
   card.dataset.mtAccount = account;
   card.innerHTML = "<h3>" + esc(account) +
-    ' <span class="pill neutral">测试中</span>' +
-    ' <span class="muted"></span></h3>' +
-    '<pre class="mono" style="white-space:pre-wrap;max-height:260px;overflow:auto"></pre>';
+    ' <span class="pill neutral">测试中</span></h3>' +
+    '<pre class="mono" style="white-space:pre-wrap;max-height:260px;overflow:auto"></pre>' +
+    '<div class="muted mt-metrics" style="font-size:12px;margin-top:6px"></div>';
   S.modelTestGrid.appendChild(card);
   S.modelTestCards[account] = card;
   return card;
@@ -1097,7 +1153,7 @@ function modelTestPill(card, klass, text) {
 }
 
 function modelTestMuted(card, text) {
-  var node = card.querySelector("h3 .muted");
+  var node = card.querySelector(".mt-metrics");
   if (node) node.innerHTML = esc(text);
 }
 
@@ -1115,24 +1171,18 @@ function onModelTestEvent(name, obj) {
       pre.innerHTML += esc(obj.token);
     }
   } else if (name === "usage") {
-    if (card) {
-      var u = obj.usage || {};
-      var bits = [];
-      if (u.prompt_tokens != null) bits.push("输入 " + u.prompt_tokens);
-      if (u.completion_tokens != null) bits.push("输出 " + u.completion_tokens);
-      if (u.total_tokens != null) bits.push("合计 " + u.total_tokens);
-      if (bits.length) modelTestMuted(card, bits.join(" · "));
-    }
+    if (card) card._mtUsage = obj.usage || {};
   } else if (name === "done") {
     if (card) {
       modelTestPill(card, "healthy", "成功");
-      modelTestMuted(card, (obj.latency_ms == null ? "—" : obj.latency_ms) + " ms");
+      modelTestMuted(card, modelTestMetrics(card._mtUsage, obj.latency_ms, obj.ttft_ms));
     }
   } else if (name === "error") {
     card = card || modelTestCard(obj.account);
     modelTestPill(card, "invalid", "失败");
     modelTestMuted(card, obj.message || "未知错误");
   } else if (name === "complete") {
+    mtStopTimer();
     var run = $("modeltest-run");
     run.disabled = false;
     run.innerHTML = "开始测试";
@@ -1175,7 +1225,7 @@ function modelTestRenderResults(results) {
     var pre = card.querySelector("pre");
     if (r.status === "ok") {
       modelTestPill(card, "healthy", "成功");
-      modelTestMuted(card, (r.latency_ms == null ? "—" : r.latency_ms) + " ms");
+      modelTestMuted(card, modelTestMetrics(r.usage, r.latency_ms, r.ttft_ms));
       if (r.text) pre.innerHTML = esc(r.text);
     } else {
       modelTestPill(card, "invalid", "失败");
@@ -1187,8 +1237,7 @@ function modelTestRenderResults(results) {
 
 async function runModelTest() {
   var model = $("modeltest-model").value;
-  var accounts = Array.prototype.slice.call($("modeltest-accounts").selectedOptions)
-    .map(function (o) { return o.value; });
+  var accounts = mtSelectedAccounts();
   var prompt = $("modeltest-prompt").value.trim();
   if (!model) { toast("请先选择模型", "err"); return; }
   if (!accounts.length) { toast("请至少选择一个账号", "err"); return; }
@@ -1200,7 +1249,7 @@ async function runModelTest() {
   S.modelTestGrid = null;
   S.modelTestCards = {};
   var note = $("modeltest-note");
-  if (note) note.textContent = "";
+  mtStartTimer();
   var body = {
     model: model,
     accounts: accounts,
@@ -1218,6 +1267,8 @@ async function runModelTest() {
     if (!body.stream) {
       var data = await api("api/model-test", { method: "POST", body: JSON.stringify(body) });
       modelTestRenderResults(data.results || []);
+      mtStopTimer();
+      if (note) note.textContent = "";
     } else {
       var headers = { "Content-Type": "application/json" };
       if (S.token) headers["Authorization"] = "Bearer " + S.token;
@@ -1236,6 +1287,7 @@ async function runModelTest() {
     }
   } catch (err) {
     if (controller && controller.signal.aborted) return;
+    mtStopTimer();
     toast(err.message, "err");
     if (note) note.textContent = "测试失败：" + err.message;
   } finally {
@@ -1573,6 +1625,17 @@ function bind() {
   $("btn-import-run").onclick = onImportKeys;
   $("btn-apply-model").onclick = onApplyModel;
   $("modeltest-run").onclick = runModelTest;
+  $("modeltest-accounts").onclick = function (event) {
+    event.stopPropagation();
+    var menu = $("modeltest-accounts-menu");
+    menu.style.display = menu.style.display === "block" ? "none" : "block";
+  };
+  $("modeltest-accounts-menu").onclick = function (event) { event.stopPropagation(); };
+  $("modeltest-accounts-menu").onchange = mtUpdateAccountsLabel;
+  document.addEventListener("click", function () {
+    var menu = $("modeltest-accounts-menu");
+    if (menu) menu.style.display = "none";
+  });
   $("btn-apply-options").onclick = onApplyOptions;
   $("btn-models").onclick = async function () {
     try { await api("/api/models/refresh", { method: "POST" }); await refreshState(); toast("模型清单已刷新", "ok"); }
