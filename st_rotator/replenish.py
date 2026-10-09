@@ -86,6 +86,8 @@ class _StopCycle(Exception):
         super().__init__()
         self.record = record
 
+    record: dict[str, Any] | None
+
 
 def count_unavailable(
     accounts: Sequence[AccountConfig], statuses: Mapping[str, Mapping[str, str]]
