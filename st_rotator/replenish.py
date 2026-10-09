@@ -215,7 +215,7 @@ class ReplenishWorker:
         key_type: str = "API_KEY_TYPE_TOKEN_PLAN",
         keyword: str = "商汤",
         sms_poll_interval: float = 5.0,
-        sms_poll_timeout: float = 60.0,
+        sms_poll_timeout: float = 120.0,
         daily_spend_cap: float = 5.0,
         interval: float = 3600.0,
         log: Callable[[str], None] | None = None,
@@ -372,18 +372,19 @@ class ReplenishWorker:
         硬性终止（blocked_cap / captcha / check_error / 去重耗尽）先写状态再抛
         ``_StopCycle`` 结束本轮。
         """
-        # a. spend gate：余额差口径，超当日上限即停（先查余额再记余额）
+        # a. spend gate：余额差口径，超当日上限即停。先记入本次读数再判定，
+        #    使闸门用的是「刚读到的余额」而不是上一次的读数（避免差一拍超冲）。
         today = today_str(self._clock)
         balance = self._sms.left_amount()
-        allowed, _consumed = spend_ok(
+        self._registry.note_balance(today, balance)
+        allowed, consumed = spend_ok(
             self._daily_spend_cap, self._registry.spend_state(), today
         )
-        self._registry.note_balance(today, balance)
         if not allowed:
             self._set_status(
                 self.STATUS_BLOCKED_CAP,
                 "今日短信消费已达上限",
-                log_line=f"[补号] 今日短信消费已达上限（已用 ¥{_consumed:.2f}），本轮停止",
+                log_line=f"[补号] 今日短信消费已达上限（已用 ¥{consumed:.2f}），本轮停止",
             )
             raise _StopCycle()
 

@@ -323,7 +323,8 @@ class ReplenishConfig:
         keyword: 短信关键词（易码 getPhone 的项目关键字）。
         daily_spend_cap: 短信平台单日消费上限（元）；0 表示不限制。
         sms_poll_interval: 轮询短信的间隔秒数。
-        sms_poll_timeout: 单次取号的短信等待超时秒数，超时换新号重试。
+        sms_poll_timeout: 单次取号的短信等待超时秒数；超时换新号重试。
+            默认 120：实测部分号段验证码到得较晚，60s 常常不够，导致白付一条短信费。
         key_name: 注册/接管后创建的新 Key 名称（中文、字母、数字、连字符，≤64）。
         key_type: 新 Key 的类型（Token Plan / 按量计费）。
     """
@@ -335,7 +336,7 @@ class ReplenishConfig:
     keyword: str = "商汤"
     daily_spend_cap: float = 5.0
     sms_poll_interval: float = 5.0
-    sms_poll_timeout: float = 60.0
+    sms_poll_timeout: float = 120.0
     key_name: str = "auto"
     key_type: str = "API_KEY_TYPE_TOKEN_PLAN"
 

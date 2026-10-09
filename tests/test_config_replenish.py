@@ -29,7 +29,7 @@ class ReplenishParseTest(unittest.TestCase):
         self.assertEqual(cfg.replenish.keyword, "商汤")
         self.assertEqual(cfg.replenish.daily_spend_cap, 5.0)
         self.assertEqual(cfg.replenish.sms_poll_interval, 5.0)
-        self.assertEqual(cfg.replenish.sms_poll_timeout, 60.0)
+        self.assertEqual(cfg.replenish.sms_poll_timeout, 120.0)
         self.assertEqual(cfg.replenish.key_name, "auto")
         self.assertEqual(cfg.replenish.key_type, "API_KEY_TYPE_TOKEN_PLAN")
 
@@ -44,7 +44,7 @@ class ReplenishParseTest(unittest.TestCase):
         self.assertEqual(cfg.replenish.sms_token, "")
         self.assertEqual(cfg.replenish.daily_spend_cap, 5.0)
         self.assertEqual(cfg.replenish.sms_poll_interval, 5.0)
-        self.assertEqual(cfg.replenish.sms_poll_timeout, 60.0)
+        self.assertEqual(cfg.replenish.sms_poll_timeout, 120.0)
         self.assertEqual(cfg.replenish.key_name, "auto")
         self.assertEqual(cfg.replenish.key_type, "API_KEY_TYPE_TOKEN_PLAN")
 

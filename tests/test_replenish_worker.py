@@ -661,6 +661,29 @@ class ReplenishWorkerTest(unittest.TestCase):
         self.assertEqual(keys.ops, [])
         self.assertEqual(self.persist_calls, [])
 
+    def test_daily_cap_gate_uses_fresh_balance_not_stale(self):
+        # 记录口径消费为 0，但平台实时余额已超上限：闸门必须用「刚读到的余额」
+        # 判定，不能沿用上一次的余额（否则会多取一个号、白花一条短信钱）。
+        registry = self._registry()
+        today = today_str(lambda: FIXED_EPOCH)
+        registry.note_balance(today, 10.0)  # 基线
+        registry.note_balance(today, 10.0)  # 上次读数 = 基线（记录口径消费 0）
+        sms = _FakeSms(balance=9.2, phones=["13800000001"])  # 实时：已消费 0.8
+        authn = _FakeAuthn()
+        keys = _FakeKeys()
+        worker = self._worker(
+            sms=sms,
+            authn=authn,
+            keys=keys,
+            registry=registry,
+            target=1,
+            daily_spend_cap=0.5,
+        )
+        worker.run_once()
+
+        self.assertEqual(self._status(worker), ReplenishWorker.STATUS_BLOCKED_CAP)
+        self.assertEqual(sms.phone_calls, [])  # 未取号
+
     # ------------------------------------------------------------ 9. S6 需要滑块
     def test_captcha_required_aborts_cycle_no_spend(self):
         registry = self._registry()

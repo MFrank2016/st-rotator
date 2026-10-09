@@ -242,7 +242,7 @@ pip install -r requirements-quota.txt     # 即 jwcrypto>=1.5
   "keyword": "商汤",              // 易码取号关键词（发件人标签，如【商汤】）
   "daily_spend_cap": 5,           // 易码单日消费上限（元），0 = 不限
   "sms_poll_interval": 5,         // 轮询短信间隔（秒）
-  "sms_poll_timeout": 60,         // 单次取号的短信等待超时（秒），超时换新号
+  "sms_poll_timeout": 120,        // 单次取号的短信等待超时（秒），超时换新号
   "key_name": "auto",             // 新建 Key 的名称（≤64，仅中文/字母/数字/连字符）
   "key_type": "API_KEY_TYPE_TOKEN_PLAN"   // 仅 TOKEN_PLAN / METERED
 }
@@ -256,7 +256,7 @@ pip install -r requirements-quota.txt     # 即 jwcrypto>=1.5
   注册新账号，换发 Key 并落账；**已被注册** → 短信登录接管：吊销该账号名下全部 Key、
   新建一把 Key、再用第二条短信验证码**改密**，之后把新凭据落账。
 - **短信轮询**：每 `sms_poll_interval`（默认 5 秒）拉一次短信，单次取号最多等
-  `sms_poll_timeout`（默认 60 秒）；超时即换一个新号码重试。
+  `sms_poll_timeout`（默认 120 秒）；超时即换一个新号码重试。
 - **号码去重**：每个用过的手机号都会记入 `replenish.json`，已用号码**永不重复取用**
   （连续 20 个已用号码则放弃本轮）。
 - **每日花销上限**：每次取号前先查易码余额，当日消费（当日余额差）达到
@@ -360,7 +360,7 @@ pip install -r requirements-quota.txt     # 即 jwcrypto>=1.5
     "keyword": "商汤",
     "daily_spend_cap": 5,
     "sms_poll_interval": 5,
-    "sms_poll_timeout": 60,
+    "sms_poll_timeout": 120,
     "key_name": "auto",
     "key_type": "API_KEY_TYPE_TOKEN_PLAN"
   },
