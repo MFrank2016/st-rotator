@@ -49,6 +49,7 @@ class ModelTestResult:
     status: str  # "ok" | "error"
     latency_ms: int
     text: str = ""
+    reasoning: str = ""  # 模型思考内容（reasoning_content）；无则空串
     usage: dict[str, Any] | None = None
     error: dict[str, Any] | None = None  # {"code":..., "message":...}
     ttft_ms: int | None = None  # 首字响应时长（流式：首个 token 用时；非流式：None）
@@ -142,6 +143,7 @@ def _run_non_stream(
         status="ok",
         latency_ms=latency_ms,
         text=message.get("content") or "",
+        reasoning=message.get("reasoning_content") or "",
         usage=body.get("usage"),
     )
 
@@ -171,12 +173,14 @@ def _run_stream(
         return _http_error(name, started, resp, safe_text(resp), emit)
     emit({"type": "start", "account": name, "model": req.model})
     pieces: list[str] = []
+    think_parts: list[str] = []
     ttft_ms: int | None = None
     for chunk in StRotator._iter_sse_chunks(resp):
         reasoning = _reasoning_text(chunk)
         if reasoning:
             if ttft_ms is None:
                 ttft_ms = round((time.monotonic() - started) * 1000)
+            think_parts.append(reasoning)
             emit({"type": "reasoning", "account": name, "text": reasoning})
         piece = StRotator._chunk_text(chunk)
         if piece:
@@ -202,6 +206,7 @@ def _run_stream(
         status="ok",
         latency_ms=latency_ms,
         text="".join(pieces),
+        reasoning="".join(think_parts),
         ttft_ms=ttft_ms,
     )
 

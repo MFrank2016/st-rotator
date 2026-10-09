@@ -76,6 +76,14 @@ class DashboardModelTestTest(unittest.TestCase):
         for label in ("首字", "处理", "输入", "缓存", "输出"):
             self.assertIn(label, DASHBOARD_HTML)
 
+    def test_shows_thinking_and_output(self):
+        # 每账号卡片分别展示「思考」与「输出」两个区块，不只是统计数字。
+        self.assertIn("function mtAppend", DASHBOARD_HTML)
+        self.assertIn('class="mt-think"', DASHBOARD_HTML)
+        self.assertIn('class="mt-out"', DASHBOARD_HTML)
+        self.assertIn("思考", DASHBOARD_HTML)
+        self.assertIn("输出", DASHBOARD_HTML)
+
 
 if __name__ == "__main__":
     unittest.main()

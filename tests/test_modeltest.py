@@ -615,6 +615,32 @@ class StreamReasoningTest(unittest.TestCase):
             [e["text"] for e in events if e["type"] == "reasoning"], ["想", "了"]
         )
         self.assertEqual(results[0].text, "答")
+        self.assertEqual(results[0].reasoning, "想了")
+
+
+class NonStreamReasoningTest(unittest.TestCase):
+    """非流式响应里的 message.reasoning_content 也要捕获到 result.reasoning。"""
+
+    def test_nonstream_captures_reasoning(self):
+        config = _config([AccountConfig(name="账号1", api_keys=["sk-1"])])
+        resp = Response(
+            200,
+            {},
+            json.dumps(
+                {
+                    "choices": [
+                        {"message": {"content": "答", "reasoning_content": "想"}}
+                    ],
+                    "usage": {"total_tokens": 3},
+                },
+                ensure_ascii=False,
+            ).encode("utf-8"),
+        )
+        clients: list[_FakeClient] = []
+        req = modeltest.ModelTestRequest(model="m1", accounts=["账号1"], prompt="p")
+        results = _run_test(config, req, clients, _single_factory(clients, [resp]))
+        self.assertEqual(results[0].text, "答")
+        self.assertEqual(results[0].reasoning, "想")
 
 
 class DedupeAccountsTest(unittest.TestCase):

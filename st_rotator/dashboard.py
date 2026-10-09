@@ -1140,7 +1140,12 @@ function modelTestCard(account) {
   card.dataset.mtAccount = account;
   card.innerHTML = "<h3>" + esc(account) +
     ' <span class="pill neutral">测试中</span></h3>' +
-    '<pre class="mono" style="white-space:pre-wrap;max-height:260px;overflow:auto"></pre>' +
+    '<div class="mt-think" style="display:none;margin-bottom:8px">' +
+    '<span class="muted" style="font-size:11.5px">思考</span>' +
+    '<pre class="mono" style="white-space:pre-wrap;max-height:180px;overflow:auto;color:var(--muted);margin:4px 0 0"></pre></div>' +
+    '<div class="mt-out" style="display:none">' +
+    '<span class="muted" style="font-size:11.5px">输出</span>' +
+    '<pre class="mono" style="white-space:pre-wrap;max-height:260px;overflow:auto;margin:4px 0 0"></pre></div>' +
     '<div class="muted mt-metrics" style="font-size:12px;margin-top:6px"></div>';
   S.modelTestGrid.appendChild(card);
   S.modelTestCards[account] = card;
@@ -1157,19 +1162,22 @@ function modelTestMuted(card, text) {
   if (node) node.innerHTML = esc(text);
 }
 
+/* 把一段文本追加到指定区块（思考 / 输出）；区块首次有内容时自动显示。 */
+function mtAppend(card, cls, text) {
+  var box = card.querySelector("." + cls);
+  if (!box) return;
+  box.style.display = "block";
+  box.querySelector("pre").innerHTML += esc(text);
+}
+
 function onModelTestEvent(name, obj) {
   var card = (S.modelTestCards || {})[obj.account];
   if (name === "start") {
     modelTestCard(obj.account);
   } else if (name === "reasoning") {
-    if (card) {
-      card.querySelector("pre").innerHTML += '<span class="muted">' + esc(obj.text) + '</span>';
-    }
+    if (card) mtAppend(card, "mt-think", obj.text);
   } else if (name === "token") {
-    if (card) {
-      var pre = card.querySelector("pre");
-      pre.innerHTML += esc(obj.token);
-    }
+    if (card) mtAppend(card, "mt-out", obj.token);
   } else if (name === "usage") {
     if (card) card._mtUsage = obj.usage || {};
   } else if (name === "done") {
@@ -1222,16 +1230,15 @@ async function parseSSE(response, onEvent) {
 function modelTestRenderResults(results) {
   results.forEach(function (r) {
     var card = modelTestCard(r.account);
-    var pre = card.querySelector("pre");
     if (r.status === "ok") {
       modelTestPill(card, "healthy", "成功");
       modelTestMuted(card, modelTestMetrics(r.usage, r.latency_ms, r.ttft_ms));
-      if (r.text) pre.innerHTML = esc(r.text);
     } else {
       modelTestPill(card, "invalid", "失败");
       modelTestMuted(card, (r.error && r.error.message) || "未知错误");
-      if (r.text) pre.innerHTML = esc(r.text);
     }
+    if (r.reasoning) mtAppend(card, "mt-think", r.reasoning);
+    if (r.text) mtAppend(card, "mt-out", r.text);
   });
 }
 
