@@ -343,6 +343,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div id="samples"></div>
   </div>
 
+  <div class="card" style="margin-bottom:14px">
+    <h2>泄漏守卫 <span class="spacer"></span><span id="leak-guard-badge"></span><span class="muted" id="leak-guard-note" style="text-transform:none;letter-spacing:0;margin-left:8px"></span></h2>
+    <div class="grid kpis" id="leak-guard-stats" style="margin-bottom:14px"></div>
+    <div id="leak-guard-pending"></div>
+    <div class="muted" style="font-size:11.5px;margin-top:8px;line-height:1.6">
+      每 10 分钟扫描一次：若窗口内网关无 token 消耗、却有账号通用池积分被消耗，判定该账号疑似泄漏并记入待轮换清单；
+      每天 02:00 统一「重新登录 → 注销全部 Key → 新建 Key」并更新配置。
+    </div>
+  </div>
+
   <div class="grid two" style="margin-bottom:14px">
     <div class="card">
       <h2>网关接入信息 <span class="spacer"></span><button class="tiny" id="btn-copy-base">复制地址</button></h2>
@@ -969,6 +979,58 @@ var REPLENISH_BADGES = {
   check_error: ["补号失败", "invalid"],
   unavailable: ["不可用", "neutral"]
 };
+
+var LEAK_GUARD_BADGES = {
+  idle: ["正常", "healthy"],
+  flagged: ["发现疑似泄漏", "cooldown"],
+  rotated: ["已轮换", "healthy"],
+  check_error: ["异常", "invalid"],
+  disabled: ["未启用", "neutral"],
+  not_running: ["已开启未运行", "neutral"]
+};
+
+function fmtClock(ts) {
+  if (!ts) return "—";
+  var d = new Date(ts * 1000);
+  return isNaN(d.getTime()) ? "—" : d.toLocaleString();
+}
+
+/* 泄漏守卫：网关空转却有通用池积分消耗 → 记录待轮换账号，每日 02:00 统一轮换。 */
+function renderLeakGuard(state) {
+  var lg = state.leak_guard_status || {};
+  var badgeEl = $("leak-guard-badge");
+  var noteEl = $("leak-guard-note");
+  var known = LEAK_GUARD_BADGES[lg.status] || (lg.status ? [lg.status, "neutral"] : null);
+  if (badgeEl) badgeEl.innerHTML = known ? '<span class="pill ' + known[1] + '">' + esc(known[0]) + "</span>" : "";
+  if (noteEl) noteEl.textContent = lg.message || "";
+  var pendingCount = Number(lg.pending_count || 0);
+  var hh = ("0" + (lg.rotate_hour != null ? lg.rotate_hour : 2)).slice(-2);
+  var mm = ("0" + (lg.rotate_minute != null ? lg.rotate_minute : 0)).slice(-2);
+  var cards = [
+    ["待轮换账号", fmtInt(pendingCount), pendingCount ? "cooldown" : "", "疑似泄漏，等待定时轮换"],
+    ["最近扫描", fmtClock(lg.last_scan_at), "", "窗口 " + fmtInt(lg.window_seconds || 0) + "s"],
+    ["下次轮换", fmtClock(lg.next_rotate_at), "", "每日 " + hh + ":" + mm],
+    ["最近轮换", lg.last_rotate_date || "—", "", "上次统一轮换日期"]
+  ];
+  var host = $("leak-guard-stats");
+  if (host) {
+    host.innerHTML = cards.map(function (c) {
+      return '<div class="card kpi"><div class="label">' + esc(c[0]) + '</div>' +
+        '<div class="value ' + c[2] + '">' + esc(c[1]) + '</div>' +
+        '<div class="label" style="margin-top:2px">' + esc(c[3]) + '</div></div>';
+    }).join("");
+  }
+  var pendHost = $("leak-guard-pending");
+  if (pendHost) {
+    var pend = lg.pending || [];
+    if (!pend.length) {
+      pendHost.innerHTML = '<div class="empty">暂无待轮换账号</div>';
+    } else {
+      pendHost.innerHTML = "<table><tr><th>待轮换账号</th></tr>" +
+        pend.map(function (n) { return "<tr><td>" + esc(n) + "</td></tr>"; }).join("") + "</table>";
+    }
+  }
+}
 
 function renderReplenish(state) {
   var rs = (state.replenish_status || {})._replenish || {};
@@ -1853,6 +1915,7 @@ async function refreshState() {
     $("authbar").classList.remove("show");
     renderKpis(state);
     renderReplenish(state);
+    renderLeakGuard(state);
     renderGateway(state);
     renderModels(state);
     renderModelTest(state);
