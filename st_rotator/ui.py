@@ -313,6 +313,31 @@ class ConsoleState:
         """近 N 小时的 token 用量（按小时分桶，最多保留 30 天）。"""
         return {"hours": hours, "buckets": self.metrics.usage.series(hours=hours)}
 
+    def export_accounts(self) -> dict[str, Any]:
+        """把全部「有登录凭据」的账号导出为导入格式（``手机--用户名--密码--apikey``）。
+
+        每个账号的每一把 Key 一行；取已加载配置（``${ENV}`` 已展开）里的**明文**，
+        以便直接粘回「批量新增」重新导入。缺 user/password 或无 Key 的账号无法用
+        该格式重新导入，跳过并计入 ``skipped``。
+        """
+        lines: list[str] = []
+        accounts = 0
+        skipped = 0
+        for acct in self.config.accounts:
+            keys = [k for k in acct.api_keys if str(k).strip()]
+            if not (acct.user and acct.password) or not keys:
+                skipped += 1
+                continue
+            accounts += 1
+            for key in keys:
+                lines.append(f"{acct.phone}--{acct.user}--{acct.password}--{key}")
+        return {
+            "text": "\n".join(lines),
+            "accounts": accounts,
+            "lines": len(lines),
+            "skipped": skipped,
+        }
+
     def snapshot(
         self, *, reveal_token: bool = False, request_base: str | None = None
     ) -> dict[str, Any]:
@@ -1023,6 +1048,8 @@ class ConsoleState:
                 if path == "/api/quota":
                     force = bool(_first_int(query, "refresh", 0))
                     return UiResponse.json(self.quota_payload(force=force))
+                if path == "/api/accounts/export":
+                    return UiResponse.json(self.export_accounts())
                 return UiResponse.error(f"未知接口 {path}", status=404)
 
             if method == "POST":

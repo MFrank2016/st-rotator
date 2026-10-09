@@ -279,7 +279,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="card" style="margin-bottom:14px">
-    <h2>Key 池 <span class="spacer"></span><span class="muted" id="pool-note" style="text-transform:none;letter-spacing:0"></span><button class="primary" id="btn-import">批量新增</button></h2>
+    <h2>Key 池 <span class="spacer"></span><span class="muted" id="pool-note" style="text-transform:none;letter-spacing:0"></span><button class="tiny" id="btn-export-accounts">复制全部账号</button><button class="primary" id="btn-import">批量新增</button></h2>
     <div id="pool"></div>
 
     <div style="margin-top:15px;padding-top:14px;border-top:1px solid var(--border)">
@@ -1492,6 +1492,19 @@ async function onAddKeys() {
   }
 }
 
+/* 复制全部账号：导出为导入格式（手机--用户名--密码--apikey），可直接粘回「批量新增」。 */
+async function onExportAccounts() {
+  try {
+    var data = await api("/api/accounts/export");
+    if (!data.text) { toast("没有可导出的账号（需配置 user/password）", "err"); return; }
+    var label = "全部账号（" + data.accounts + " 个 / " + data.lines + " 行" +
+      (data.skipped ? "，跳过 " + data.skipped + " 个无凭据" : "") + "）";
+    copyText(data.text, label);
+  } catch (err) {
+    toast(err.message, "err");
+  }
+}
+
 async function onImportKeys() {
   var lines = $("import-lines").value;
   if (!lines.trim()) { toast("请先粘贴内容", "err"); return; }
@@ -1628,6 +1641,7 @@ function bind() {
   $("btn-pause").onclick = onTogglePause;
   $("btn-add").onclick = onAddKeys;
   $("btn-import").onclick = function () { $("import-dialog").showModal(); };
+  $("btn-export-accounts").onclick = onExportAccounts;
   $("btn-import-close").onclick = function () { $("import-dialog").close(); };
   $("btn-import-run").onclick = onImportKeys;
   $("btn-apply-model").onclick = onApplyModel;
