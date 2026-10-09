@@ -1066,6 +1066,33 @@ class ReplenishWorkerTest(unittest.TestCase):
         self.assertEqual(self._status(worker), ReplenishWorker.STATUS_OK)
         self.assertEqual(len(self.persist_calls), 1)
 
+    def test_run_once_skips_when_another_cycle_in_progress(self):
+        # 补号必须串行：上一轮还在跑时，再次 run_once 直接跳过（不并发跑两轮）。
+        registry = self._registry()
+        started = threading.Event()
+        release = threading.Event()
+
+        class _BlockingSms(_FakeSms):
+            def left_amount(self) -> float:
+                result = super().left_amount()  # 先记一次 left_amount
+                started.set()
+                release.wait(3)
+                return result
+
+        sms = _BlockingSms(phones=["13800000001"])
+        worker = self._worker(
+            sms=sms, authn=_FakeAuthn(), keys=_FakeKeys(), registry=registry, target=1
+        )
+        thread = threading.Thread(target=worker.run_once)
+        thread.start()
+        try:
+            self.assertTrue(started.wait(2))
+            worker.run_once()  # 上一轮未结束 -> 应被跳过
+            self.assertEqual(len(sms.left_calls), 1)
+        finally:
+            release.set()
+            thread.join(3)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1002,9 +1002,11 @@ class ConsoleState:
             if self.config.replenish.enabled and available < target:
                 if self.replenish is None and self.replenish_factory is not None:
                     self.replenish = self.replenish_factory()
-                run = getattr(self.replenish, "run_once", None)
-                if run is not None:
-                    run()
+                # 只唤醒 worker 的线程去跑，绝不在请求线程里跑补号——否则会与
+                # worker 自身的循环并发（补号必须串行、一个一个来）。
+                wake = getattr(self.replenish, "wake", None)
+                if wake is not None:
+                    wake()
                 self._log(f"[补号] 可用 {available} < 目标 {target}，已开启自动补号")
         except Exception:  # noqa: BLE001 - 对账失败不阻止保存
             pass

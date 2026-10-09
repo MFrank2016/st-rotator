@@ -260,6 +260,7 @@ class ReplenishWorker:
         self._thread: threading.Thread | None = None
         self._status: dict[str, dict[str, str]] = {}
         self._status_lock = threading.Lock()
+        self._cycle_lock = threading.Lock()  # 保证补号串行：同一时刻只允许一轮
         self._active_phone = ""  # 最近一次尝试取到的号码（审计失败记录用）
 
     # ------------------------------------------------------------ 线程生命周期
@@ -319,8 +320,19 @@ class ReplenishWorker:
             return {name: dict(entry) for name, entry in self._status.items()}
 
     # ------------------------------------------------------------ 核心
+    def wake(self) -> None:
+        """唤醒后台循环立即跑一轮（在 worker 自己的线程里跑，不在调用方线程里跑）。"""
+        self._wake.set()
+
     def run_once(self) -> None:
-        """跑一轮补充；任何异常收敛为 check_error，绝不抛出（线程循环永续）。"""
+        """跑一轮补充；任何异常收敛为 check_error，绝不抛出（线程循环永续）。
+
+        串行保证：补号必须一个一个来——同一时刻只允许一轮在跑；上一轮未结束时，
+        本次调用直接跳过（不并发跑两轮）。
+        """
+        if not self._cycle_lock.acquire(blocking=False):
+            self._log("[补号] 上一轮仍在进行，跳过本轮")
+            return
         try:
             self._cycle()
         except Exception as exc:  # noqa: BLE001 - 兜底：循环线程永不中断
@@ -329,7 +341,8 @@ class ReplenishWorker:
                 f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT],
                 log_line=f"[补号] 本轮异常：{type(exc).__name__}: {exc}"[:DETAIL_LIMIT],
             )
-
+        finally:
+            self._cycle_lock.release()
     def _loop(self) -> None:
         """先立即跑一轮，再按 interval 周期循环。
 

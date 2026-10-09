@@ -499,6 +499,20 @@ class SmsCheckRunner:
         return 99.0
 
 
+class _WakeWorker(_StoppableWorker):
+    """记录 wake / run_once 的假 worker：验证对账只唤醒、不在请求线程里跑补号。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.woke = 0
+        self.ran = 0
+
+    def wake(self) -> None:
+        self.woke += 1
+
+    def run_once(self) -> None:
+        self.ran += 1
+
 class SaveTimeReplenishTest(unittest.TestCase):
     """保存补号配置后的 token 校验与立即对账（失败不破坏落盘）。"""
 
@@ -559,15 +573,11 @@ class SaveTimeReplenishTest(unittest.TestCase):
 
     def test_save_triggers_immediate_reconcile_when_short(self):
         with tempfile.TemporaryDirectory() as tmp:
-            worker = _StoppableWorker()
+            worker = _WakeWorker()
             logs: list[str] = []
             store = _load_store(
                 tmp,
-                replenish={
-                    "enabled": True,
-                    "target_count": 3,
-                    "sms_token": "tok",
-                },
+                replenish={"enabled": True, "target_count": 3, "sms_token": "tok"},
             )
             rotator = _FakeRotator(store.config)
             console = ConsoleState(store=store, rotator=rotator)  # type: ignore[arg-type]
@@ -576,6 +586,8 @@ class SaveTimeReplenishTest(unittest.TestCase):
             resp = console.set_options({"replenish": {"target_count": 5}})
             self.assertEqual(resp.status, 200)
             self.assertTrue(any("已开启自动补号" in line for line in logs), logs)
+            self.assertEqual(worker.woke, 1)  # 唤醒 worker
+            self.assertEqual(worker.ran, 0)  # 不在请求线程里跑（避免与 worker 并发）
 
     def test_reconcile_failure_never_breaks_save(self):
         with tempfile.TemporaryDirectory() as tmp:
