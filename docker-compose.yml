@@ -13,6 +13,8 @@ services:
       SENSENOVA_KEY_1: "${SENSENOVA_KEY_1:-}"
       SENSENOVA_KEY_2: "${SENSENOVA_KEY_2:-}"
       SENSENOVA_KEY_3: "${SENSENOVA_KEY_3:-}"
+      # 容器时区：决定日志时间、补号「今日」边界与泄漏守卫 02:00 轮换的本地时间
+      TZ: "${TZ:-Asia/Shanghai}"
     volumes:
       # 挂载目录需包含 config.json（其中 console_token 写 "${CONSOLE_TOKEN}"），且对 uid 10001 可写
       - ./data:/data
