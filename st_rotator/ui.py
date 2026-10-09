@@ -280,6 +280,9 @@ class ConsoleState:
     replenish: ReplenishWorker | None = None
     replenish_factory: Callable[[], ReplenishWorker | None] | None = None
     registry: Registry | None = None
+    sms_token_ok: bool | None = (
+        None  # 最近一次保存时的易码 Token 校验结果（None=未配置）
+    )
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     # ------------------------------------------------------------ 只读
@@ -399,6 +402,8 @@ class ConsoleState:
                     "sms_poll_timeout": self.config.replenish.sms_poll_timeout,
                     "key_name": self.config.replenish.key_name,
                     "key_type": self.config.replenish.key_type,
+                    "sms_token_configured": bool(self.config.replenish.sms_token),
+                    "sms_token_ok": self.sms_token_ok,
                 },
             },
         }
@@ -1100,6 +1105,22 @@ class ConsoleState:
                 if path == "/api/quota":
                     force = bool(_first_int(query, "refresh", 0))
                     return UiResponse.json(self.quota_payload(force=force))
+                if path == "/api/replenish/registrations":
+                    if self.registry is None:
+                        return UiResponse.json(
+                            {"items": [], "total": 0, "page": 1, "size": 20}
+                        )
+                    return UiResponse.json(
+                        self.registry.registrations_page(
+                            page=_clamp_int(
+                                _first_int(query, "page", 1), 1, 1, 2**31 - 1
+                            ),
+                            size=_clamp_int(_first_int(query, "size", 20), 20, 1, 200),
+                            q=_first_str(query, "q", ""),
+                            status=_first_str(query, "status", ""),
+                            kind=_first_str(query, "kind", ""),
+                        )
+                    )
                 if path == "/api/accounts/export":
                     return UiResponse.json(self.export_accounts())
                 return UiResponse.error(f"未知接口 {path}", status=404)
@@ -1181,6 +1202,17 @@ def _first_int(
         return int(values[0])
     except (TypeError, ValueError, IndexError):
         return default
+
+
+def _first_str(
+    query: Mapping[str, Sequence[str]] | None, name: str, default: str
+) -> str:
+    if not query:
+        return default
+    values = query.get(name)
+    if not values:
+        return default
+    return str(values[0])
 
 
 def _clamp_int(value: Any, default: int, low: int, high: int) -> int:

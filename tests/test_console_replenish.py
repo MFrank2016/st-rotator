@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 from st_rotator.config import ConfigStore
+from st_rotator.registry import Registry
 from st_rotator.ui import ConsoleState
 
 
@@ -401,6 +402,87 @@ class SyncReplenishTest(unittest.TestCase):
             resp = console.set_options({"replenish": {"target_count": 6}})
             self.assertEqual(resp.status, 200)
             self.assertEqual(worker.calls[-1]["target"], 6)
+
+
+class RegistrationsApiTest(unittest.TestCase):
+    """GET /api/replenish/registrations：分页 + 过滤 + 缺 registry 时的安全空值。"""
+
+    def test_route_returns_page_from_registry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reg = Registry.load(Path(tmp) / "state.json")
+            reg.record_registration(
+                created_at=1.0,
+                phone="13800000001",
+                username="a1",
+                password="p",
+                is_new=True,
+                password_reset=False,
+                success=True,
+                reason="",
+                detail="",
+            )
+            reg.record_registration(
+                created_at=2.0,
+                phone="13800000002",
+                username="a2",
+                password="p",
+                is_new=False,
+                password_reset=True,
+                success=True,
+                reason="",
+                detail="",
+            )
+            reg.record_registration(
+                created_at=3.0,
+                phone="13800000003",
+                username="a3",
+                password="p",
+                is_new=True,
+                password_reset=False,
+                success=False,
+                reason="captcha_required",
+                detail="需要滑块",
+            )
+            console = _console(tmp, registry=reg)
+            resp = console.handle(
+                "GET",
+                "/api/replenish/registrations",
+                query={"page": ["1"], "size": ["2"], "status": ["ok"], "q": ["138"]},
+            )
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(resp.payload["total"], 2)
+            self.assertEqual(len(resp.payload["items"]), 2)
+            self.assertEqual(resp.payload["items"][0]["phone"], "13800000002")
+            self.assertEqual(resp.payload["page"], 1)
+            self.assertEqual(resp.payload["size"], 2)
+
+    def test_route_without_registry_returns_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            console = _console(tmp)
+            resp = console.handle("GET", "/api/replenish/registrations")
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(
+                resp.payload, {"items": [], "total": 0, "page": 1, "size": 20}
+            )
+
+
+class SnapshotSmsTokenFlagsTest(unittest.TestCase):
+    """snapshot options.replenish：sms_token_configured / sms_token_ok。"""
+
+    def test_snapshot_exposes_token_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            console = _console(tmp, replenish_cfg={"sms_token": "tok", "enabled": True})
+            console.sms_token_ok = False
+            opts = console.snapshot()["options"]["replenish"]
+            self.assertTrue(opts["sms_token_configured"])
+            self.assertFalse(opts["sms_token_ok"])
+
+    def test_snapshot_token_ok_defaults_none_without_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            console = _console(tmp)
+            opts = console.snapshot()["options"]["replenish"]
+            self.assertFalse(opts["sms_token_configured"])
+            self.assertIsNone(opts["sms_token_ok"])
 
 
 if __name__ == "__main__":
