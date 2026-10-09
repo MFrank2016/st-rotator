@@ -248,7 +248,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <h2>自动补号 <span class="spacer"></span><span id="replenish-badge"></span><span class="muted" id="replenish-note" style="text-transform:none;letter-spacing:0;margin-left:8px"></span></h2>
       <div class="grid kpis" id="replenish-stats" style="margin-bottom:14px"></div>
       <div class="row" style="margin-bottom:12px;align-items:flex-end;flex-wrap:wrap;padding-top:14px;border-top:1px solid var(--border)">
-        <label class="field" style="width:auto;margin-bottom:0;flex-direction:row;align-items:center;gap:6px">
+        <label class="field" style="width:auto;margin-bottom:0;flex-direction:row;align-items:center;gap:6px;white-space:nowrap">
           <input id="opt-rp-enabled" type="checkbox" style="width:auto;margin:0">
           <span style="font-weight:600">启用自动补号</span>
         </label>
@@ -280,7 +280,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <span>新 Key 名称</span>
           <input id="opt-rp-keyname" type="text">
         </label>
-        <label class="field" style="width:158px;margin-bottom:0">
+        <label class="field" style="width:232px;margin-bottom:0">
           <span>新 Key 类型</span>
           <select id="opt-rp-keytype">
             <option value="API_KEY_TYPE_TOKEN_PLAN">API_KEY_TYPE_TOKEN_PLAN</option>
