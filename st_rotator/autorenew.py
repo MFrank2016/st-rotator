@@ -223,6 +223,66 @@ class HttpKeyManager:
         )
 
 
+@dataclass(frozen=True)
+class RotationOutcome:
+    """一次账号轮换的结果。
+
+    ``status`` 取 ``AutoRenewWorker.STATUS_*`` 之一（ok / password_error /
+    check_error / unavailable）；本结构只承载结果，不负责写状态或打日志。
+    """
+
+    ok: bool
+    status: str
+    message: str = ""
+
+
+def rotate_account(
+    account: AccountConfig,
+    *,
+    login: Callable[[str, str], TokenBundle],
+    keys: KeyTransport,
+    persist: Callable[[str, Sequence[str], str], None],
+    key_name: str = "auto",
+    key_type: str = "API_KEY_TYPE_TOKEN_PLAN",
+    on_login: Callable[[], None] | None = None,
+) -> RotationOutcome:
+    """登录该账号 → 注销平台侧全部 key → 新建一把 → persist(account.name, old_keys, new_key)。
+
+    平台操作顺序固定为「先 list+delete-all 后 create」（历史 bug：反序会把刚建的 key 一并删掉）。
+    异常分类：QuotaAuthError→password_error；QuotaUnavailable→unavailable；
+    其它登录异常或平台异常→check_error；成功→ok。**不打印任何日志、不写状态**；
+    ``on_login`` 在登录成功后、平台操作前回调（供调用方打印「开始轮换」等）。
+    """
+    try:
+        bundle = login(account.user, account.password)
+    except QuotaAuthError as exc:
+        # 凭据/密码问题：不调用任何平台操作
+        return RotationOutcome(False, "password_error", str(exc))
+    except QuotaUnavailable:
+        # 缺依赖：静默返回固定文案
+        return RotationOutcome(False, "unavailable", "缺 jwcrypto 等依赖，无法登录")
+    except Exception as exc:  # noqa: BLE001 - 瞬时失败（网络/风控），下次再试
+        return RotationOutcome(
+            False, "check_error", f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT]
+        )
+    if on_login is not None:
+        on_login()
+    try:
+        for item in keys.list_keys(bundle.access_token):
+            keys.delete_key(bundle.access_token, key_id=item.id)
+        created = keys.create_key(
+            bundle.access_token,
+            displayname=key_name,
+            key_type=key_type,
+        )
+    except Exception as exc:  # noqa: BLE001 - 平台瞬时失败
+        return RotationOutcome(
+            False, "check_error", f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT]
+        )
+    persist(account.name, list(account.api_keys), created.api_key)
+    return RotationOutcome(True, "ok", "")
+
+
 class AutoRenewWorker:
     """定时检测 Key 失效并自动轮换。
 
@@ -414,54 +474,33 @@ class AutoRenewWorker:
 
     def _rotate(self, account: AccountConfig) -> None:
         """登录 → 先 delete-all 后 create → persist；异常分类到对应状态。"""
-        try:
-            bundle = self._login(account.user, account.password)
-        except QuotaAuthError as exc:
-            # 凭据/密码问题：不调用任何平台操作，状态记 password_error
+        outcome = rotate_account(
+            account,
+            login=self._login,
+            keys=self._keys,
+            persist=self._persist,
+            key_name=self._key_name,
+            key_type=self._key_type,
+            on_login=lambda: self._log(f"账号 {account.name}：key 失效，开始轮换"),
+        )
+        if outcome.status == self.STATUS_PASSWORD_ERROR:
             self._set_status(
                 account.name,
                 self.STATUS_PASSWORD_ERROR,
-                str(exc),
+                outcome.message,
                 log_line=f"账号 {account.name}：密码错误",
             )
-            return
-        except QuotaUnavailable:
-            # 缺依赖：静默跳过，不记日志
-            self._set_status(
-                account.name, self.STATUS_UNAVAILABLE, "缺 jwcrypto 等依赖，无法登录"
-            )
-            return
-        except Exception as exc:  # noqa: BLE001 - 瞬时失败（网络/风控），下次再试
+        elif outcome.status == self.STATUS_UNAVAILABLE:
+            self._set_status(account.name, self.STATUS_UNAVAILABLE, outcome.message)
+        elif outcome.status == self.STATUS_CHECK_ERROR:
+            self._set_status(account.name, self.STATUS_CHECK_ERROR, outcome.message)
+        else:
             self._set_status(
                 account.name,
-                self.STATUS_CHECK_ERROR,
-                f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT],
+                self.STATUS_OK,
+                "",
+                log_line=f"账号 {account.name}：轮换成功，Key 已更新",
             )
-            return
-        # 登录成功后日志「开始轮换」：登录失败（含 unavailable）时保持静默
-        self._log(f"账号 {account.name}：key 失效，开始轮换")
-        try:
-            for item in self._keys.list_keys(bundle.access_token):
-                self._keys.delete_key(bundle.access_token, key_id=item.id)
-            created = self._keys.create_key(
-                bundle.access_token,
-                displayname=self._key_name,
-                key_type=self._key_type,
-            )
-        except Exception as exc:  # noqa: BLE001 - 平台瞬时失败
-            self._set_status(
-                account.name,
-                self.STATUS_CHECK_ERROR,
-                f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT],
-            )
-            return
-        self._persist(account.name, list(account.api_keys), created.api_key)
-        self._set_status(
-            account.name,
-            self.STATUS_OK,
-            "",
-            log_line=f"账号 {account.name}：轮换成功，Key 已更新",
-        )
 
     def _set_status(
         self, name: str, status: str, message: str, *, log_line: str | None = None

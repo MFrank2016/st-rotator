@@ -289,6 +289,32 @@ class AutoRenewWorkerTest(unittest.TestCase):
         self.assertEqual(keys.ops, ["list", "delete"])
         self.assertEqual(self.persist_calls, [])
 
+    def test_platform_failure_still_logs_start_rotation(self):
+        """平台操作中途失败时，「开始轮换」日志仍应在登录成功后、平台操作前打出（回归）。"""
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-bad"], user="u1", password="p1"
+        )
+        probe, _ = self._probe_stub({"sk-bad": ("invalid", "401")})
+        login = _FakeLogin()
+        keys = _FakeKeys()
+        keys.list_result = [
+            KeyInfo(
+                id="old-1",
+                displayname="old",
+                api_key="sk-old",
+                key_type="API_KEY_TYPE_TOKEN_PLAN",
+                create_time="t1",
+            )
+        ]
+        keys.delete_exc = autorenew.KeyApiError(500, "server error")
+        worker = self._worker(accounts=[account], probe=probe, login=login, keys=keys)
+        worker.run_once()
+        self.assertEqual(
+            worker.account_status()["账号1"]["status"],
+            AutoRenewWorker.STATUS_CHECK_ERROR,
+        )
+        self.assertTrue(any("开始轮换" in line for line in self.log_lines[0]))
+
     # ------------------------------------------------------------ 8. 全部 unknown
     def test_all_unknown_no_rotation_status_ok(self):
         account = AccountConfig(
