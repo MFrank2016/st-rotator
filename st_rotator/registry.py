@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -45,6 +46,37 @@ def _as_balance(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise RegistryError(f"spend 字段必须是数值或 null，当前为 {value!r}")
     return float(value)
+
+
+def _as_float(value: Any) -> float:
+    """宽松地把 JSON 数值规范成 ``float``；不合法回退 0.0。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return float(value)
+
+
+def _migrate_registration(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """把旧格式注册审计（``name`` / ``outcome``）迁移成新的 9 键契约。
+
+    旧格式无法区分「新注册」与「接管」，也拿不回用户名 / 密码，故 ``is_new`` /
+    ``password_reset`` 一律 False、``username`` / ``password`` 留空；原 ``outcome``
+    原样放进 ``reason`` 以便追溯，``success`` 取 ``outcome == "ok"``。已是新格式的
+    记录原样返回。
+    """
+    if "success" in entry:
+        return dict(entry)
+    outcome = str(entry.get("outcome") or "")
+    return {
+        "created_at": _as_float(entry.get("created_at")),
+        "phone": str(entry.get("phone") or ""),
+        "username": "",
+        "password": "",
+        "is_new": False,
+        "password_reset": False,
+        "success": outcome == "ok",
+        "reason": outcome,
+        "detail": "",
+    }
 
 
 class Registry:
@@ -105,8 +137,14 @@ class Registry:
             start_balance=_as_balance(spend_raw.get("start_balance")),
             last_balance=_as_balance(spend_raw.get("last_balance")),
         )
-        reg._registrations = [dict(e) for e in regs_raw]
+        reg._registrations = [_migrate_registration(e) for e in regs_raw]
         reg._rotations = _as_count(raw.get("rotations"))
+        if any("success" not in e for e in regs_raw):
+            # 旧格式记录已在内存迁移；尽力落盘使其持久化（写失败不影响加载）
+            try:
+                reg.save()
+            except OSError as exc:  # noqa: BLE001 - 迁移落盘失败不应阻塞加载
+                print(f"[警告] 注册审计迁移落盘失败：{exc}", file=sys.stderr)
         return reg
 
     def save(self) -> None:

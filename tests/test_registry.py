@@ -410,8 +410,9 @@ class RegistrationAuditTest(unittest.TestCase):
         self.assertEqual(page["page"], 1)
         self.assertEqual(page["size"], 1)
 
-    def test_old_records_without_new_keys_still_load_and_count_as_fail(self):
-        # 磁盘上旧版记录（无新字段）必须能加载，不因缺键而拒绝
+    def test_legacy_records_are_migrated_to_new_contract(self):
+        # 旧版记录（outcome / name）加载时迁移成新 9 键契约：success 由 outcome 派生，
+        # 并落盘（一次性 schema 迁移），不再被误当作失败。
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         path = Path(tmp.name) / "state.json"
@@ -422,21 +423,44 @@ class RegistrationAuditTest(unittest.TestCase):
                     "used_phones": [],
                     "spend": {"date": "", "start_balance": None, "last_balance": None},
                     "registrations": [
+                        {"name": "账号0", "phone": "130", "outcome": "ok", "created_at": 1.0},
                         {
-                            "name": "账号0",
-                            "phone": "130",
-                            "outcome": "ok",
-                            "created_at": 1.0,
-                        }
+                            "name": "账号1",
+                            "phone": "131",
+                            "outcome": "takeover_password_unset",
+                            "created_at": 2.0,
+                        },
                     ],
                 }
             ),
             encoding="utf-8",
         )
         reg = Registry.load(path)
-        self.assertEqual(len(reg.registrations()), 1)
-        self.assertEqual(reg.count_registrations(True), 0)  # 缺 success 键 -> 视为失败
+        items = reg.registrations()  # 最新在前
+        self.assertEqual(len(items), 2)
+        for entry in items:
+            self.assertEqual(
+                set(entry),
+                {
+                    "created_at",
+                    "phone",
+                    "username",
+                    "password",
+                    "is_new",
+                    "password_reset",
+                    "success",
+                    "reason",
+                    "detail",
+                },
+            )
+        # success 由 outcome 派生：ok -> True，takeover_password_unset -> False
+        self.assertEqual(reg.count_registrations(True), 1)
         self.assertEqual(reg.count_registrations(False), 1)
-        self.assertEqual(
-            reg.registrations_page(q="账号0")["total"], 0
-        )  # username 缺 -> 不命中
+        self.assertEqual(items[0]["reason"], "takeover_password_unset")
+        self.assertFalse(items[0]["success"])
+        self.assertTrue(items[1]["success"])
+        self.assertEqual(items[1]["phone"], "130")
+        # 迁移已落盘：旧键（outcome/name）消失，新键（success）就位
+        reloaded = json.loads(path.read_text(encoding="utf-8"))
+        self.assertTrue(all("success" in e for e in reloaded["registrations"]))
+        self.assertTrue(all("outcome" not in e for e in reloaded["registrations"]))
