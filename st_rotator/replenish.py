@@ -67,9 +67,24 @@ _PASSWORD_CLASSES = (
 )
 _PW_MIN, _PW_MAX = 8, 32
 
+# AuthnError.reason -> 注册审计 reason（稳定 snake_case 分类；未知 reason 归 authn_error）
+_AUTHN_EXC_REASONS = {
+    "incorrect_sms_code": "sms_code_error",
+    "challenge_expired": "login_error",
+    "username_taken": "register_error",
+}
+
 
 class _StopCycle(Exception):
-    """硬性终止本轮补充（blocked_cap / captcha / check_error / 去重耗尽）。"""
+    """硬性终止本轮补充（blocked_cap / captcha / check_error / 去重耗尽）。
+
+    ``record`` 携带该次尝试的注册审计字段（见 ``ReplenishWorker._record_registration``），
+    由 ``_cycle`` 统一落审计，避免在抛错点四处散落写审计的代码。
+    """
+
+    def __init__(self, *, record: dict[str, Any] | None = None) -> None:
+        super().__init__()
+        self.record = record
 
 
 def count_unavailable(
@@ -243,6 +258,7 @@ class ReplenishWorker:
         self._thread: threading.Thread | None = None
         self._status: dict[str, dict[str, str]] = {}
         self._status_lock = threading.Lock()
+        self._active_phone = ""  # 最近一次尝试取到的号码（审计失败记录用）
 
     # ------------------------------------------------------------ 线程生命周期
     def start(self) -> None:
@@ -350,21 +366,42 @@ class ReplenishWorker:
                     continue
                 soft_retries += 1
                 if soft_retries >= SOFT_RETRY_MAX:
+                    self._record_registration(
+                        phone=self._active_phone,
+                        username="",
+                        password="",
+                        is_new=False,
+                        password_reset=False,
+                        success=False,
+                        reason="sms_timeout",
+                        detail=f"连续 {SOFT_RETRY_MAX} 次短信超时，本轮放弃",
+                    )
                     self._set_status(
                         self.STATUS_CHECK_ERROR,
                         f"连续 {SOFT_RETRY_MAX} 次短信超时，本轮放弃",
                         log_line=f"[补号] 连续 {SOFT_RETRY_MAX} 次短信超时，本轮放弃",
                     )
                     return
-            except _StopCycle:
+            except _StopCycle as stop:
+                if stop.record is not None:
+                    self._record_registration(**stop.record)
                 return
             except Exception as exc:  # noqa: BLE001 - 单次迭代失败不拖垮循环
+                detail = f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT]
+                self._record_registration(
+                    phone=self._active_phone,
+                    username="",
+                    password="",
+                    is_new=False,
+                    password_reset=False,
+                    success=False,
+                    reason=self._failure_reason(exc),
+                    detail=detail,
+                )
                 self._set_status(
                     self.STATUS_CHECK_ERROR,
-                    f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT],
-                    log_line=f"[补号] 本轮补充出错：{type(exc).__name__}: {exc}"[
-                        :DETAIL_LIMIT
-                    ],
+                    detail,
+                    log_line=f"[补号] 本轮补充出错：{detail}",
                 )
                 return
 
@@ -394,6 +431,7 @@ class ReplenishWorker:
 
         # b. 取号 + 去重（已用号码跳过，不 claim；连续 20 个已用即放弃）
         phone = self._fetch_fresh_phone()
+        self._active_phone = phone
         self._registry.claim_phone(phone)
         self._log(f"[补号] 已取号 {phone}")
 
@@ -406,7 +444,18 @@ class ReplenishWorker:
                     "需要滑块验证码（未配置 solver）",
                     log_line=f"[补号] 号码 {phone} 需要滑块验证码（未配置 solver），本轮停止",
                 )
-                raise _StopCycle()
+                raise _StopCycle(
+                    record=dict(
+                        phone=phone,
+                        username="",
+                        password="",
+                        is_new=False,
+                        password_reset=False,
+                        success=False,
+                        reason="captcha_required",
+                        detail="需要滑块验证码（未配置 solver）",
+                    )
+                )
             code_key = self._captcha_solver()
             token_code = self._authn.send_sms_code(phone, code_key=code_key)
             if token_code is None:
@@ -415,7 +464,18 @@ class ReplenishWorker:
                     "滑块验证后仍未下发验证码",
                     log_line=f"[补号] 号码 {phone} 滑块验证后仍未下发验证码，本轮停止",
                 )
-                raise _StopCycle()
+                raise _StopCycle(
+                    record=dict(
+                        phone=phone,
+                        username="",
+                        password="",
+                        is_new=False,
+                        password_reset=False,
+                        success=False,
+                        reason="captcha_required",
+                        detail="滑块验证后仍未下发验证码",
+                    )
+                )
         self._log(f"[补号] 已向 {phone} 发送短信验证码，等待接收…")
 
         # d. 等短信；超时 -> 软重试（换新号，重跑 spend gate）
@@ -479,6 +539,14 @@ class ReplenishWorker:
             bundle.access_token, displayname=self._key_name, key_type=self._key_type
         )
         self._persist(user, phone, password, created.api_key)
+        self._record_registration(
+            phone=phone,
+            username=user,
+            password=password,
+            is_new=True,
+            password_reset=False,
+            success=True,
+        )
         self._set_status(
             self.STATUS_OK,
             "",
@@ -497,7 +565,18 @@ class ReplenishWorker:
             f"取号去重超过 {DEDUPE_MAX} 次",
             log_line=f"[补号] 取号去重超过 {DEDUPE_MAX} 次，本轮放弃",
         )
-        raise _StopCycle()
+        raise _StopCycle(
+            record=dict(
+                phone="",
+                username="",
+                password="",
+                is_new=False,
+                password_reset=False,
+                success=False,
+                reason="phone_unavailable",
+                detail=f"取号去重超过 {DEDUPE_MAX} 次，本轮放弃",
+            )
+        )
 
     def _mint_challenge(self) -> tuple[str, str]:
         """拿 login challenge；challenge_expired 时重 mint 一次。"""
@@ -526,7 +605,18 @@ class ReplenishWorker:
                 f"用户名重试仍失败: {exc.detail}"[:DETAIL_LIMIT],
                 log_line=f"[补号] 用户名重试仍失败：{exc.detail}"[:DETAIL_LIMIT],
             )
-            raise _StopCycle() from exc
+            raise _StopCycle(
+                record=dict(
+                    phone=self._active_phone,
+                    username=new_user,
+                    password="",
+                    is_new=True,
+                    password_reset=False,
+                    success=False,
+                    reason="register_error",
+                    detail=f"用户名重试仍失败：{exc.detail}"[:DETAIL_LIMIT],
+                )
+            ) from exc
         return new_user, redirect
 
     # ------------------------------------------------------------ S2 接管
@@ -551,7 +641,18 @@ class ReplenishWorker:
                     "接管：smsLogin 无 redirect 且无租户",
                     log_line=f"[补号] 号码 {phone} 接管失败：smsLogin 无 redirect 且无租户",
                 )
-                raise _StopCycle()
+                raise _StopCycle(
+                    record=dict(
+                        phone=phone,
+                        username="",
+                        password="",
+                        is_new=False,
+                        password_reset=False,
+                        success=False,
+                        reason="login_error",
+                        detail="接管：smsLogin 无 redirect 且无租户",
+                    )
+                )
             nxt = self._authn.login_next(
                 challenge=challenge,
                 username=str(tenant.get("username") or ""),
@@ -565,7 +666,18 @@ class ReplenishWorker:
                 "接管：登录未返回 redirect",
                 log_line=f"[补号] 号码 {phone} 接管失败：登录未返回 redirect",
             )
-            raise _StopCycle()
+            raise _StopCycle(
+                record=dict(
+                    phone=phone,
+                    username="",
+                    password="",
+                    is_new=False,
+                    password_reset=False,
+                    success=False,
+                    reason="login_error",
+                    detail="接管：登录未返回 redirect",
+                )
+            )
         bundle = self._authn.exchange_code(redirect, verifier)
         user_id = jwt_sub(bundle.access_token)
         if not user_id:
@@ -574,7 +686,18 @@ class ReplenishWorker:
                 "接管后无法解析 user_id",
                 log_line=f"[补号] 号码 {phone} 接管失败：无法解析 user_id",
             )
-            raise _StopCycle()
+            raise _StopCycle(
+                record=dict(
+                    phone=phone,
+                    username="",
+                    password="",
+                    is_new=False,
+                    password_reset=False,
+                    success=False,
+                    reason="login_error",
+                    detail="接管后无法解析 user_id",
+                )
+            )
         # 先吊销全部旧 key（该手机号归我们所有，旧凭据一律作废）。
         for item in self._keys.list_keys(bundle.access_token):
             self._keys.delete_key(bundle.access_token, key_id=item.id)
@@ -606,7 +729,18 @@ class ReplenishWorker:
                 "改密短信超时，账号已接管但未改密",
                 log_line=f"[补号] 号码 {phone} 改密短信超时，账号已接管但未改密",
             )
-            raise _StopCycle()
+            raise _StopCycle(
+                record=dict(
+                    phone=phone,
+                    username="",
+                    password=new_pw,
+                    is_new=False,
+                    password_reset=False,
+                    success=True,
+                    reason="",
+                    detail="改密短信超时，账号已接管但未改密",
+                )
+            )
         self._authn.change_password(
             bundle.access_token,
             user_id,
@@ -620,12 +754,59 @@ class ReplenishWorker:
         except Exception:  # noqa: BLE001 - 用户名可缺省，不影响落账
             username = ""
         self._persist(username, phone, new_pw, created.api_key)
+        self._record_registration(
+            phone=phone,
+            username=username,
+            password=new_pw,
+            is_new=False,
+            password_reset=True,
+            success=True,
+        )
         self._set_status(
             self.STATUS_OK,
             "",
             log_line=f"[补号] 已接管账号 {username or phone}（{phone}）并改密",
         )
         return True
+
+    # ------------------------------------------------------------ 审计辅助
+    def _record_registration(
+        self,
+        *,
+        phone: str,
+        username: str,
+        password: str,
+        is_new: bool,
+        password_reset: bool,
+        success: bool,
+        reason: str = "",
+        detail: str = "",
+    ) -> None:
+        """登记一条注册审计（成功与失败每次尝试都记）。
+
+        写审计失败（磁盘满等）绝不能拖垮补号循环，故吞掉异常只留日志。
+        """
+        try:
+            self._registry.record_registration(
+                created_at=self._clock(),
+                phone=phone,
+                username=username,
+                password=password,
+                is_new=bool(is_new),
+                password_reset=bool(password_reset),
+                success=bool(success),
+                reason=reason,
+                detail=str(detail)[:DETAIL_LIMIT],
+            )
+        except Exception:  # noqa: BLE001 - 审计写盘失败不中断补号
+            self._log("[补号] 注册审计写盘失败，已跳过本次登记")
+
+    @staticmethod
+    def _failure_reason(exc: Exception) -> str:
+        """把未被子流程显式归类的一次性异常映射成稳定失败分类。"""
+        if isinstance(exc, AuthnError):
+            return _AUTHN_EXC_REASONS.get(exc.reason, "authn_error")
+        return "unknown"
 
     # ------------------------------------------------------------ 状态
     def _set_status(

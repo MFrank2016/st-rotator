@@ -35,6 +35,7 @@ from st_rotator.quota import TokenBundle
 from st_rotator.registry import Registry
 from st_rotator.replenish import (
     ReplenishWorker,
+    SOFT_RETRY_MAX,
     count_available,
     count_unavailable,
     generate_credentials,
@@ -88,6 +89,24 @@ class _JumpClock:
         if self._calls < 3:
             return 0.0
         return 999.0
+
+
+def _advancing_clock() -> Callable[[], float]:
+    """每次调用递增 1000 秒：单次尝试内必超时，且跨尝试继续推进。"""
+    calls = {"n": 0}
+
+    def clock() -> float:
+        calls["n"] += 1
+        return float(calls["n"]) * 1000.0
+
+    return clock
+
+
+class _FailingRegistry(Registry):
+    """record_registration 抛错：审计写盘失败不能拖垮补号循环。"""
+
+    def record_registration(self, **kwargs) -> None:
+        raise OSError("磁盘满")
 
 
 class _FakeSms:
@@ -887,6 +906,164 @@ class ReplenishWorkerTest(unittest.TestCase):
         worker.run_once()
         self.assertEqual(self._status(worker), ReplenishWorker.STATUS_OK)
         self.assertEqual(self.persist_calls[0][1], "13800000014")
+
+    # ------------------------------------------------------------ 15. 审计登记
+    def test_register_success_records_audit(self):
+        registry = self._registry()
+        sms = _FakeSms(phones=["13800000001"])
+        worker = self._worker(
+            sms=sms, authn=_FakeAuthn(), keys=_FakeKeys(), registry=registry, target=1
+        )
+        worker.run_once()
+        (entry,) = registry.registrations()
+        self.assertTrue(entry["success"])
+        self.assertTrue(entry["is_new"])
+        self.assertFalse(entry["password_reset"])
+        self.assertEqual(entry["reason"], "")
+        self.assertEqual(entry["detail"], "")
+        self.assertEqual(entry["phone"], "13800000001")
+        self.assertRegex(entry["username"], _USER_RE)
+        self.assertRegex(entry["password"], _PW_RE)
+
+    def test_takeover_success_records_takeover_audit(self):
+        registry = self._registry()
+        sms = _FakeSms(phones=["13800000002"], msg="【商汤】验证码 888888")
+        authn = _FakeAuthn(
+            sms_login_result={
+                "tenant_list": [{"user_id": "user-42"}],
+                "redirect": "http://redirect/login?code=def",
+            }
+        )
+        worker = self._worker(
+            sms=sms,
+            authn=authn,
+            keys=_FakeKeys(list_result=[_key("old-1")]),
+            registry=registry,
+            target=1,
+        )
+        worker.run_once()
+        (entry,) = registry.registrations()
+        self.assertTrue(entry["success"])
+        self.assertFalse(entry["is_new"])
+        self.assertTrue(entry["password_reset"])
+        self.assertEqual(entry["username"], "接管实名")
+        self.assertEqual(entry["reason"], "")
+
+    def test_takeover_password_unset_records_success_with_detail(self):
+        registry = self._registry()
+        sms = _FakeSms(phones=["13800000013"])
+        sms.msg_queue = ["【商汤】验证码 888888", "[尚未收到]", "[尚未收到]"]
+        authn = _FakeAuthn(
+            sms_login_result={
+                "tenant_list": [{"user_id": "user-42"}],
+                "redirect": "http://redirect/login?code=def",
+            }
+        )
+        calls = {"n": 0}
+
+        def clock() -> float:
+            calls["n"] += 1
+            return 0.0 if calls["n"] <= 3 else 999.0
+
+        worker = self._worker(
+            sms=sms,
+            authn=authn,
+            keys=_FakeKeys(list_result=[_key("old-1")]),
+            registry=registry,
+            target=1,
+            clock=clock,
+        )
+        worker.run_once()
+        (entry,) = registry.registrations()
+        self.assertTrue(entry["success"])
+        self.assertFalse(entry["is_new"])
+        self.assertFalse(entry["password_reset"])
+        self.assertEqual(entry["detail"], "改密短信超时，账号已接管但未改密")
+        self.assertEqual(entry["username"], "")
+
+    def test_sms_timeout_giveup_records_failures(self):
+        registry = self._registry()
+        phones = [f"1380{i:07d}" for i in range(SOFT_RETRY_MAX)]
+        sms = _FakeSms(phones=phones, msg="[尚未收到]")  # 无验证码 -> 时钟必超时
+        worker = self._worker(
+            sms=sms,
+            authn=_FakeAuthn(),
+            keys=_FakeKeys(),
+            registry=registry,
+            target=1,
+            clock=_advancing_clock(),
+        )
+        worker.run_once()
+        self.assertEqual(self._status(worker), ReplenishWorker.STATUS_CHECK_ERROR)
+        (entry,) = registry.registrations()
+        self.assertFalse(entry["success"])
+        self.assertEqual(entry["reason"], "sms_timeout")
+        self.assertIn("短信超时", entry["detail"])
+        self.assertEqual(entry["phone"], phones[-1])  # 最后一次尝试的号码
+        self.assertEqual(registry.count_registrations(False), 1)
+
+    def test_captcha_required_records_failure(self):
+        registry = self._registry()
+        sms = _FakeSms(phones=["13800000008"])
+        worker = self._worker(
+            sms=sms,
+            authn=_FakeAuthn(send_result=None),
+            keys=_FakeKeys(),
+            registry=registry,
+            target=1,
+        )
+        worker.run_once()
+        (entry,) = registry.registrations()
+        self.assertFalse(entry["success"])
+        self.assertEqual(entry["reason"], "captcha_required")
+        self.assertEqual(entry["phone"], "13800000008")
+
+    def test_register_error_records_failure(self):
+        registry = self._registry()
+        sms = _FakeSms(phones=["13800000012"])
+        authn = _FakeAuthn(
+            register_excs=[AuthnError(400, "invalid_sms_code", "注册失败")]
+        )
+        worker = self._worker(
+            sms=sms, authn=authn, keys=_FakeKeys(), registry=registry, target=1
+        )
+        worker.run_once()
+        (entry,) = registry.registrations()
+        self.assertFalse(entry["success"])
+        self.assertEqual(entry["reason"], "authn_error")
+        self.assertTrue(entry["detail"])
+        self.assertEqual(entry["phone"], "13800000012")
+
+    def test_unexpected_exception_records_failure(self):
+        class _BoomKeys(_FakeKeys):
+            def create_key(self, access_token, *, displayname, key_type):
+                raise RuntimeError("boom")
+
+        registry = self._registry()
+        worker = self._worker(
+            sms=_FakeSms(phones=["13800000015"]),
+            authn=_FakeAuthn(),
+            keys=_BoomKeys(),
+            registry=registry,
+            target=1,
+        )
+        worker.run_once()
+        (entry,) = registry.registrations()
+        self.assertFalse(entry["success"])
+        self.assertEqual(entry["reason"], "unknown")
+        self.assertEqual(entry["phone"], "13800000015")
+
+    def test_audit_write_failure_does_not_kill_cycle(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        registry = _FailingRegistry(Path(tmp.name) / "state.json")
+        sms = _FakeSms(phones=["13800000001"])
+        worker = self._worker(
+            sms=sms, authn=_FakeAuthn(), keys=_FakeKeys(), registry=registry, target=1
+        )
+        worker.run_once()
+        self.assertEqual(self._status(worker), ReplenishWorker.STATUS_OK)
+        self.assertEqual(len(self.persist_calls), 1)
 
 
 if __name__ == "__main__":
