@@ -8,6 +8,10 @@ config.json.tmp
 replenish.json
 replenish.json.tmp
 
+# 泄漏守卫状态（待轮换账号 / 最近轮换日期）—— 运行产物，不要提交
+guard.json
+guard.json.tmp
+
 # 运行产物
 .venv/
 __pycache__/
