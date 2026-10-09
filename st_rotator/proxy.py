@@ -439,6 +439,10 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         except RotatorError as exc:
             self._send_json(502, error_payload(str(exc), "upstream_error", "502"))
             return
+        # 模型清单按配置过滤：上层应用看到的清单与控制台保持一致，
+        # 避免 agent 自动挑中那些"几乎不可用"的模型（见 model_filter 配置）。
+        if method == "GET" and upstream_path.split("?", 1)[0].rstrip("/") == "models":
+            result = self.rotator.filter_models_payload(result)
         self._send_json(200, result)
 
 

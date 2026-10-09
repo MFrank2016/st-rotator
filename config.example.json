@@ -47,6 +47,10 @@
     "max_workers": 8
   },
 
+  "model_filter": {
+    "hidden": ["deepseek-v4.1-flash"]
+  },
+
   "accounts": [
     {
       "name": "账号1",
