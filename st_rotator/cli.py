@@ -485,9 +485,7 @@ def build_auto_renew(
         probe=rotator.probe_key,
         login=HttpQuotaTransport().login,
         keys=HttpKeyManager(),
-        persist=build_auto_renew_persist(
-            store, rotator, lock=lock, registry=registry
-        ),
+        persist=build_auto_renew_persist(store, rotator, lock=lock, registry=registry),
         key_name=config.auto_renew.key_name,
         key_type=config.auto_renew.key_type,
         interval=config.auto_renew.interval_seconds,
@@ -501,16 +499,16 @@ def build_auto_renew(
 def build_replenish_persist(
     store: ConfigStore,
     rotator: StRotator,
-    registry: Registry,
     *,
     lock: threading.Lock,
 ) -> Callable[[str, str, str, str], None]:
-    """构造「新账号落池 + 落盘 + 登记」的 persist 回调。
+    """构造「新账号落池 + 落盘」的 persist 回调。
 
     铁律顺序（勿改）：先在内存池加入新 Key → 再写进 store（含凭据与 Key 列表）→
-    把 reload 后的内存配置拷回 ``rotator.config.accounts`` → 登记注册审计 →
-    最后 store / registry 一起落盘。顺序反了会出现「池里有 Key、配置里没有」
-    或「配置与池脱节」的中间态。
+    把 reload 后的内存配置拷回 ``rotator.config.accounts`` → store 落盘。
+    顺序反了会出现「池里有 Key、配置里没有」或「配置与池脱节」的中间态。
+    注册审计由 ``ReplenishWorker`` 统一负责（成功与失败每次尝试都登记），
+    此处不再重复登记，避免一条成功被记两笔。
     """
 
     def persist(
@@ -524,11 +522,7 @@ def build_replenish_persist(
             )
             store.reload()
             rotator.config.accounts = list(store.config.accounts)
-            registry.record_registration(
-                name=name, phone=phone, outcome=outcome, created_at=time.time()
-            )
             store.save()
-            registry.save()
 
     return persist
 
@@ -571,7 +565,7 @@ def build_replenish(
         authn=authn,
         keys=keys,
         captcha_solver=getattr(authn, "solve_captcha", None),
-        persist=build_replenish_persist(store, rotator, registry, lock=lock),
+        persist=build_replenish_persist(store, rotator, lock=lock),
         registry=registry,
         key_name=rc.key_name,
         key_type=rc.key_type,

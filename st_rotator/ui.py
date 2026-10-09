@@ -449,7 +449,7 @@ class ConsoleState:
         spend = self.registry.spend_state() if self.registry else {}
         used = len(self.registry.used_phones()) if self.registry else 0
         registrations_ok = (
-            self.registry.count_registrations("ok") if self.registry else 0
+            self.registry.count_registrations(True) if self.registry else 0
         )
         rotations = self.registry.rotation_count() if self.registry else 0
         return {

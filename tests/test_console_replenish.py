@@ -73,8 +73,8 @@ class _FakeRegistry:
     def used_phones(self) -> frozenset:
         return self._used
 
-    def count_registrations(self, outcome: str | None = None) -> int:
-        return self._registrations_ok if outcome == "ok" else 0
+    def count_registrations(self, success: bool | None = None) -> int:
+        return self._registrations_ok if success else 0
 
     def rotation_count(self) -> int:
         return self._rotations

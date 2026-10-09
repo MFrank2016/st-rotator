@@ -182,16 +182,31 @@ class Registry:
     # ------------------------------------------------------------ 注册审计
 
     def record_registration(
-        self, *, name: str, phone: str, outcome: str, created_at: float
+        self,
+        *,
+        created_at: float,
+        phone: str,
+        username: str,
+        password: str,
+        is_new: bool,
+        password_reset: bool,
+        success: bool,
+        reason: str,
+        detail: str,
     ) -> None:
-        """追加一条注册审计记录并落盘。"""
+        """追加一条注册审计记录并落盘（字段固定为以上 9 键）。"""
         with self._lock:
             self._registrations.append(
                 {
-                    "name": name,
-                    "phone": phone,
-                    "outcome": outcome,
                     "created_at": created_at,
+                    "phone": phone,
+                    "username": username,
+                    "password": password,
+                    "is_new": is_new,
+                    "password_reset": password_reset,
+                    "success": success,
+                    "reason": reason,
+                    "detail": detail,
                 }
             )
             self._save()
@@ -202,14 +217,62 @@ class Registry:
             newest_first = list(reversed(self._registrations))
         return newest_first[:limit]
 
-    def count_registrations(self, outcome: str | None = None) -> int:
-        """注册审计记录数；``outcome`` 非空时只计该结果的条数。"""
+    def count_registrations(self, success: bool | None = None) -> int:
+        """注册审计记录数；``success`` 非空时只计该成功 / 失败结果的条数。"""
         with self._lock:
-            if outcome is None:
+            if success is None:
                 return len(self._registrations)
             return sum(
-                1 for e in self._registrations if e.get("outcome") == outcome
+                1 for e in self._registrations if bool(e.get("success")) == success
             )
+
+    def registrations_page(
+        self,
+        *,
+        page: int = 1,
+        size: int = 20,
+        q: str = "",
+        status: str = "",
+        kind: str = "",
+    ) -> dict[str, Any]:
+        """分页查询注册审计：最新在前，支持 ``q`` / ``status`` / ``kind`` 过滤。"""
+        try:
+            page = max(1, int(page))
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            size = max(1, min(200, int(size)))
+        except (TypeError, ValueError):
+            size = 20
+        q = (q or "").strip().lower()
+        with self._lock:
+            newest_first = list(reversed(self._registrations))
+        filtered: list[dict[str, Any]] = []
+        for entry in newest_first:
+            if (
+                q
+                and q not in str(entry.get("phone") or "").lower()
+                and q not in str(entry.get("username") or "").lower()
+            ):
+                continue
+            success = bool(entry.get("success"))
+            if status == "ok" and not success:
+                continue
+            if status == "fail" and success:
+                continue
+            is_new = bool(entry.get("is_new"))
+            if kind == "new" and not is_new:
+                continue
+            if kind == "takeover" and is_new:
+                continue
+            filtered.append(entry)
+        start = (page - 1) * size
+        return {
+            "items": filtered[start : start + size],
+            "total": len(filtered),
+            "page": page,
+            "size": size,
+        }
 
     # ------------------------------------------------------------ 轮换计数
 

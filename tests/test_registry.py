@@ -1,7 +1,10 @@
 """T4 registry.py 测试：原子 JSON 注册表（已用号码 / 每日花销 / 注册审计）。"""
 
 import json
+import tempfile
 import threading
+import unittest
+from pathlib import Path
 
 import pytest
 
@@ -108,16 +111,39 @@ def test_record_registration_audit(tmp_path):
     path = tmp_path / "state.json"
     reg = Registry.load(path)
     reg.record_registration(
-        name="账号0", phone="13000000000", outcome="ok", created_at=0.0
+        created_at=0.0,
+        phone="13000000000",
+        username="u0",
+        password="p",
+        is_new=True,
+        password_reset=False,
+        success=True,
+        reason="",
+        detail="",
     )
     reg.record_registration(
-        name="账号1", phone="13100000000", outcome="ok", created_at=1.0
+        created_at=1.0,
+        phone="13100000000",
+        username="u1",
+        password="p",
+        is_new=True,
+        password_reset=False,
+        success=True,
+        reason="",
+        detail="",
     )
     reg.record_registration(
-        name="账号2", phone="13200000000", outcome="ok", created_at=2.0
+        created_at=2.0,
+        phone="13200000000",
+        username="u2",
+        password="p",
+        is_new=True,
+        password_reset=False,
+        success=True,
+        reason="",
+        detail="",
     )
     entries = reg.registrations()
-    assert [e["name"] for e in entries] == ["账号2", "账号1", "账号0"]
     assert [e["phone"] for e in entries] == [
         "13200000000",
         "13100000000",
@@ -125,18 +151,30 @@ def test_record_registration_audit(tmp_path):
     ]
     # 审计日志同样持久化
     reloaded = Registry.load(path)
-    assert [e["name"] for e in reloaded.registrations()] == ["账号2", "账号1", "账号0"]
+    assert [e["phone"] for e in reloaded.registrations()] == [
+        "13200000000",
+        "13100000000",
+        "13000000000",
+    ]
 
 
 def test_registrations_capped_at_default_limit(tmp_path):
     reg = Registry.load(tmp_path / "state.json")
     for i in range(60):
         reg.record_registration(
-            name=f"账号{i}", phone=f"13{i % 10:08d}", outcome="ok", created_at=float(i)
+            created_at=float(i),
+            phone=f"13{i % 10:08d}",
+            username="u",
+            password="p",
+            is_new=True,
+            password_reset=False,
+            success=True,
+            reason="",
+            detail="",
         )
     assert len(reg.registrations()) == 50
     assert len(reg.registrations(limit=60)) == 60
-    assert reg.registrations(limit=2)[0]["name"] == "账号59"
+    assert reg.registrations(limit=2)[0]["phone"] == "1300000009"
 
 
 def test_injected_lock_is_used(tmp_path):
@@ -156,17 +194,44 @@ def test_note_rotation_increments_and_persists(tmp_path):
     assert Registry.load(path).rotation_count() == 2
 
 
-def test_count_registrations_filters_by_outcome(tmp_path):
+def test_count_registrations_filters_by_success(tmp_path):
     reg = Registry.load(tmp_path / "state.json")
-    reg.record_registration(name="a", phone="130", outcome="ok", created_at=1.0)
-    reg.record_registration(name="b", phone="131", outcome="ok", created_at=2.0)
     reg.record_registration(
-        name="c", phone="132", outcome="takeover_password_unset", created_at=3.0
+        created_at=1.0,
+        phone="130",
+        username="a",
+        password="p",
+        is_new=True,
+        password_reset=False,
+        success=True,
+        reason="",
+        detail="",
     )
-    assert reg.count_registrations("ok") == 2
-    assert reg.count_registrations("takeover_password_unset") == 1
+    reg.record_registration(
+        created_at=2.0,
+        phone="131",
+        username="b",
+        password="p",
+        is_new=True,
+        password_reset=False,
+        success=True,
+        reason="",
+        detail="",
+    )
+    reg.record_registration(
+        created_at=3.0,
+        phone="132",
+        username="c",
+        password="p",
+        is_new=False,
+        password_reset=True,
+        success=False,
+        reason="sms_timeout",
+        detail="",
+    )
+    assert reg.count_registrations(True) == 2
+    assert reg.count_registrations(False) == 1
     assert reg.count_registrations() == 3
-    assert reg.count_registrations("nope") == 0
 
 
 def test_snapshot_shape(tmp_path):
@@ -176,7 +241,15 @@ def test_snapshot_shape(tmp_path):
     reg.note_balance("2026-10-09", 100.0)
     reg.note_rotation()
     reg.record_registration(
-        name="账号1", phone="13800000000", outcome="ok", created_at=1.0
+        created_at=1.0,
+        phone="13800000000",
+        username="u1",
+        password="p",
+        is_new=True,
+        password_reset=False,
+        success=True,
+        reason="",
+        detail="",
     )
     snap = reg.snapshot()
     assert set(snap) == {"used_phones", "spend", "registrations", "rotations"}
@@ -188,5 +261,182 @@ def test_snapshot_shape(tmp_path):
     }
     assert snap["rotations"] == 1
     assert snap["registrations"] == [
-        {"name": "账号1", "phone": "13800000000", "outcome": "ok", "created_at": 1.0}
+        {
+            "created_at": 1.0,
+            "phone": "13800000000",
+            "username": "u1",
+            "password": "p",
+            "is_new": True,
+            "password_reset": False,
+            "success": True,
+            "reason": "",
+            "detail": "",
+        }
     ]
+
+
+def _record(
+    reg,
+    *,
+    phone="13000000000",
+    username="",
+    is_new=True,
+    success=True,
+    created_at=0.0,
+    reason="",
+    detail="",
+    password_reset=False,
+) -> None:
+    reg.record_registration(
+        created_at=created_at,
+        phone=phone,
+        username=username,
+        password="pw",
+        is_new=is_new,
+        password_reset=password_reset,
+        success=success,
+        reason=reason,
+        detail=detail,
+    )
+
+
+class RegistrationAuditTest(unittest.TestCase):
+    """新记录契约：record_registration 关键字参数 + count_registrations(success) + 分页。"""
+
+    def _registry(self) -> Registry:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return Registry.load(Path(tmp.name) / "state.json")
+
+    def test_record_registration_stores_exact_keys(self):
+        reg = self._registry()
+        reg.record_registration(
+            created_at=5.0,
+            phone="13800000001",
+            username="abcd1234",
+            password="s3cret!A",
+            is_new=True,
+            password_reset=False,
+            success=True,
+            reason="",
+            detail="",
+        )
+        (entry,) = reg.registrations()
+        self.assertEqual(
+            set(entry),
+            {
+                "created_at",
+                "phone",
+                "username",
+                "password",
+                "is_new",
+                "password_reset",
+                "success",
+                "reason",
+                "detail",
+            },
+        )
+        self.assertEqual(entry["created_at"], 5.0)
+        self.assertEqual(entry["username"], "abcd1234")
+        self.assertEqual(entry["is_new"], True)
+        self.assertEqual(entry["success"], True)
+
+    def test_count_registrations_by_success(self):
+        reg = self._registry()
+        _record(reg, phone="130", created_at=1.0, success=True)
+        _record(reg, phone="131", created_at=2.0, success=True)
+        _record(reg, phone="132", created_at=3.0, success=False, reason="sms_timeout")
+        self.assertEqual(reg.count_registrations(), 3)
+        self.assertEqual(reg.count_registrations(True), 2)
+        self.assertEqual(reg.count_registrations(False), 1)
+
+    def test_registrations_page_newest_first_paging(self):
+        reg = self._registry()
+        for i in range(5):
+            _record(reg, phone=f"13{i}", created_at=float(i))
+        page = reg.registrations_page(page=1, size=2)
+        self.assertEqual(page["total"], 5)
+        self.assertEqual(page["page"], 1)
+        self.assertEqual(page["size"], 2)
+        self.assertEqual([e["phone"] for e in page["items"]], ["134", "133"])
+        page2 = reg.registrations_page(page=3, size=2)
+        self.assertEqual([e["phone"] for e in page2["items"]], ["130"])
+
+    def test_registrations_page_filters_q_status_kind(self):
+        reg = self._registry()
+        _record(
+            reg,
+            phone="13800000001",
+            username="userAbc",
+            created_at=1.0,
+            is_new=True,
+            success=True,
+        )
+        _record(
+            reg,
+            phone="13800000002",
+            username="other",
+            created_at=2.0,
+            is_new=False,
+            success=True,
+            password_reset=True,
+        )
+        _record(
+            reg,
+            phone="13800000003",
+            username="third",
+            created_at=3.0,
+            is_new=True,
+            success=False,
+            reason="captcha_required",
+        )
+        self.assertEqual(reg.registrations_page(q="USERABC")["total"], 1)
+        self.assertEqual(reg.registrations_page(q="13800000002")["total"], 1)
+        self.assertEqual(reg.registrations_page(status="ok")["total"], 2)
+        self.assertEqual(reg.registrations_page(status="fail")["total"], 1)
+        self.assertEqual(reg.registrations_page(kind="new")["total"], 2)
+        self.assertEqual(reg.registrations_page(kind="takeover")["total"], 1)
+        both = reg.registrations_page(status="ok", kind="new")
+        self.assertEqual(both["total"], 1)
+        self.assertEqual(both["items"][0]["phone"], "13800000001")
+
+    def test_registrations_page_clamps_page_and_size(self):
+        reg = self._registry()
+        _record(reg, phone="130", created_at=1.0)
+        page = reg.registrations_page(page=0, size=9999)
+        self.assertEqual(page["page"], 1)
+        self.assertEqual(page["size"], 200)
+        page = reg.registrations_page(page=-5, size=0)
+        self.assertEqual(page["page"], 1)
+        self.assertEqual(page["size"], 1)
+
+    def test_old_records_without_new_keys_still_load_and_count_as_fail(self):
+        # 磁盘上旧版记录（无新字段）必须能加载，不因缺键而拒绝
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "state.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "used_phones": [],
+                    "spend": {"date": "", "start_balance": None, "last_balance": None},
+                    "registrations": [
+                        {
+                            "name": "账号0",
+                            "phone": "130",
+                            "outcome": "ok",
+                            "created_at": 1.0,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        reg = Registry.load(path)
+        self.assertEqual(len(reg.registrations()), 1)
+        self.assertEqual(reg.count_registrations(True), 0)  # 缺 success 键 -> 视为失败
+        self.assertEqual(reg.count_registrations(False), 1)
+        self.assertEqual(
+            reg.registrations_page(q="账号0")["total"], 0
+        )  # username 缺 -> 不命中

@@ -145,9 +145,7 @@ class BuildReplenishPersistTest(unittest.TestCase):
     def test_persist_creates_account_consistently(self):
         with tempfile.TemporaryDirectory() as tmp:
             path, store, rotator, registry = _make_runtime(tmp)
-            persist = build_replenish_persist(
-                store, rotator, registry, lock=threading.Lock()
-            )
+            persist = build_replenish_persist(store, rotator, lock=threading.Lock())
             persist("user_new", "13900000001", "pw_new", NEW_KEY)
 
             new_acct = store.config.accounts[-1]
@@ -172,16 +170,8 @@ class BuildReplenishPersistTest(unittest.TestCase):
             self.assertEqual(raw_acct["password"], "pw_new")
             self.assertEqual(raw_acct["api_keys"], [NEW_KEY])
 
-            # registry：登记审计含该号码（内存 + 磁盘）
-            regs = registry.registrations()
-            self.assertEqual(len(regs), 1)
-            self.assertEqual(regs[0]["name"], "账号2")
-            self.assertEqual(regs[0]["phone"], "13900000001")
-            self.assertEqual(regs[0]["outcome"], "ok")
-            reg_disk = json.loads(
-                (path.parent / "state.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(reg_disk["registrations"][-1]["phone"], "13900000001")
+            # 注册审计由 worker 统一登记，persist 不再写入 registry
+            self.assertEqual(registry.registrations(), [])
 
 
 class LoadRegistryForTest(unittest.TestCase):
