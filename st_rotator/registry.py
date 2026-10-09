@@ -59,13 +59,14 @@ def _migrate_registration(entry: Mapping[str, Any]) -> dict[str, Any]:
     """把旧格式注册审计（``name`` / ``outcome``）迁移成新的 9 键契约。
 
     旧格式无法区分「新注册」与「接管」，也拿不回用户名 / 密码，故 ``is_new`` /
-    ``password_reset`` 一律 False、``username`` / ``password`` 留空；原 ``outcome``
-    原样放进 ``reason`` 以便追溯，``success`` 取 ``outcome == "ok"``。已是新格式的
-    记录原样返回。
+    ``password_reset`` 一律 False、``username`` / ``password`` 留空；``success`` 取
+    ``outcome == "ok"``，失败时把原 ``outcome`` 放进 ``reason`` 以便追溯（成功记录
+    ``reason`` 留空，与新契约一致）。已是新格式的记录原样返回。
     """
     if "success" in entry:
         return dict(entry)
     outcome = str(entry.get("outcome") or "")
+    success = outcome == "ok"
     return {
         "created_at": _as_float(entry.get("created_at")),
         "phone": str(entry.get("phone") or ""),
@@ -73,8 +74,8 @@ def _migrate_registration(entry: Mapping[str, Any]) -> dict[str, Any]:
         "password": "",
         "is_new": False,
         "password_reset": False,
-        "success": outcome == "ok",
-        "reason": outcome,
+        "success": success,
+        "reason": "" if success else outcome,
         "detail": "",
     }
 

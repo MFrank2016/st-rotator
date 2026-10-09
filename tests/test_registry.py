@@ -459,6 +459,7 @@ class RegistrationAuditTest(unittest.TestCase):
         self.assertEqual(items[0]["reason"], "takeover_password_unset")
         self.assertFalse(items[0]["success"])
         self.assertTrue(items[1]["success"])
+        self.assertEqual(items[1]["reason"], "")  # 成功记录 reason 留空（与新契约一致）
         self.assertEqual(items[1]["phone"], "130")
         # 迁移已落盘：旧键（outcome/name）消失，新键（success）就位
         reloaded = json.loads(path.read_text(encoding="utf-8"))
