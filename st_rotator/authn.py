@@ -7,8 +7,8 @@ OIDC 重定向；register / change_password 按文档观测为明文密码（无
 只 import quota 的公开常量与 TokenBundle（quota.py 零修改）。
 
 失败语义：``AuthnError``，``status=0`` 表示网络层错误，其余为 HTTP 状态码；
-``reason`` 取自封闭集合 {invalid_captcha, invalid, already_registered,
-username_taken, tenant_list, challenge_expired, network, unknown}。
+``reason`` 取自封闭集合 {invalid_captcha, incorrect_sms_code, invalid,
+already_registered, username_taken, tenant_list, challenge_expired, network, unknown}。
 
 端点分属两个 host（OIDC = platform.sensenova.cn，IAM = iam.sensecoreapi.cn），
 构造时可分别用 ``oidc_base`` / ``iam_base`` 覆盖（测试指向本地假服务）。
@@ -22,6 +22,7 @@ username_taken, tenant_list, challenge_expired, network, unknown}。
 from __future__ import annotations
 
 import base64
+import io
 import json
 import re
 import secrets
@@ -49,6 +50,9 @@ OIDC_TOKEN_URL = OIDC_BASE + "/oauth2/token"
 
 # 错误原因识别标记（匹配于 gRPC 信封的 message/reason 合并文本）
 _CAPTCHA_MARKERS = ("captcha", "验证码")
+# 短信验证码错误（register/smsLogin 校验失败）。必须优先于 _CAPTCHA_MARKERS 判定：
+# 服务端该错误的中文文案为「验证码错误」，其中含「验证码」二字会误命中 captcha 标记。
+_SMS_CODE_MARKERS = ("incorrectsmscode", "incorrect_sms_code", "sms_code_incorrect")
 _USERNAME_TAKEN_MARKERS = (
     "username_taken",
     "user_name_taken",
@@ -69,6 +73,59 @@ _CHALLENGE_MARKERS = (
     "challenge 已过期",
     "挑战已过期",
 )
+
+_CAPTCHA_MAX_TRIES = 4
+
+
+def _match_slider(image_b64: str, block_b64: str) -> int | None:
+    """在背景图里定位滑块缺口的 x（带 alpha 掩膜的归一化互相关）。
+
+    滑块 ``block`` 的 alpha 通道即缺口形状；用它在背景里做归一化互相关，
+    峰值列即缺口 x。需要可选依赖 ``numpy`` + ``Pillow``，缺失或解码失败返回 ``None``。
+    实测命中率 ~94%+（见 docs/sensenova_captcha_solver.md）。
+    """
+    try:
+        import numpy as np
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        bg = np.asarray(
+            Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB"),
+            dtype=np.float64,
+        )
+        blk = np.asarray(Image.open(io.BytesIO(base64.b64decode(block_b64))))
+    except Exception:  # noqa: BLE001 - 解码失败一律视为无法求解
+        return None
+    if bg.ndim != 3 or blk.ndim != 3 or blk.shape[2] < 4:
+        return None
+    template = blk[:, :, :3].astype(np.float64)
+    mask = (blk[:, :, 3] > 0).astype(np.float64)[:, :, None]
+    th, tw = template.shape[:2]
+    if th > bg.shape[0] or tw > bg.shape[1]:
+        return None
+    t = template * mask
+    t_sq = float((t * t).sum())
+    best_x, best = None, -1.0
+    for x in range(bg.shape[1] - tw + 1):
+        patch = bg[:th, x : x + tw, :] * mask
+        num = float((t * patch).sum())
+        den = (t_sq * float((patch * patch).sum())) ** 0.5 + 1e-9
+        score = num / den
+        if score > best:
+            best, best_x = score, x
+    return best_x
+
+
+def _decode_json(raw: bytes) -> dict[str, Any] | None:
+    """bytes -> JSON dict；空 / 非 JSON / 非对象返回 None。"""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 class AuthnError(RuntimeError):
@@ -95,6 +152,21 @@ def jwt_sub(token: str) -> str | None:
     return sub if isinstance(sub, str) else None
 
 
+def sms_login_tenants(data: Mapping[str, Any]) -> list[Any]:
+    """smsLogin 响应里的 tenant_list（缺省/非列表 -> []）。空列表 = 手机号未注册。"""
+    tenants = data.get("tenant_list")
+    return list(tenants) if isinstance(tenants, list) else []
+
+
+def sms_login_redirect(data: Mapping[str, Any]) -> str | None:
+    """smsLogin 响应里的登录重定向 URL（已注册账号可直接登录时返回）。"""
+    for key in ("redirect", "redirect_uri", "redirect_to"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 class AuthnTransport(Protocol):
     """认证 API 的传输抽象（供上层 worker / 测试 Fake 实现）。"""
 
@@ -110,7 +182,10 @@ class AuthnTransport(Protocol):
     ) -> str: ...
     def sms_login(
         self, *, token_code: str, verify_code: str, challenge: str
-    ) -> str: ...
+    ) -> Mapping[str, Any]: ...
+    def login_next(
+        self, *, challenge: str, username: str, user_id: str, sign: str
+    ) -> Mapping[str, Any]: ...
     def request_change_password_code(self, access_token: str, user_id: str) -> str: ...
     def change_password(
         self,
@@ -163,6 +238,8 @@ def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
 
 def _classify_reason(text: str) -> str:
     """按标记判定 AuthnError.reason；顺序即优先级（用户名占用优先于泛化「存在」）。"""
+    if _contains_any(text, _SMS_CODE_MARKERS):
+        return "incorrect_sms_code"
     if _contains_any(text, _CAPTCHA_MARKERS):
         return "invalid_captcha"
     if _contains_any(text, _USERNAME_TAKEN_MARKERS):
@@ -195,12 +272,25 @@ class HttpAuthn:
         timeout: float = 20.0,
         iam_base: str = IAM_BASE,
         oidc_base: str = OIDC_BASE,
+        impersonate: str = "chrome",
     ) -> None:
         # 端点是固定的（docs §B），base 只用于测试指向本地假服务 / 环境隔离
         self.timeout = timeout
         self.iam_base = iam_base.rstrip("/")
         self._oidc_auth = oidc_base.rstrip("/") + "/oauth2/auth"
         self._oidc_token = oidc_base.rstrip("/") + "/oauth2/token"
+        # 可选：curl_cffi 提供浏览器级 TLS 指纹（装了就用，未装回落 urllib）。
+        # 注意：它并不改变验证码结果（求解才是关键），仅让请求更像真实浏览器。
+        self._curl: Any = None
+        try:
+            from curl_cffi import requests as _curl_requests
+
+            self._curl = _curl_requests.Session(impersonate=impersonate)
+        except Exception:  # noqa: BLE001 - 可选依赖，缺失即回落 urllib
+            self._curl = None
+        # urllib 分支共用一个 Cookie 罐：register/smsLogin 建立的会话 Cookie 必须在随后
+        # 跟随 OIDC 重定向换取 code 时可见，否则 /oauth2/auth 不返回 code（curl 分支同理）。
+        self._shared_opener = self._opener()
 
     # --- 低层 HTTP ---
     @staticmethod
@@ -265,14 +355,37 @@ class HttpAuthn:
             "Accept-Language": "zh-CN",
             "User-Agent": USER_AGENT,
         }
-        data = None
         if body is not None:
-            data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
         if bearer is not None:
             headers["Authorization"] = f"Bearer {bearer}"
+        if self._curl is not None:
+            return self._request_json_curl(method, url, body=body, headers=headers)
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
-        return self._parse_json(self._open(self._opener(), req))
+        return self._parse_json(self._open(self._shared_opener, req))
+
+    def _request_json_curl(
+        self,
+        method: str,
+        url: str,
+        *,
+        body: Mapping[str, Any] | None,
+        headers: Mapping[str, str],
+    ) -> dict[str, Any]:
+        """curl_cffi 传输分支（浏览器指纹）；错误映射与 urllib 分支一致。"""
+        try:
+            resp = self._curl.request(
+                method, url, json=body, headers=dict(headers), timeout=self.timeout
+            )
+        except Exception as exc:  # curl_cffi 异常类型不稳定，统一归网络层
+            raise AuthnError(0, "network", f"{type(exc).__name__}: {exc}") from exc
+        parsed = _decode_json(resp.content)
+        if resp.status_code >= 400:
+            raise _map_authn_error(resp.status_code, parsed)
+        return parsed if parsed is not None else {}
 
     def _follow_until(
         self,
@@ -306,6 +419,40 @@ class HttpAuthn:
             location = new_loc
         return None
 
+    def _follow_until_curl(
+        self,
+        location: str | None,
+        predicate: Callable[[str], bool],
+        *,
+        max_hops: int = 6,
+    ) -> str | None:
+        """curl 会话版重定向跟随：复用同一 Cookie 罐（与 register/smsLogin 同会话）。"""
+        headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+        for _ in range(max_hops):
+            if not location:
+                return None
+            if predicate(location):
+                return location
+            try:
+                resp = self._curl.get(
+                    location,
+                    headers=headers,
+                    timeout=self.timeout,
+                    allow_redirects=False,
+                )
+            except Exception as exc:  # 统一归网络层
+                raise AuthnError(0, "network", f"{type(exc).__name__}: {exc}") from exc
+            new_loc = resp.headers.get("Location")
+            if not new_loc:
+                found = re.search(
+                    r"(https?://[^\"'\s<>]+[?&]code=[^&\"'\s<>]+)", resp.text or ""
+                )
+                if found and predicate(found.group(1)):
+                    return found.group(1)
+                return None
+            location = urllib.parse.urljoin(location, new_loc)
+        return None
+
     @staticmethod
     def _query_param(url: str, key: str) -> str:
         """从 URL 取指定查询参数；缺失抛 AuthnError。"""
@@ -332,17 +479,20 @@ class HttpAuthn:
         }
         if intent == "register":
             params["intent"] = "register"
-        opener = self._opener()
-        resp = self._open(
-            opener,
-            urllib.request.Request(
-                self._oidc_auth + "?" + urllib.parse.urlencode(params),
-                headers={"User-Agent": USER_AGENT, "Accept": "*/*"},
-            ),
-        )
-        loc = self._follow_until(
-            opener, resp.geturl(), lambda u: "login_challenge=" in u
-        )
+        url = self._oidc_auth + "?" + urllib.parse.urlencode(params)
+        if self._curl is not None:
+            loc = self._follow_until_curl(url, lambda u: "login_challenge=" in u)
+        else:
+            opener = self._shared_opener
+            resp = self._open(
+                opener,
+                urllib.request.Request(
+                    url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"}
+                ),
+            )
+            loc = self._follow_until(
+                opener, resp.geturl(), lambda u: "login_challenge=" in u
+            )
         if not loc:
             raise AuthnError(0, "unknown", "未能获取 login_challenge")
         return self._query_param(loc, "login_challenge"), verifier
@@ -350,9 +500,16 @@ class HttpAuthn:
     def exchange_code(
         self, redirect_url: str | None, code_verifier: str
     ) -> TokenBundle:
-        """跟随 redirect_url 到 ``code=``，用 PKCE verifier 换 TokenBundle。"""
-        opener = self._opener()
-        loc = self._follow_until(opener, redirect_url, lambda u: "code=" in u)
+        """跟随 redirect_url 到 ``code=``，用 PKCE verifier 换 TokenBundle。
+
+        必须与 register/smsLogin 复用同一会话（Cookie），否则 OIDC 授权端点不返回 code。
+        """
+        if self._curl is not None:
+            loc = self._follow_until_curl(redirect_url, lambda u: "code=" in u)
+        else:
+            loc = self._follow_until(
+                self._shared_opener, redirect_url, lambda u: "code=" in u
+            )
         if not loc:
             raise AuthnError(0, "unknown", "未能获取 authorization code")
         code = self._query_param(loc, "code")
@@ -365,15 +522,21 @@ class HttpAuthn:
                 "grant_type": "authorization_code",
             }
         ).encode("utf-8")
-        req = urllib.request.Request(
-            self._oidc_token,
-            data=form,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": USER_AGENT,
-            },
-        )
-        tok = self._parse_json(self._open(opener, req))
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": USER_AGENT,
+        }
+        if self._curl is not None:
+            try:
+                resp = self._curl.post(
+                    self._oidc_token, data=form, headers=headers, timeout=self.timeout
+                )
+            except Exception as exc:  # 统一归网络层
+                raise AuthnError(0, "network", f"{type(exc).__name__}: {exc}") from exc
+            tok = _decode_json(resp.content) or {}
+        else:
+            req = urllib.request.Request(self._oidc_token, data=form, headers=headers)
+            tok = self._parse_json(self._open(self._shared_opener, req))
         access = tok.get("access_token")
         if not access:
             raise AuthnError(
@@ -393,6 +556,43 @@ class HttpAuthn:
         )
 
     # --- 短信验证码 / 注册 / 短信登录（未认证，skipBearerAuth） ---
+    def solve_captcha(self) -> str | None:
+        """取滑块验证码并用图像匹配求解，返回已解 code_key；失败返回 None。
+
+        供 worker 的 captcha_solver 钩子调用：解出后带 code_key 重发 sendSmsCode。
+        需要可选依赖 numpy + Pillow；未装则返回 None（worker 回落 captcha_required）。
+        """
+        base = self.iam_base + "/iam/authn/v1/auth"
+        for _ in range(_CAPTCHA_MAX_TRIES):
+            try:
+                cap = self._request_json("GET", base + "/getCaptcha")
+            except AuthnError:
+                continue
+            code_key = cap.get("code_key")
+            image = cap.get("image")
+            block = cap.get("block")
+            if not (
+                isinstance(code_key, str)
+                and isinstance(image, str)
+                and isinstance(block, str)
+            ):
+                continue
+            x = _match_slider(image, block)
+            if x is None:
+                continue
+            url = (
+                base
+                + "/checkCaptcha?"
+                + urllib.parse.urlencode({"code_key": code_key, "code_value": x})
+            )
+            try:
+                result = self._request_json("GET", url)
+            except AuthnError:
+                continue
+            if result.get("result") is True:
+                return code_key
+        return None
+
     def send_sms_code(self, phone: str, *, code_key: str | None = None) -> str | None:
         """请求短信验证码；缺 token_code 或需要滑块验证码（含 HTTP 400
         invalidCaptcha）时返回 None，不抛错（调用方据此转 captcha 处理）。"""
@@ -431,9 +631,17 @@ class HttpAuthn:
             )
         return str(redirect)
 
-    def sms_login(self, *, token_code: str, verify_code: str, challenge: str) -> str:
-        """短信登录已有账号；多租户时抛 AuthnError(reason="tenant_list")。"""
-        data = self._request_json(
+    def sms_login(
+        self, *, token_code: str, verify_code: str, challenge: str
+    ) -> Mapping[str, Any]:
+        """短信登录 / 校验验证码，返回原始响应。
+
+        - ``{"tenant_list": []}``  → 手机号未注册；此时 verify_code 已通过校验，
+          同一 token_code 才可用于随后的 register（服务端 register 前必须先校验）。
+        - ``tenant_list`` 非空      → 手机号已注册（1 个租户可直接登录，多个需选择）。
+        - 含 ``redirect``           → 已注册且可直接换取 code。
+        """
+        return self._request_json(
             "POST",
             self.iam_base + "/iam/authn/v1/auth/nova/smsLogin",
             body={
@@ -442,16 +650,21 @@ class HttpAuthn:
                 "challenge": challenge,
             },
         )
-        if "tenant_list" in data:
-            raise AuthnError(200, "tenant_list", "需要选择租户")
-        redirect = data.get("redirect")
-        if not redirect:
-            raise AuthnError(
-                0,
-                "invalid",
-                str(data.get("message") or "短信登录失败：未返回 redirect"),
-            )
-        return str(redirect)
+
+    def login_next(
+        self, *, challenge: str, username: str, user_id: str, sign: str
+    ) -> Mapping[str, Any]:
+        """多租户选择：选定租户后换取登录重定向（返回含 ``redirect`` 的响应）。"""
+        return self._request_json(
+            "POST",
+            self.iam_base + "/iam/authn/v1/auth/nova/loginNext",
+            body={
+                "challenge": challenge,
+                "username": username,
+                "user_id": user_id,
+                "sign": sign,
+            },
+        )
 
     # --- 改密 / 用户信息（已认证，Bearer） ---
     def request_change_password_code(self, access_token: str, user_id: str) -> str:

@@ -38,6 +38,7 @@ Thumbs.db
 # 隔离工作区（git worktree）与 SDD 工作目录
 .worktrees/
 .superpowers/
+.omo/
 
 # 容器部署的运行产物
 .env

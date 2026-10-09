@@ -7,6 +7,7 @@
 import base64
 import hashlib
 import http.server
+import io
 import json
 import threading
 import unittest
@@ -201,6 +202,63 @@ class ExchangeCodeTest(unittest.TestCase):
             thread.join(timeout=5)
 
 
+class ExchangeSessionCookieTest(unittest.TestCase):
+    """register 建立的会话 Cookie 必须在 exchange_code 跟随重定向时可见（回归）。
+
+    真实 OIDC：register 成功后返回 redirect，跟随它时 /oauth2/auth 依赖 register 会话
+    Cookie 才返回 code；若 exchange 用全新 Cookie 罐则拿不到 code（本次线上故障）。
+    """
+
+    def test_exchange_reuses_session_cookie_from_register(self):
+        for force_urllib in (False, True):
+            with self.subTest(force_urllib=force_urllib):
+                self._run_cookie_flow(force_urllib=force_urllib)
+
+    def _run_cookie_flow(self, *, force_urllib: bool) -> None:
+        holder = {}
+
+        def do_register(rec):
+            return (
+                200,
+                {
+                    "Content-Type": "application/json",
+                    "Set-Cookie": "sid=abc; Path=/",
+                },
+                json.dumps({"redirect": holder["base"] + "/oauth2/consent"}).encode(),
+            )
+
+        def do_consent(rec):
+            if "sid=abc" in rec["headers"].get("Cookie", ""):
+                return _redirect(holder["base"] + "/cb?code=CODE123")
+            return _redirect(holder["base"] + "/login")
+
+        server, thread, base = serve(
+            {
+                ("POST", "/iam/authn/v1/auth/nova/register"): do_register,
+                ("GET", "/oauth2/consent"): do_consent,
+                ("GET", "/cb"): lambda rec: (200, {}, b"ok"),
+                ("GET", "/login"): lambda rec: (200, {}, b"login"),
+                ("POST", "/oauth2/token"): lambda rec: _json(
+                    {"access_token": "AT-COOKIE", "expires_in": 3600}
+                ),
+            }
+        )
+        holder["base"] = base
+        try:
+            auth = authn.HttpAuthn(timeout=5.0, iam_base=base, oidc_base=base)
+            if force_urllib:
+                auth._curl = None
+            redirect = auth.register(
+                token_code="TK", user_name="u", password="P", challenge="CHAL"
+            )
+            bundle = auth.exchange_code(redirect, "VERIFIER")
+            self.assertEqual(bundle.access_token, "AT-COOKIE")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+
 class SendSmsCodeTest(unittest.TestCase):
     SEND = "/iam/authn/v1/auth/nova/sendSmsCode"
 
@@ -352,11 +410,44 @@ class RegisterTest(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
+    def test_register_incorrect_sms_code_reason(self):
+        envelope = {
+            "code": 3,
+            "message": "InvalidArgument",
+            "details": [
+                {"@type": "LocalizedMessage", "reason": "incorrectSmsCode"},
+                {"@type": "LocalizedMessage", "message": "验证码错误"},
+            ],
+        }
+        server, thread, base = serve(
+            {
+                ("POST", self.REGISTER): lambda rec: (
+                    400,
+                    {"Content-Type": "application/json"},
+                    json.dumps(envelope).encode("utf-8"),
+                )
+            }
+        )
+        try:
+            auth = authn.HttpAuthn(timeout=5.0, iam_base=base, oidc_base=base)
+            with self.assertRaises(authn.AuthnError) as ctx:
+                auth.register(
+                    token_code="TK",
+                    user_name="user01",
+                    password="Passw0rd!",
+                    challenge="CHAL",
+                )
+            self.assertEqual(ctx.exception.reason, "incorrect_sms_code")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
 
 class SmsLoginTest(unittest.TestCase):
     SMSLOGIN = "/iam/authn/v1/auth/nova/smsLogin"
 
-    def test_sms_login_redirect(self):
+    def test_sms_login_returns_raw_response_with_redirect(self):
         seen = {}
 
         def do_sms(rec):
@@ -366,10 +457,13 @@ class SmsLoginTest(unittest.TestCase):
         server, thread, base = serve({("POST", self.SMSLOGIN): do_sms})
         try:
             auth = authn.HttpAuthn(timeout=5.0, iam_base=base, oidc_base=base)
-            redirect = auth.sms_login(
+            data = auth.sms_login(
                 token_code="TK", verify_code="123456", challenge="CHAL"
             )
-            self.assertEqual(redirect, "https://console/oauth2/cb")
+            self.assertEqual(
+                authn.sms_login_redirect(data), "https://console/oauth2/cb"
+            )
+            self.assertEqual(authn.sms_login_tenants(data), [])
             self.assertEqual(
                 seen["body"],
                 {"token_code": "TK", "verify_code": "123456", "challenge": "CHAL"},
@@ -379,7 +473,23 @@ class SmsLoginTest(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
-    def test_sms_login_tenant_list_reason(self):
+    def test_sms_login_empty_tenant_list_means_unregistered(self):
+        server, thread, base = serve(
+            {("POST", self.SMSLOGIN): lambda rec: _json({"tenant_list": []})}
+        )
+        try:
+            auth = authn.HttpAuthn(timeout=5.0, iam_base=base, oidc_base=base)
+            data = auth.sms_login(
+                token_code="TK", verify_code="123456", challenge="CHAL"
+            )
+            self.assertEqual(authn.sms_login_tenants(data), [])
+            self.assertIsNone(authn.sms_login_redirect(data))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_sms_login_returns_tenants_when_registered(self):
         server, thread, base = serve(
             {
                 ("POST", self.SMSLOGIN): lambda rec: _json(
@@ -389,9 +499,11 @@ class SmsLoginTest(unittest.TestCase):
         )
         try:
             auth = authn.HttpAuthn(timeout=5.0, iam_base=base, oidc_base=base)
-            with self.assertRaises(authn.AuthnError) as ctx:
-                auth.sms_login(token_code="TK", verify_code="123456", challenge="CHAL")
-            self.assertEqual(ctx.exception.reason, "tenant_list")
+            data = auth.sms_login(
+                token_code="TK", verify_code="123456", challenge="CHAL"
+            )
+            self.assertEqual(authn.sms_login_tenants(data), [{"user_id": "u1"}])
+            self.assertIsNone(authn.sms_login_redirect(data))
         finally:
             server.shutdown()
             server.server_close()
@@ -471,6 +583,32 @@ class GetUserInfoTest(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+
+class MatchSliderTest(unittest.TestCase):
+    """滑块求解：合成背景 + 已知缺口，断言归一化互相关命中正确列。"""
+
+    def test_locates_gap_column(self) -> None:
+        try:
+            import numpy as np
+            from PIL import Image
+        except ImportError:
+            self.skipTest("需要可选依赖 numpy + Pillow")
+        rng = np.random.default_rng(0)
+        bg = rng.integers(0, 256, size=(190, 316, 3), dtype=np.uint8)
+        gap_x = 123
+        blk_rgb = bg[:, gap_x : gap_x + 47, :]
+        blk = np.dstack([blk_rgb, np.full((190, 47), 255, np.uint8)])
+
+        def png_b64(arr: object) -> str:
+            buf = io.BytesIO()
+            Image.fromarray(arr).save(buf, format="PNG")  # type: ignore[arg-type]
+            return base64.b64encode(buf.getvalue()).decode()
+
+        self.assertEqual(authn._match_slider(png_b64(bg), png_b64(blk)), gap_x)
+
+    def test_returns_none_on_bad_input(self) -> None:
+        self.assertIsNone(authn._match_slider("not-base64!!", "also-bad!!"))
 
 
 if __name__ == "__main__":

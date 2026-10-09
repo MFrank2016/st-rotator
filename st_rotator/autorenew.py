@@ -190,16 +190,30 @@ class HttpKeyManager:
     def create_key(
         self, access_token: str, *, displayname: str, key_type: str
     ) -> KeyInfo:
-        """创建一个新 key，返回含完整明文 api_key 的 KeyInfo。"""
+        """创建一个新 key，返回含完整明文 api_key 的 KeyInfo。
+
+        响应形如 ``{"api_key": {…脱敏对象…}, "api_key_plain": "sk-…"}``：明文在
+        ``api_key_plain``（仅创建时返回一次），``api_key`` 里是与 list 同形的脱敏对象。
+        """
         data = self._request(
             "POST",
             KEYS_PATH,
             access_token,
             body={"displayname": displayname, "key_type": key_type},
         )
-        key = _parse_key(data)
+        raw = data.get("api_key")
+        key = _parse_key(raw if isinstance(raw, Mapping) else data)
         if key is None:
             raise KeyApiError(0, "create_key 响应缺少 key 字段")
+        plain = data.get("api_key_plain")
+        if isinstance(plain, str) and plain.strip():
+            return KeyInfo(
+                id=key.id,
+                displayname=key.displayname,
+                api_key=plain.strip(),
+                key_type=key.key_type,
+                create_time=key.create_time,
+            )
         return key
 
     def delete_key(self, access_token: str, *, key_id: str) -> None:

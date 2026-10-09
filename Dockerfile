@@ -11,6 +11,10 @@ WORKDIR /app
 COPY requirements-quota.txt ./requirements-quota.txt
 RUN pip install --no-cache-dir -r requirements-quota.txt
 
+# 自动补号的可选依赖（验证码求解 + 浏览器指纹）；放在 COPY 源码之前缓存该层
+COPY requirements-replenish.txt ./requirements-replenish.txt
+RUN pip install --no-cache-dir -r requirements-replenish.txt
+
 # 核心零第三方依赖：源码本身无需 pip install
 COPY st_rotator ./st_rotator
 COPY config.example.json ./config.example.json

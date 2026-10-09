@@ -561,6 +561,7 @@ def build_replenish(
         sms=sms,
         authn=authn,
         keys=keys,
+        captcha_solver=getattr(authn, "solve_captcha", None),
         persist=build_replenish_persist(store, rotator, registry, lock=lock),
         registry=registry,
         key_name=rc.key_name,

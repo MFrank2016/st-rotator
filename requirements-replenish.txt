@@ -1,0 +1,8 @@
+# 自动补号（replenish）的可选依赖 —— 用于滑块验证码求解 + 浏览器指纹。
+# 核心与既有功能零依赖；未安装时补号遇到验证码会降级为 captcha_required（不消费额度）。
+#   curl_cffi : 浏览器级 TLS/JA3 指纹（装了让请求更像真实浏览器；不改变验证码结果）
+#   numpy     : 滑块缺口的归一化互相关匹配
+#   Pillow    : 解码验证码 PNG
+curl_cffi>=0.7
+numpy>=1.26
+Pillow>=10.0

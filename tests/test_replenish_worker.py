@@ -128,6 +128,9 @@ class _FakeAuthn:
         send_queue=(),
         mint_excs=(),
         user_info=None,
+        sms_login_result=None,
+        sms_login_excs=(),
+        login_next_result=None,
     ):
         self.bundle = bundle
         self.register_excs = list(register_excs)
@@ -135,6 +138,14 @@ class _FakeAuthn:
         self.send_queue = list(send_queue)
         self.mint_excs = list(mint_excs)
         self.user_info = user_info
+        self.sms_login_result = (
+            {"tenant_list": []} if sms_login_result is None else sms_login_result
+        )
+        self.sms_login_excs = list(sms_login_excs)
+        self.login_next_result = login_next_result or {
+            "redirect": "http://redirect/login?code=def"
+        }
+        self.login_next_calls: list[tuple[object, object, object, object]] = []
         self.mint_calls: list[str | None] = []
         self.exchange_calls: list[tuple[object, object]] = []
         self.send_calls: list[tuple[str, str | None]] = []
@@ -174,9 +185,17 @@ class _FakeAuthn:
                 raise exc
         return "http://redirect/register?code=abc"
 
-    def sms_login(self, *, token_code: str, verify_code: str, challenge: str) -> str:
+    def sms_login(self, *, token_code: str, verify_code: str, challenge: str):
         self.sms_login_calls.append((token_code, verify_code, challenge))
-        return "http://redirect/login?code=def"
+        if self.sms_login_excs:
+            exc = self.sms_login_excs.pop(0)
+            if exc is not None:
+                raise exc
+        return self.sms_login_result
+
+    def login_next(self, *, challenge: str, username: str, user_id: str, sign: str):
+        self.login_next_calls.append((challenge, username, user_id, sign))
+        return self.login_next_result
 
     def request_change_password_code(self, access_token: str, user_id: str) -> str:
         self.pw_code_calls.append((access_token, user_id))
@@ -446,7 +465,10 @@ class ReplenishWorkerTest(unittest.TestCase):
         registry = self._registry()
         sms = _FakeSms(phones=["13800000002"], msg="【商汤】验证码 888888")
         authn = _FakeAuthn(
-            register_excs=[AuthnError(400, "already_registered", "手机号已注册")]
+            sms_login_result={
+                "tenant_list": [{"user_id": "user-42"}],
+                "redirect": "http://redirect/login?code=def",
+            }
         )
         keys = _FakeKeys(list_result=[_key("old-1"), _key("old-2")])
         worker = self._worker(
@@ -454,7 +476,8 @@ class ReplenishWorkerTest(unittest.TestCase):
         )
         worker.run_once()
 
-        # 注册抛 already_registered -> 走短信登录接管
+        # smsLogin 返回非空 tenant_list -> 手机号已注册 -> 走短信登录接管（不 register）
+        self.assertEqual(authn.register_calls, [])
         self.assertEqual(len(authn.sms_login_calls), 1)
         self.assertEqual(authn.sms_login_calls[0][0], "tok-sms")  # token_code
         self.assertEqual(authn.sms_login_calls[0][1], "888888")  # verify_code
@@ -478,12 +501,45 @@ class ReplenishWorkerTest(unittest.TestCase):
         self.assertEqual(api_key, "sk-new-plain")
         self.assertEqual(self._status(worker), ReplenishWorker.STATUS_OK)
 
+    def test_takeover_multi_tenant_uses_login_next(self):
+        registry = self._registry()
+        sms = _FakeSms(phones=["13800000003"], msg="【商汤】验证码 888888")
+        authn = _FakeAuthn(
+            sms_login_result={
+                "tenant_list": [
+                    {"user_id": "u1", "username": "a", "sign": "s1"},
+                    {
+                        "user_id": "u2",
+                        "username": "b",
+                        "sign": "s2",
+                        "is_last_login": True,
+                    },
+                ]
+            }
+        )
+        keys = _FakeKeys(list_result=[_key("old-1")])
+        worker = self._worker(
+            sms=sms, authn=authn, keys=keys, registry=registry, target=1
+        )
+        worker.run_once()
+
+        # 多租户：smsLogin 无 redirect -> loginNext 选中最近登录的 u2
+        self.assertEqual(authn.register_calls, [])
+        self.assertEqual(len(authn.login_next_calls), 1)
+        _challenge, username, user_id, sign = authn.login_next_calls[0]
+        self.assertEqual((username, user_id, sign), ("b", "u2", "s2"))
+        self.assertEqual(keys.ops, ["list", "delete", "create"])
+        self.assertEqual(self._status(worker), ReplenishWorker.STATUS_OK)
+
     def test_takeover_password_sms_timeout_persists_with_partial_outcome(self):
         registry = self._registry()
         sms = _FakeSms(phones=["13800000013"])
         sms.msg_queue = ["【商汤】验证码 888888", "[尚未收到]", "[尚未收到]"]
         authn = _FakeAuthn(
-            register_excs=[AuthnError(400, "already_registered", "手机号已注册")]
+            sms_login_result={
+                "tenant_list": [{"user_id": "user-42"}],
+                "redirect": "http://redirect/login?code=def",
+            }
         )
         keys = _FakeKeys(list_result=[_key("old-1")])
         calls = {"n": 0}

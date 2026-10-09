@@ -13,11 +13,13 @@ persist / registry）都通过注入的协议与回调提供，因此可无网�
       除非注入了 captcha_solver（先 getCaptcha+checkCaptcha 再带 code_key 重发）。
    d. 等短信；超时 → 换新号，重跑 spend gate。
    e. mint login challenge（challenge_expired 时重 mint 一次）。
-   f. S1 register → exchange → create key → persist；
-      already_registered → S2 接管：sms_login → 吊销全部 key → 建新 key →
-      二次短信 → 改密 → get_user_info → persist；
+   f. 短信校验（smsLogin）：服务端要求 register 前 token_code 先经一次验证码校验，
+      否则 register 报 incorrectSmsCode。tenant_list 非空 → 号码已注册 → S2 接管；
+      空 → 未注册 → S1 注册。
+   g. S1 register → exchange → create key → persist；
       username_taken → 重造用户名重试一次，仍失败 → check_error。
-   g. 其它异常 → check_error，结束本轮。
+      S2 接管：吊销全部 key → 建新 key → 二次短信 → 改密 → get_user_info → persist。
+   h. 其它异常 → check_error，结束本轮。
 
 纯函数 ``generate_credentials`` 生成的用户名 / 密码字符集都排除 ``$`` ``{``
 ``}``，避免被 ConfigStore 的 ``${ENV}`` 占位符展开误伤。
@@ -35,7 +37,13 @@ import threading
 import time
 from typing import Any, Callable, Mapping, Sequence, cast
 
-from .authn import AuthnError, AuthnTransport, jwt_sub
+from .authn import (
+    AuthnError,
+    AuthnTransport,
+    jwt_sub,
+    sms_login_redirect,
+    sms_login_tenants,
+)
 from .autorenew import KeyInfo, KeyTransport
 from .config import AccountConfig
 from .registry import Registry
@@ -102,8 +110,8 @@ def generate_credentials(
     """生成一对新账号凭据 ``(user, password)``。
 
     - user: ``[A-Za-z0-9]``，长度 6..24（默认 10）。
-    - password: 至少 3 种字符类别（小写 / 大写 / 数字 / 特殊字符），
-      长度 8..32（默认 16）。
+    - password: 必须同时含小写 / 大写 / 数字 / 特殊字符四类（商汤规则：
+      「8–32 位，须含大写、小写、数字与特殊字符」），长度 8..32（默认 16）。
     - 两个字符集都排除 ``$`` ``{`` ``}``，保证 ${ENV} 展开永不误伤。
 
     ``rng`` 可注入（``secrets`` / ``random.Random(seed)`` / ``random`` 模块）；
@@ -116,8 +124,8 @@ def generate_credentials(
 
     user = "".join(rng.choice(_USER_CHARSET) for _ in range(ulen))
 
-    # 随机挑 3 或 4 个类别保证「至少 3 类」，每类至少 1 字符，其余从这些类别里补
-    picked = _sample_without_replacement(rng, _PASSWORD_CLASSES, 3 + _randbelow(rng, 2))
+    # 商汤密码规则要求四类齐全（见上方 docstring），故固定取全部类别，每类至少 1 字符
+    picked = _sample_without_replacement(rng, _PASSWORD_CLASSES, len(_PASSWORD_CLASSES))
     pool = "".join(picked)
     chars = [rng.choice(cls) for cls in picked]
     chars += [rng.choice(pool) for _ in range(plen - len(chars))]
@@ -131,6 +139,14 @@ def generate_credentials(
 def today_str(clock: Callable[[], float] = time.time) -> str:
     """本地日期 ``YYYY-MM-DD``。"""
     return time.strftime("%Y-%m-%d", time.localtime(clock()))
+
+
+def pick_tenant(tenants: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+    """多租户短信登录选一个租户：优先最近登录（``is_last_login``），否则第一个。"""
+    for tenant in tenants:
+        if tenant.get("is_last_login"):
+            return tenant
+    return tenants[0] if tenants else None
 
 
 def spend_ok(cap: float, state: Mapping[str, Any], today: str) -> tuple[bool, float]:
@@ -329,7 +345,28 @@ class ReplenishWorker:
         # e. mint login challenge（challenge_expired 重 mint 一次）
         challenge, verifier = self._mint_challenge()
 
-        # f. S1 新注册；already_registered -> S2 接管；username_taken -> 重试一次
+        # f. 先短信校验（smsLogin）：服务端要求 register 前 token_code 必须先经一次
+        #    验证码校验，否则 register 报 incorrectSmsCode。smsLogin 同时判定号码归属。
+        try:
+            login_data = self._authn.sms_login(
+                token_code=token_code, verify_code=code, challenge=challenge
+            )
+        except AuthnError as exc:
+            if exc.reason == "challenge_expired":
+                challenge, verifier = self._mint_challenge()
+                login_data = self._authn.sms_login(
+                    token_code=token_code, verify_code=code, challenge=challenge
+                )
+            elif exc.reason == "incorrect_sms_code":
+                return False
+            else:
+                raise
+
+        # 手机号已被注册（tenant_list 非空）-> S2 接管
+        if sms_login_tenants(login_data):
+            return self._takeover(login_data, challenge, verifier, phone)
+
+        # g. S1 新注册；username_taken -> 重试一次
         user, password = generate_credentials()
         try:
             redirect = self._authn.register(
@@ -339,8 +376,6 @@ class ReplenishWorker:
                 challenge=challenge,
             )
         except AuthnError as exc:
-            if exc.reason == "already_registered":
-                return self._takeover(token_code, code, challenge, verifier, phone)
             if exc.reason == "username_taken":
                 user, redirect = self._retry_register(token_code, password, challenge)
             else:
@@ -399,16 +434,34 @@ class ReplenishWorker:
     # ------------------------------------------------------------ S2 接管
     def _takeover(
         self,
-        token_code: str,
-        verify_code: str,
+        login_data: Mapping[str, Any],
         challenge: str,
         verifier: str,
         phone: str,
     ) -> bool:
-        """手机号已被他人注册：短信登录 -> 吊销全部 key -> 建新 key -> 二次短信改密。"""
-        redirect = self._authn.sms_login(
-            token_code=token_code, verify_code=verify_code, challenge=challenge
-        )
+        """手机号已被他人注册：短信登录 -> 吊销全部 key -> 建新 key -> 二次短信改密。
+
+        ``login_data`` 为 smsLogin 原始响应（验证码已在 _replenish_one 校验通过），
+        其中含可直接换取 code 的 redirect。
+        """
+        redirect = sms_login_redirect(login_data)
+        if not redirect:
+            tenant = pick_tenant(sms_login_tenants(login_data))
+            if tenant is None:
+                self._set_status(
+                    self.STATUS_CHECK_ERROR, "接管：smsLogin 无 redirect 且无租户"
+                )
+                raise _StopCycle()
+            nxt = self._authn.login_next(
+                challenge=challenge,
+                username=str(tenant.get("username") or ""),
+                user_id=str(tenant.get("user_id") or ""),
+                sign=str(tenant.get("sign") or ""),
+            )
+            redirect = sms_login_redirect(nxt)
+        if not redirect:
+            self._set_status(self.STATUS_CHECK_ERROR, "接管：登录未返回 redirect")
+            raise _StopCycle()
         bundle = self._authn.exchange_code(redirect, verifier)
         user_id = jwt_sub(bundle.access_token)
         if not user_id:

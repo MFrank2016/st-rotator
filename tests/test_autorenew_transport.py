@@ -219,6 +219,33 @@ class AutorenewTransportTest(unittest.TestCase):
         self.assertEqual(key.id, "k-new")
         self.assertEqual(key.api_key, "sk-plain")
 
+    def test_create_key_reads_api_key_plain_from_nested_response(self):
+        def responder(method, path, headers, body):
+            if method == "POST" and path == KEYS_PATH:
+                return 200, json.dumps(
+                    {
+                        "api_key": {
+                            "id": "k-new",
+                            "displayname": "auto",
+                            "key_type": "API_KEY_TYPE_TOKEN_PLAN",
+                            "api_key": "sk-****Vrsi",
+                            "create_time": "t-new",
+                            "status": "enabled",
+                            "is_default": False,
+                        },
+                        "api_key_plain": "sk-kZcgPLAINkeyVrsi",
+                    }
+                ).encode()
+            return 404, b"not found"
+
+        manager = self._manager(responder)
+        key = manager.create_key(
+            "tok", displayname="auto", key_type="API_KEY_TYPE_TOKEN_PLAN"
+        )
+        self.assertEqual(key.id, "k-new")
+        self.assertEqual(key.displayname, "auto")
+        self.assertEqual(key.api_key, "sk-kZcgPLAINkeyVrsi")
+
     # 5. delete_key 正确调用 DELETE {path}/{id}，Authorization: Bearer 头正确
     def test_delete_key_sends_delete_with_bearer(self):
         seen = {}
