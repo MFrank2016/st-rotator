@@ -264,5 +264,105 @@ class SetOptionsReplenishTest(unittest.TestCase):
             self.assertEqual(console.config.replenish.sms_token, "")
 
 
+class _StoppableWorker:
+    """可停止的假 worker：用于验证 _sync_replenish 的停机 / 重建 / 热更新分支。"""
+
+    def __init__(self) -> None:
+        self.stopped = False
+
+    def account_status(self) -> dict:
+        return {}
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+class _ReconfigWorker(_StoppableWorker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[dict] = []
+
+    def reconfigure(self, **kwargs) -> None:
+        self.calls.append(kwargs)
+
+
+class SyncReplenishTest(unittest.TestCase):
+    """set_options 落盘后调用 _sync_replenish，让运行中的 worker 实时采用新配置。"""
+
+    def test_sync_stops_worker_when_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = _StoppableWorker()
+            console = _console(
+                tmp,
+                replenish=worker,
+                replenish_cfg={"enabled": False, "target_count": 3, "sms_token": "t"},
+            )
+            console._sync_replenish()
+            self.assertTrue(worker.stopped)
+            self.assertIsNone(console.replenish)
+
+    def test_sync_reconfigures_running_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = _ReconfigWorker()
+            console = _console(
+                tmp,
+                replenish=worker,
+                replenish_cfg={
+                    "enabled": True,
+                    "target_count": 4,
+                    "sms_token": "t",
+                    "keyword": "商汤",
+                    "daily_spend_cap": 1.0,
+                    "sms_poll_interval": 5,
+                    "sms_poll_timeout": 60,
+                    "interval_seconds": 600,
+                    "key_name": "auto",
+                    "key_type": "API_KEY_TYPE_TOKEN_PLAN",
+                },
+            )
+            console._sync_replenish()
+            self.assertIs(console.replenish, worker)
+            self.assertEqual(worker.calls[-1]["target"], 4)
+            self.assertEqual(worker.calls[-1]["daily_spend_cap"], 1.0)
+            self.assertEqual(worker.calls[-1]["keyword"], "商汤")
+
+    def test_sync_rebuilds_running_worker_on_token_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = _StoppableWorker()
+            rebuilt = _StoppableWorker()
+            console = _console(
+                tmp,
+                replenish=old,
+                replenish_cfg={"enabled": True, "target_count": 3, "sms_token": "new"},
+            )
+            console.replenish_factory = lambda: rebuilt
+            console._sync_replenish(rebuild=True)
+            self.assertTrue(old.stopped)
+            self.assertIs(console.replenish, rebuilt)
+
+    def test_sync_builds_worker_when_missing_and_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            built = _StoppableWorker()
+            console = _console(
+                tmp,
+                replenish_cfg={"enabled": True, "target_count": 3, "sms_token": "t"},
+            )
+            console.replenish_factory = lambda: built
+            console._sync_replenish()
+            self.assertIs(console.replenish, built)
+
+    def test_set_options_replenish_triggers_sync(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = _ReconfigWorker()
+            console = _console(
+                tmp,
+                replenish=worker,
+                replenish_cfg={"enabled": True, "target_count": 1, "sms_token": "t"},
+            )
+            resp = console.set_options({"replenish": {"target_count": 6}})
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(worker.calls[-1]["target"], 6)
+
+
 if __name__ == "__main__":
     unittest.main()

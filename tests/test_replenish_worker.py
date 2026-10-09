@@ -774,6 +774,58 @@ class ReplenishWorkerTest(unittest.TestCase):
         self.assertGreaterEqual(counter["n"], 2)  # 先立即跑一轮，再周期循环
         self.assertFalse(thread.is_alive())
 
+    # ------------------------------------------------------------ 14. 热更新
+    def test_reconfigure_updates_live_params_and_wakes(self):
+        registry = self._registry()
+        worker = self._worker(
+            sms=_FakeSms(phones=[]),
+            authn=_FakeAuthn(),
+            keys=_FakeKeys(),
+            registry=registry,
+            target=1,
+            interval=3600.0,
+        )
+        worker.reconfigure(
+            target=3,
+            interval=30.0,
+            keyword="x",
+            sms_poll_interval=2.0,
+            sms_poll_timeout=20.0,
+            daily_spend_cap=9.0,
+            key_name="k",
+            key_type="API_KEY_TYPE_METERED",
+        )
+        self.assertEqual(worker._target, 3)
+        self.assertEqual(worker._interval, 30.0)
+        self.assertEqual(worker._keyword, "x")
+        self.assertEqual(worker._sms_poll_interval, 2.0)
+        self.assertEqual(worker._sms_poll_timeout, 20.0)
+        self.assertEqual(worker._daily_spend_cap, 9.0)
+        self.assertEqual(worker._key_name, "k")
+        self.assertEqual(worker._key_type, "API_KEY_TYPE_METERED")
+        self.assertTrue(worker._wake.is_set())  # 唤醒循环，缩短间隔立即生效
+
+    def test_reconfigure_raises_target_and_next_cycle_replenishes(self):
+        registry = self._registry()
+        sms = _FakeSms(phones=["13800000014"])
+        keys = _FakeKeys()
+        worker = self._worker(
+            sms=sms,
+            authn=_FakeAuthn(),
+            keys=keys,
+            registry=registry,
+            accounts=[AccountConfig(name="a", api_keys=["sk-a"])],
+            target=1,
+        )
+        worker.run_once()  # 1 可用 >= 目标 1 -> 空闲，不取号
+        self.assertEqual(self._status(worker), ReplenishWorker.STATUS_IDLE)
+        self.assertEqual(sms.phone_calls, [])
+
+        worker.reconfigure(target=2)  # 目标抬到 2 -> 下一轮立即补 1 个
+        worker.run_once()
+        self.assertEqual(self._status(worker), ReplenishWorker.STATUS_OK)
+        self.assertEqual(self.persist_calls[0][1], "13800000014")
+
 
 if __name__ == "__main__":
     unittest.main()

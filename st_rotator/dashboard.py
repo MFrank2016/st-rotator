@@ -89,6 +89,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   button.primary:hover:not(:disabled) { filter: brightness(1.08); color: #fff; }
   button.danger:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
   button.tiny { padding: 3px 9px; font-size: 11.5px; border-radius: 6px; }
+  button.primary.dirty { box-shadow: 0 0 0 2px var(--amber-bg), 0 0 0 3px var(--amber); }
+  .opt-dirty { color: var(--amber); font-size: 11.5px; margin-left: 6px; }
 
   .grid { display: grid; gap: 14px; }
   .kpis { grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); margin-bottom: 14px; }
@@ -375,7 +377,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <span>最大重试次数</span>
           <input id="opt-attempts" type="number" min="1" max="50">
         </label>
-        <button class="primary" id="btn-apply-options" style="height:33px">应用</button>
+        <button class="primary" id="btn-apply-options" style="height:33px">保存并应用</button>
       </div>
       <div class="row" style="margin-bottom:12px;align-items:flex-end;flex-wrap:wrap">
         <label class="field" style="width:auto;margin-bottom:0;flex-direction:row;align-items:center;gap:6px">
@@ -472,6 +474,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <span>易码 Token（留空不修改）</span>
           <input id="opt-rp-sms-token" type="password" autocomplete="off" placeholder="已配置则留空">
         </label>
+        <button class="primary" id="btn-save-replenish" style="height:33px">保存并应用</button>
+        <span class="opt-dirty" id="opt-dirty-hint" style="display:none">● 有未保存的改动</span>
       </div>
       <div class="muted" style="font-size:11.5px;margin-bottom:8px">
         自动补号：可用账号数低于目标时，通过易码短信平台自动注册新账号并换绑 Key；
@@ -512,6 +516,7 @@ var S = {
   cursor: 0,
   autoscroll: true,
   tab: "python",
+  optionsDirty: false,
   models: [],
   quota: [],
   usage: [],
@@ -1363,6 +1368,11 @@ function renderPool(state) {
 }
 
 function renderOptions(state) {
+  // 用户一旦编辑过运行参数（勾选/输入），就暂停轮询回填：2 秒一次的状态刷新
+  // 只能保护「当前聚焦的那一个」输入框，无法阻止它把同一表单里其它未保存字段
+  // （例如刚勾上的「自动补号」、刚改的「目标账号数」）覆盖回服务端旧值。
+  // 由 markOptionsDirty() 置脏、保存成功后清除。
+  if (S.optionsDirty) return;
   var opt = state.options || {};
   var strategy = $("opt-strategy");
   if (document.activeElement !== strategy) strategy.value = opt.strategy || "round_robin";
@@ -1534,6 +1544,37 @@ async function onApplyModel() {
   } catch (err) { toast(err.message, "err"); }
 }
 
+/* 运行参数表单的「未保存」跟踪：任一字段被编辑即置脏并暂停轮询回填，
+   保存成功后清脏并恢复回填。按钮上的 * 与提示文字给出可见反馈。 */
+var OPT_FIELD_IDS = [
+  "opt-strategy", "opt-rate-mode", "opt-qps", "opt-wait", "opt-attempts",
+  "opt-fx-enabled", "opt-fx-concurrency", "opt-fx-req", "opt-fx-interval",
+  "opt-fx-tokens", "opt-fx-imgsize", "opt-fx-imgcount", "opt-fx-image",
+  "opt-fx-yield", "opt-fx-minmem",
+  "opt-rp-enabled", "opt-rp-target", "opt-rp-interval", "opt-rp-keyword",
+  "opt-rp-cap", "opt-rp-sms-interval", "opt-rp-sms-timeout", "opt-rp-keyname",
+  "opt-rp-keytype", "opt-rp-sms-token"
+];
+
+function markOptionsDirty() {
+  if (S.optionsDirty) return;
+  S.optionsDirty = true;
+  updateOptionsDirtyUi();
+}
+
+function updateOptionsDirtyUi() {
+  var dirty = !!S.optionsDirty;
+  ["btn-apply-options", "btn-save-replenish"].forEach(function (id) {
+    var el = $(id);
+    if (!el) return;
+    el.classList.toggle("dirty", dirty);
+    el.textContent = dirty ? "保存并应用 *" : "保存并应用";
+    el.title = dirty ? "有未保存的改动，点击保存并立即生效" : "";
+  });
+  var hint = $("opt-dirty-hint");
+  if (hint) hint.style.display = dirty ? "" : "none";
+}
+
 async function onApplyOptions() {
   var body = {
     strategy: $("opt-strategy").value,
@@ -1570,6 +1611,9 @@ async function onApplyOptions() {
   try {
     var result = await api("/api/options", { method: "POST", body: JSON.stringify(body) });
     toast(result.message, "ok");
+    // 保存成功后清脏：恢复 2 秒轮询回填，并以服务端最终值刷新表单。
+    S.optionsDirty = false;
+    updateOptionsDirtyUi();
     await refreshState();
   } catch (err) { toast(err.message, "err"); }
 }
@@ -1658,6 +1702,15 @@ function bind() {
     if (menu) menu.style.display = "none";
   });
   $("btn-apply-options").onclick = onApplyOptions;
+  $("btn-save-replenish").onclick = onApplyOptions;
+  // 任一运行参数字段被编辑 -> 置脏并暂停轮询回填，直到点击保存。
+  OPT_FIELD_IDS.forEach(function (id) {
+    var el = $(id);
+    if (!el) return;
+    el.addEventListener("input", markOptionsDirty);
+    el.addEventListener("change", markOptionsDirty);
+  });
+  updateOptionsDirtyUi();
   $("btn-models").onclick = async function () {
     try { await api("/api/models/refresh", { method: "POST" }); await refreshState(); toast("模型清单已刷新", "ok"); }
     catch (err) { toast(err.message, "err"); }

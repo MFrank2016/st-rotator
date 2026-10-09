@@ -71,6 +71,21 @@ class DashboardReplenishTest(unittest.TestCase):
             'if (document.activeElement !== rps) rps.value = "";', DASHBOARD_HTML
         )
 
+    def test_options_dirty_tracking_pauses_poll_and_save_button(self):
+        # 编辑任一运行参数字段即置脏并暂停 2 秒轮询回填，避免未保存改动被覆盖回旧值；
+        # 保存成功后清脏。同时提供独立的「保存并应用」按钮。
+        self.assertIn('id="btn-save-replenish"', DASHBOARD_HTML)
+        self.assertIn("optionsDirty: false,", DASHBOARD_HTML)
+        self.assertIn("if (S.optionsDirty) return;", DASHBOARD_HTML)
+        self.assertIn("function markOptionsDirty", DASHBOARD_HTML)
+        self.assertIn("S.optionsDirty = true;", DASHBOARD_HTML)
+        self.assertIn("S.optionsDirty = false;", DASHBOARD_HTML)
+        self.assertIn(
+            '$("btn-save-replenish").onclick = onApplyOptions;', DASHBOARD_HTML
+        )
+        self.assertIn('el.addEventListener("input", markOptionsDirty);', DASHBOARD_HTML)
+        self.assertIn('"opt-rp-enabled", "opt-rp-target"', DASHBOARD_HTML)
+
 
 if __name__ == "__main__":
     unittest.main()

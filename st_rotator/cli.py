@@ -38,6 +38,7 @@ if TYPE_CHECKING:  # 仅类型标注用，运行时走函数内 lazy import
     from .registry import Registry
     from .replenish import ReplenishWorker
     from .sms import SmsTransport
+    from .ui import ConsoleState
 
 # ---------------------------------------------------------------- 输出工具
 
@@ -574,6 +575,34 @@ def build_replenish(
     return worker
 
 
+def _wire_replenish(
+    console: ConsoleState,
+    config: Config,
+    store: ConfigStore,
+    rotator: StRotator,
+    registry: Registry,
+    *,
+    sink: Callable[[str], None],
+) -> None:
+    def _factory() -> ReplenishWorker | None:
+        return build_replenish(
+            config,
+            store,
+            rotator,
+            registry,
+            lock=console.lock,
+            sink=sink,
+            status_source=(
+                lambda: (
+                    console.auto_renew.account_status() if console.auto_renew else {}
+                )
+            ),
+        )
+
+    console.replenish_factory = _factory
+    console.replenish = _factory()
+
+
 def _load_registry_for(
     config_path: Path, *, sink: Callable[[str], None] | None = None
 ) -> Registry:
@@ -622,19 +651,7 @@ def cmd_ui(args: argparse.Namespace) -> int:
     )
     if store is not None:
         registry = _load_registry_for(Path(args.config), sink=sink)
-        console.replenish = build_replenish(
-            config,
-            store,
-            rotator,
-            registry,
-            lock=console.lock,
-            sink=sink,
-            status_source=(
-                lambda: (
-                    console.auto_renew.account_status() if console.auto_renew else {}
-                )
-            ),
-        )
+        _wire_replenish(console, config, store, rotator, registry, sink=sink)
         console.registry = registry
 
     sink(
@@ -753,19 +770,7 @@ def cmd_tray(args: argparse.Namespace) -> int:
     )
     if store is not None:
         registry = _load_registry_for(config_path, sink=sink)
-        console.replenish = build_replenish(
-            config,
-            store,
-            rotator,
-            registry,
-            lock=console.lock,
-            sink=sink,
-            status_source=(
-                lambda: (
-                    console.auto_renew.account_status() if console.auto_renew else {}
-                )
-            ),
-        )
+        _wire_replenish(console, config, store, rotator, registry, sink=sink)
         console.registry = registry
 
     try:

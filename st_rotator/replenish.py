@@ -232,6 +232,7 @@ class ReplenishWorker:
         self._interval = float(interval)
         self._log = log or (lambda _msg: None)
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._status: dict[str, dict[str, str]] = {}
         self._status_lock = threading.Lock()
@@ -247,8 +248,45 @@ class ReplenishWorker:
     def stop(self) -> None:
         """请求停止并 join 线程（最多等 5 秒）。"""
         self._stop.set()
+        self._wake.set()  # 立刻打断 interval 等待，缩短 join
         if self._thread is not None:
             self._thread.join(timeout=5)
+
+    def reconfigure(
+        self,
+        *,
+        target: int | None = None,
+        interval: float | None = None,
+        keyword: str | None = None,
+        sms_poll_interval: float | None = None,
+        sms_poll_timeout: float | None = None,
+        daily_spend_cap: float | None = None,
+        key_name: str | None = None,
+        key_type: str | None = None,
+    ) -> None:
+        """热更新运行参数，无需重启进程（控制台保存补号配置后调用）。
+
+        只更新标量运行参数；``sms`` / ``authn`` / ``keys`` 传输层不在此热换
+        （``SmsTransport`` 在构造时固定 token）——token 变更需由调用方重建 worker。
+        更新后唤醒循环，使「更短的检查间隔」等参数立即生效，而不必等完旧间隔。
+        """
+        if target is not None:
+            self._target = int(target)
+        if interval is not None:
+            self._interval = float(interval)
+        if keyword is not None:
+            self._keyword = str(keyword)
+        if sms_poll_interval is not None:
+            self._sms_poll_interval = float(sms_poll_interval)
+        if sms_poll_timeout is not None:
+            self._sms_poll_timeout = float(sms_poll_timeout)
+        if daily_spend_cap is not None:
+            self._daily_spend_cap = float(daily_spend_cap)
+        if key_name is not None:
+            self._key_name = str(key_name)
+        if key_type is not None:
+            self._key_type = str(key_type)
+        self._wake.set()
 
     def account_status(self) -> dict[str, dict[str, str]]:
         """返回 ``{"_replenish": {"status", "message"}}`` 的深拷贝（线程安全）。"""
@@ -267,9 +305,17 @@ class ReplenishWorker:
             )
 
     def _loop(self) -> None:
-        """先立即跑一轮，再按 interval 周期循环；stop 时退出等待。"""
+        """先立即跑一轮，再按 interval 周期循环。
+
+        ``reconfigure()`` / ``stop()`` 置位 ``_wake`` 可提前打断等待：改短检查间隔
+        或停止时都能立即响应，而不必等完当前 interval。
+        """
         self.run_once()
-        while not self._stop.wait(self._interval):
+        while not self._stop.is_set():
+            self._wake.wait(self._interval)
+            self._wake.clear()
+            if self._stop.is_set():
+                return
             self.run_once()
 
     def _cycle(self) -> None:

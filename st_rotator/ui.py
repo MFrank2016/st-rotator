@@ -278,6 +278,7 @@ class ConsoleState:
     quota: QuotaService | None = None
     auto_renew: AutoRenewWorker | None = None
     replenish: ReplenishWorker | None = None
+    replenish_factory: Callable[[], ReplenishWorker | None] | None = None
     registry: Registry | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -953,11 +954,45 @@ class ConsoleState:
                         for k, v in rp_changes.items()
                     )
                 )
+                self._sync_replenish(rebuild="sms_token" in rp_changes)
 
         if not changes:
             return UiResponse.json({"ok": True, "message": "没有需要改动的参数"})
         self._save_and_log("运行参数已更新：" + "，".join(changes))
         return UiResponse.json({"ok": True, "message": "已更新：" + "，".join(changes)})
+
+    def _sync_replenish(self, *, rebuild: bool = False) -> None:
+        """把运行中的补号 worker 与最新 config.replenish 对齐（保存后即时生效）。
+
+        未启用/目标<=0/无 sms_token 时停机；需要运行但无 worker 或需重建时用
+        ``replenish_factory`` 新建；否则对现有 worker 热更新标量参数。
+        """
+        rc = self.config.replenish
+        want = bool(rc.enabled and rc.target_count > 0 and rc.sms_token)
+        if not want:
+            if self.replenish is not None:
+                self.replenish.stop()
+                self.replenish = None
+            return
+        if self.replenish is None or rebuild:
+            if self.replenish is not None:
+                self.replenish.stop()
+                self.replenish = None
+            if self.replenish_factory is not None:
+                self.replenish = self.replenish_factory()
+            return
+        reconfigure = getattr(self.replenish, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(
+                target=rc.target_count,
+                interval=rc.interval_seconds,
+                keyword=rc.keyword,
+                sms_poll_interval=rc.sms_poll_interval,
+                sms_poll_timeout=rc.sms_poll_timeout,
+                daily_spend_cap=rc.daily_spend_cap,
+                key_name=rc.key_name,
+                key_type=rc.key_type,
+            )
 
     def set_paused(self, paused: bool) -> UiResponse:
         """暂停 / 恢复对外服务（网关进程和控制台都还活着）。"""
