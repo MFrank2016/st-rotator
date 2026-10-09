@@ -473,6 +473,101 @@ class ReplenishConfig:
 
 
 @dataclass
+class LeakGuardConfig:
+    """泄漏防护（leak_guard）：定时轮换 Key，限制单把 Key 的可观测窗口。
+
+    Attributes:
+        enabled: 是否启用泄漏防护。
+        interval_seconds: 轮换检测的间隔秒数。
+        window_seconds: 单把 Key 允许存续的窗口秒数。
+        rotate_hour: 定时轮换的小时（0~23）。
+        rotate_minute: 定时轮换的分钟（0~59）。
+        key_name: 轮换创建的新 Key 名称（仅允许中文、字母、数字、连字符，≤64）。
+        key_type: 轮换 API 对应的 Key 类型（Token Plan / 按量计费）。
+    """
+
+    enabled: bool = False
+    interval_seconds: float = 600.0
+    window_seconds: float = 600.0
+    rotate_hour: int = 2
+    rotate_minute: int = 0
+    key_name: str = "auto"
+    key_type: str = "API_KEY_TYPE_TOKEN_PLAN"
+
+    KEY_TYPES = ("API_KEY_TYPE_TOKEN_PLAN", "API_KEY_TYPE_METERED")
+    _KEY_NAME_PATTERN = re.compile(r"^[A-Za-z0-9\u4e00-\u9fa5-]+$")
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigError(
+                f"leak_guard.enabled 必须是布尔值，当前为 {self.enabled!r}"
+            )
+        for field_name in ("interval_seconds", "window_seconds"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ConfigError(
+                    f"leak_guard.{field_name} 必须是数值，当前为 {value!r}"
+                )
+            if value <= 0:
+                raise ConfigError(f"leak_guard.{field_name} 必须 > 0")
+        if isinstance(self.rotate_hour, bool) or not isinstance(
+            self.rotate_hour, int
+        ):
+            raise ConfigError(
+                f"leak_guard.rotate_hour 必须是整数，当前为 {self.rotate_hour!r}"
+            )
+        if not 0 <= self.rotate_hour <= 23:
+            raise ConfigError("leak_guard.rotate_hour 需在 0~23 之间")
+        if isinstance(self.rotate_minute, bool) or not isinstance(
+            self.rotate_minute, int
+        ):
+            raise ConfigError(
+                f"leak_guard.rotate_minute 必须是整数，当前为 {self.rotate_minute!r}"
+            )
+        if not 0 <= self.rotate_minute <= 59:
+            raise ConfigError("leak_guard.rotate_minute 需在 0~59 之间")
+        if not isinstance(self.key_name, str):
+            raise ConfigError(
+                f"leak_guard.key_name 必须是字符串，当前为 {self.key_name!r}"
+            )
+        self.key_name = self.key_name.strip()
+        if not self.key_name:
+            raise ConfigError("leak_guard.key_name 不能为空")
+        if len(self.key_name) > 64:
+            raise ConfigError("leak_guard.key_name 长度不能超过 64")
+        if not self._KEY_NAME_PATTERN.match(self.key_name):
+            raise ConfigError("leak_guard.key_name 仅允许中文、字母、数字与连字符")
+        if not isinstance(self.key_type, str):
+            raise ConfigError(
+                f"leak_guard.key_type 必须是字符串，当前为 {self.key_type!r}"
+            )
+        if self.key_type not in self.KEY_TYPES:
+            raise ConfigError(
+                f"leak_guard.key_type 必须是 {self.KEY_TYPES} 之一，当前为 {self.key_type!r}"
+            )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any] | None) -> "LeakGuardConfig":
+        data = dict(data or {})
+        unknown = set(data) - set(cls.__dataclass_fields__)
+        if unknown:
+            raise ConfigError(f"leak_guard 存在未知字段: {sorted(unknown)}")
+        return cls(**data)
+
+    def to_dict(self) -> dict[str, Any]:
+        """导出为可序列化字典。"""
+        return {
+            "enabled": self.enabled,
+            "interval_seconds": self.interval_seconds,
+            "window_seconds": self.window_seconds,
+            "rotate_hour": self.rotate_hour,
+            "rotate_minute": self.rotate_minute,
+            "key_name": self.key_name,
+            "key_type": self.key_type,
+        }
+
+
+@dataclass
 class ModelFilterConfig:
     """模型清单过滤：把"几乎不可用"的模型从清单里藏掉。
 
@@ -643,6 +738,8 @@ class Config:
     )
     # 自动补充账号（可用账号数不足时用易码短信注册/接管）
     replenish: ReplenishConfig = field(default_factory=ReplenishConfig)
+    # 泄漏防护（定时轮换 Key，限制单把 Key 的可观测窗口）
+    leak_guard: LeakGuardConfig = field(default_factory=LeakGuardConfig)
 
     # 模型清单过滤（把几乎不可用的模型从清单里藏掉）
     model_filter: ModelFilterConfig = field(default_factory=ModelFilterConfig)
@@ -705,6 +802,7 @@ class Config:
             data.pop("flash_lite_exchange", None)
         )
         replenish = ReplenishConfig.from_dict(data.pop("replenish", None))
+        leak_guard = LeakGuardConfig.from_dict(data.pop("leak_guard", None))
         model_filter = ModelFilterConfig.from_dict(data.pop("model_filter", None))
         headers = {
             str(k): expand_env(str(v))
@@ -718,6 +816,7 @@ class Config:
             "auto_renew",
             "flash_lite_exchange",
             "replenish",
+            "leak_guard",
             "model_filter",
         }
         unknown = set(data) - known
@@ -731,6 +830,7 @@ class Config:
             auto_renew=auto_renew,
             flash_lite_exchange=flash_lite,
             replenish=replenish,
+            leak_guard=leak_guard,
             model_filter=model_filter,
             extra_headers=headers,
             **{k: expand_env(v) if isinstance(v, str) else v for k, v in data.items()},
@@ -765,6 +865,7 @@ class Config:
             },
             "auto_renew": self.auto_renew.to_dict(),
             "replenish": self.replenish.to_dict(),
+            "leak_guard": self.leak_guard.to_dict(),
             "accounts": [
                 {
                     "name": a.name,

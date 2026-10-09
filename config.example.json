@@ -58,6 +58,16 @@
     "key_type": "API_KEY_TYPE_TOKEN_PLAN"
   },
 
+  "leak_guard": {
+    "enabled": false,
+    "interval_seconds": 600,
+    "window_seconds": 600,
+    "rotate_hour": 2,
+    "rotate_minute": 0,
+    "key_name": "auto",
+    "key_type": "API_KEY_TYPE_TOKEN_PLAN"
+  },
+
   "replenish": {
     "enabled": false,
     "target_count": 0,
