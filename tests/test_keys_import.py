@@ -26,6 +26,7 @@ class _FakeRotator:
     def add_key(self, key, *, account, max_concurrency=4, rpm_limit=None):
         self.pool.keys.add(key)
         class _Item:
+            id = 1
             key_id = "id-" + key[-4:]
             masked = key[:6] + "..." + key[-4:]
             account_ = account

@@ -144,7 +144,7 @@ class ApiKey:
     """一把 Key 的运行时状态。"""
 
     __slots__ = (
-        "key", "account", "rpm_limit", "max_concurrency", "weight", "tags",
+        "id", "key", "account", "rpm_limit", "max_concurrency", "weight", "tags",
         "status", "cooldown_until", "consecutive_failures", "inflight",
         "last_used", "last_error", "stats", "_window", "account_state",
     )
@@ -154,12 +154,14 @@ class ApiKey:
         key: str,
         account: str,
         *,
+        id: int = 0,
         rpm_limit: int | None = None,
         max_concurrency: int = 4,
         weight: float = 1.0,
         tags: Sequence[str] = (),
         account_state: AccountState | None = None,
     ) -> None:
+        self.id = id
         self.key = key
         self.account = account
         self.rpm_limit = rpm_limit
@@ -233,7 +235,7 @@ class ApiKey:
             window_len = len(self._window)
             rpm_limit = self.rpm_limit
         return {
-            "id": self.key_id,
+            "id": self.id,
             "account": self.account,
             "key": self.masked,
             "status": self.status.value,
@@ -264,6 +266,7 @@ class KeyPool:
         self._rng = rng or random.Random()
         self._accounts: dict[str, AccountState] = {}
         self._keys: list[ApiKey] = []
+        next_id = 1
         for account in accounts:
             acct_state = self._accounts.get(account.name)
             if acct_state is None:
@@ -279,6 +282,7 @@ class KeyPool:
                     ApiKey(
                         raw,
                         account.name,
+                        id=next_id,
                         rpm_limit=account.rpm_limit,
                         max_concurrency=account.max_concurrency,
                         weight=account.weight,
@@ -286,8 +290,10 @@ class KeyPool:
                         account_state=acct_state,
                     )
                 )
+                next_id += 1
         if not self._keys:
             raise ConfigError("Key 池为空：请至少配置一个账号和一把 Key")
+        self._next_id = next_id
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._cursor = 0
@@ -308,11 +314,19 @@ class KeyPool:
                 return item
         return None
 
-    def find_by_id(self, identifier: str) -> ApiKey | None:
-        """按明文或 ``key_id`` 查找，方便控制台用脱敏标识操作。"""
-        found = self.find_key(identifier)
+    def find_by_id(self, identifier: str | int) -> ApiKey | None:
+        """按数字 id / 明文 / 旧 ``key_id`` 查找，方便控制台用短标识操作。"""
+        found = self.find_key(str(identifier))
         if found is not None:
             return found
+        try:
+            numeric = int(identifier)
+        except (TypeError, ValueError):
+            numeric = None
+        if numeric is not None:
+            for item in self._keys:
+                if item.id == numeric:
+                    return item
         for item in self._keys:
             if item.key_id == identifier:
                 return item
@@ -354,12 +368,14 @@ class KeyPool:
             item = ApiKey(
                 key,
                 acct_name,
+                id=self._next_id,
                 rpm_limit=rpm_limit,
                 max_concurrency=max_concurrency,
                 weight=weight,
                 tags=tags,
                 account_state=acct_state,
             )
+            self._next_id += 1
             self._keys.append(item)
             self._cond.notify_all()
             return item
@@ -367,14 +383,22 @@ class KeyPool:
     def remove_key(self, key: str) -> ApiKey | None:
         """运行中移除一把 Key，返回被移除的对象（不存在则返回 None）。
 
-        参数可以是 Key 明文，也可以是 ``key_id``（控制台只有脱敏值）。
+        参数可以是 Key 明文、数字 ``id``，或旧 ``key_id``。
 
         允许移除"正在处理请求"的 Key：在途请求持有的是它自己的 ``ApiKey`` 对象，
         释放时照常 ``release``，只是不再参与后续调度。所以这里不需要等它跑完。
         """
+        try:
+            numeric = int(key)
+        except (TypeError, ValueError):
+            numeric = None
         with self._cond:
             for index, item in enumerate(self._keys):
-                if item.key == key or item.key_id == key:
+                if (
+                    item.key == key
+                    or item.key_id == key
+                    or (numeric is not None and item.id == numeric)
+                ):
                     del self._keys[index]
                     if self._cursor >= len(self._keys):
                         self._cursor = 0

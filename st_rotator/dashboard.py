@@ -1550,7 +1550,7 @@ function renderPool(state) {
     if (S.poolPage < 1) S.poolPage = 1;
     var start = (S.poolPage - 1) * size;
     var pageKeys = filtered.slice(start, start + size);
-    var head = "<tr><th>id</th><th>账号</th><th>Key</th><th>状态</th><th>冷却</th><th>RPM</th>" +
+    var head = "<tr><th class='num'>ID</th><th>账号</th><th>Key</th><th>状态</th><th>冷却</th><th>RPM</th>" +
       "<th class='num'>成功/失败</th><th class='num'>429</th><th class='num'>延迟</th>" +
       "<th class='num' title='通用积分池 5 小时窗口剩余额度'>通用 5h 余量</th>" +
       "<th class='num' title='通用积分池 5 小时窗口重置倒计时'>通用 5h 重置</th>" +
@@ -1568,7 +1568,7 @@ function renderPool(state) {
       var flash = q && q.status === "ok" ? q.flash_lite : null;
       var label = k.username || k.account;
       return "<tr>" +
-        '<td class="mono">' + esc(k.id) + "</td>" +
+        '<td class="num">' + esc(k.id) + "</td>" +
         "<td>" + esc(label) +
           (as[k.account] && as[k.account].status === "password_error"
             ? ' <span class="pill invalid" title="' + esc(as[k.account].message || "登录失败：密码错误") + '">密码错误</span>'

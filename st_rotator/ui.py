@@ -26,7 +26,7 @@
 * 只监听 127.0.0.1（由 CLI 保证），不对外暴露。
 * 若网关设了 ``--token``，``/api/*`` 一律要求 Bearer 鉴权；页面本身是空壳，不含密钥，
   所以可以免鉴权加载，Token 由用户在前端输入后存 localStorage。
-* 页面展示的 Key 永远是脱敏值；对 Key 的操作走 ``key_id``（sha256 前 12 位），
+* 页面展示的 Key 永远是脱敏值；对 Key 的操作走数字 ``id``（池内顺序递增），
   前端拿不到也不需要明文。
 """
 
@@ -609,7 +609,7 @@ class ConsoleState:
                 self.store.reload()
                 self.rotator.config.accounts = list(self.store.config.accounts)
             added.append(
-                {"id": item.key_id, "key": item.masked, "account": item.account}
+                {"id": item.id, "key": item.masked, "account": item.account}
             )
 
         if added:
@@ -756,7 +756,7 @@ class ConsoleState:
                     self.store.reload()
                     self.rotator.config.accounts = list(self.store.config.accounts)
                 added.append(
-                    {"id": item.key_id, "key": item.masked, "account": item.account}
+                    {"id": item.id, "key": item.masked, "account": item.account}
                 )
                 results.append(row(line_no, parts, "ok", "已导入", item.masked))
                 ok += 1
@@ -788,7 +788,7 @@ class ConsoleState:
         return user or phone
 
     def verify_one(self, identifier: str) -> UiResponse:
-        """体检池中某一把 Key（identifier 可以是 key_id 或明文）。"""
+        """体检池中某一把 Key（identifier 可以是数字 id、key_id 或明文）。"""
         item = self.rotator.pool.find_by_id(identifier)
         if item is None:
             return UiResponse.error("池中找不到这把 Key（可能已被删除）", status=404)
