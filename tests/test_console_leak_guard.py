@@ -254,6 +254,17 @@ class RotateAccountKeyTest(unittest.TestCase):
             self.assertIn("已更换 Key", resp.payload["message"])
             self.assertEqual(worker.calls, ["账号1"])
 
+    def test_logs_manual_change_details(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = _FakeGuardWorker({"ok": True, "status": "ok", "message": "ok"})
+            console = self._console(tmp, leak_guard=worker)
+            console.rotate_account_key("账号1")
+            _cursor, items = console.buffer.since(0)
+            text = "\n".join(str(i["text"]) for i in items)
+            self.assertIn("手动更换 Key：账号 账号1", text)
+            self.assertIn("新 Key", text)
+            self.assertIn("检测", text)
+
     def test_rotation_failure_returns_502(self):
         with tempfile.TemporaryDirectory() as tmp:
             worker = _FakeGuardWorker(
@@ -263,6 +274,36 @@ class RotateAccountKeyTest(unittest.TestCase):
             resp = console.rotate_account_key("账号1")
             self.assertEqual(resp.status, 502)
             self.assertIn("boom", resp.payload["error"]["message"])
+
+
+class ProbeNewKeyTest(unittest.TestCase):
+    """新建 Key 的探测：平台生效有延迟，401/403（invalid）时短重试。"""
+
+    def _console(self, tmp: str, probe):
+        store = _load_store(tmp)
+        rotator = _FakeRotator(store.config)
+        rotator.probe_key = probe  # type: ignore[method-assign]
+        return ConsoleState(store=store, rotator=rotator)  # type: ignore[arg-type]
+
+    def test_retries_until_valid(self):
+        seq = iter([("invalid", "401"), ("invalid", "401"), ("ok", "ok")])
+        with tempfile.TemporaryDirectory() as tmp:
+            console = self._console(tmp, lambda _k: next(seq))
+            verdict, _detail = console._probe_new_key("sk-x", attempts=5, delay=0.0)
+            self.assertEqual(verdict, "ok")
+
+    def test_gives_up_after_attempts(self):
+        calls = {"n": 0}
+
+        def probe(_k):
+            calls["n"] += 1
+            return ("invalid", "401")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            console = self._console(tmp, probe)
+            verdict, _detail = console._probe_new_key("sk-x", attempts=3, delay=0.0)
+            self.assertEqual(verdict, "invalid")
+            self.assertEqual(calls["n"], 3)
 
 
 if __name__ == "__main__":

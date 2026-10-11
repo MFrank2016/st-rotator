@@ -545,6 +545,7 @@ def build_leak_guard(
             persist=persist,
             key_name=config.leak_guard.key_name,
             key_type=config.leak_guard.key_type,
+            log=sink,
         )
 
     path = Path(store.path).resolve().parent / "guard.json"

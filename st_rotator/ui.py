@@ -840,17 +840,21 @@ class ConsoleState:
             return UiResponse.error(
                 "泄漏守卫未运行（需启用 leak_guard 且账号配置了登录凭据）", status=409
             )
+        self._log(f"[控制台] 手动更换 Key：账号 {name}")
         result = self.leak_guard.rotate_now(name)
         if not result.get("ok"):
             status = {"not_found": 404, "no_credentials": 400}.get(
                 str(result.get("status")), 502
             )
-            return UiResponse.error(
-                str(result.get("message") or "更换 Key 失败"), status=status
+            message = str(result.get("message") or "更换 Key 失败")
+            self._log(
+                f"[控制台] 账号 {name}：更换 Key 失败（{result.get('status')}）：{message}"
             )
+            return UiResponse.error(message, status=status)
         fresh = next((a for a in self.config.accounts if a.name == name), None)
         new_key = fresh.api_keys[0] if fresh and fresh.api_keys else ""
         if not new_key:
+            self._log(f"[控制台] 账号 {name}：已更换 Key，但未取到新 Key 做探测")
             return UiResponse.json(
                 {
                     "ok": True,
@@ -859,11 +863,17 @@ class ConsoleState:
                     "message": f"账号 {name} 已更换 Key，但未取到新 Key 做探测",
                 }
             )
-        verdict, detail = self.rotator.probe_key(new_key)
+        verdict, detail = self._probe_new_key(new_key)
         labels = {"ok": "可用", "invalid": "不可用", "unknown": "暂时无法确认"}
+        self._log(
+            f"[控制台] 账号 {name}：新 Key {_mask(new_key)} 检测 "
+            f"{labels.get(verdict, verdict)}（{detail}）"
+        )
         note = f"新 Key {labels.get(verdict, verdict)}"
         if detail:
             note += f"（{detail}）"
+        if verdict == "invalid":
+            note += "；平台新建 Key 有短暂生效延迟，稍后会自动复探"
         return UiResponse.json(
             {
                 "ok": True,
@@ -872,6 +882,18 @@ class ConsoleState:
                 "message": f"账号 {name} 已更换 Key；{note}",
             }
         )
+
+    def _probe_new_key(
+        self, key: str, *, attempts: int = 5, delay: float = 2.0
+    ) -> tuple[str, str]:
+        """探测刚新建的 Key；平台新建 Key 生效有短暂延迟，401/403（invalid）时短重试几次。"""
+        verdict, detail = self.rotator.probe_key(key)
+        for _ in range(max(0, int(attempts) - 1)):
+            if verdict != "invalid":
+                break
+            time.sleep(delay)
+            verdict, detail = self.rotator.probe_key(key)
+        return verdict, detail
 
     def set_model(self, model: str) -> UiResponse:
         model = (model or "").strip()

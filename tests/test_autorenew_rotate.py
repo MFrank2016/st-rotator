@@ -257,6 +257,35 @@ class RotateAccountTest(unittest.TestCase):
         )
         self.assertEqual(self.persist_calls, [("账号1", ["sk-a"], "sk-new-plain")])
 
+    # ------------------------------------------------------------ 8. 业务日志
+    def test_logs_details_with_masked_keys(self):
+        """log 回调收到：登录成功 / 注销旧 Key / 新建 Key / 本地已更新；明文绝不出现。"""
+        from st_rotator.keypool import mask_key
+
+        logs: list[str] = []
+        account = self._account(api_keys=["sk-a"])
+        keys = _FakeKeys()
+        keys.list_result = [
+            _key("old-1", "sk-old-secret-1"),
+            _key("old-2", "sk-old-secret-2"),
+        ]
+        outcome = rotate_account(
+            account,
+            login=_FakeLogin(),
+            keys=keys,
+            persist=self._persist,
+            log=logs.append,
+        )
+        self.assertTrue(outcome.ok)
+        joined = "\n".join(logs)
+        self.assertIn("登录成功", joined)
+        self.assertEqual(joined.count("已注销旧 Key"), 2)
+        self.assertIn("已新建 Key", joined)
+        self.assertIn("本地 Key 已更新", joined)
+        for secret in ("sk-old-secret-1", "sk-old-secret-2", "sk-new-plain"):
+            self.assertNotIn(secret, joined)
+        self.assertIn(mask_key("sk-new-plain"), joined)
+
     # ------------------------------------------------------------ 7. 截断
     def test_message_truncated_to_detail_limit(self):
         """超长错误摘要截断到 DETAIL_LIMIT。"""

@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .config import AccountConfig
+from .keypool import mask_key
 from .quota import USER_AGENT, QuotaAuthError, QuotaUnavailable, TokenBundle
 
 # ---------------------------------------------------------------- 常量
@@ -245,14 +246,16 @@ def rotate_account(
     key_name: str = "auto",
     key_type: str = "API_KEY_TYPE_TOKEN_PLAN",
     on_login: Callable[[], None] | None = None,
+    log: Callable[[str], None] | None = None,
 ) -> RotationOutcome:
     """登录该账号 → 注销平台侧全部 key → 新建一把 → persist(account.name, old_keys, new_key)。
 
     平台操作顺序固定为「先 list+delete-all 后 create」（历史 bug：反序会把刚建的 key 一并删掉）。
     异常分类：QuotaAuthError→password_error；QuotaUnavailable→unavailable；
-    其它登录异常或平台异常→check_error；成功→ok。**不打印任何日志、不写状态**；
-    ``on_login`` 在登录成功后、平台操作前回调（供调用方打印「开始轮换」等）。
+    其它登录异常或平台异常→check_error；成功→ok。**不写状态**；
+    ``on_login`` 在登录成功后、平台操作前回调；``log`` 收到详细业务日志（旧/新 Key 一律脱敏）。
     """
+    emit = log or (lambda _message: None)
     try:
         bundle = login(account.user, account.password)
     except QuotaAuthError as exc:
@@ -267,9 +270,12 @@ def rotate_account(
         )
     if on_login is not None:
         on_login()
+    emit(f"账号 {account.name}：登录成功，开始更换 Key")
     try:
-        for item in keys.list_keys(bundle.access_token):
+        old_keys = list(keys.list_keys(bundle.access_token))
+        for item in old_keys:
             keys.delete_key(bundle.access_token, key_id=item.id)
+            emit(f"账号 {account.name}：已注销旧 Key {mask_key(item.api_key)}")
         created = keys.create_key(
             bundle.access_token,
             displayname=key_name,
@@ -279,7 +285,9 @@ def rotate_account(
         return RotationOutcome(
             False, "check_error", f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT]
         )
+    emit(f"账号 {account.name}：已新建 Key {mask_key(created.api_key)}（{key_type}）")
     persist(account.name, list(account.api_keys), created.api_key)
+    emit(f"账号 {account.name}：本地 Key 已更新为 {mask_key(created.api_key)}")
     return RotationOutcome(True, "ok", "")
 
 
