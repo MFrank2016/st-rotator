@@ -65,6 +65,16 @@ class GuardStoreTest(unittest.TestCase):
             with self.assertRaises(GuardError):
                 GuardStore.load(path)
 
+    def test_remove_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "guard.json"
+            store = GuardStore.load(path)
+            store.add_pending(["A", "B"])
+            self.assertTrue(store.remove_pending("A"))
+            self.assertEqual(store.pending(), ["B"])
+            self.assertFalse(store.remove_pending("A"))  # 已不在清单
+            self.assertEqual(GuardStore.load(path).pending(), ["B"])
+
 
 if __name__ == "__main__":
     unittest.main()

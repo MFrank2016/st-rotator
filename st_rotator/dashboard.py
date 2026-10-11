@@ -1026,9 +1026,36 @@ function renderLeakGuard(state) {
     if (!pend.length) {
       pendHost.innerHTML = '<div class="empty">暂无待轮换账号</div>';
     } else {
-      pendHost.innerHTML = "<table><tr><th>待轮换账号</th></tr>" +
-        pend.map(function (n) { return "<tr><td>" + esc(n) + "</td></tr>"; }).join("") + "</table>";
+      pendHost.innerHTML = "<table><tr><th>待轮换账号</th><th style='text-align:right'>操作</th></tr>" +
+        pend.map(function (n) {
+          return "<tr><td>" + esc(n) + "</td>" +
+            '<td style="text-align:right;white-space:nowrap">' +
+            '<button class="tiny" data-rotate="' + esc(n) + '">更换 Key</button></td></tr>';
+        }).join("") + "</table>";
+      Array.prototype.forEach.call(pendHost.querySelectorAll("button[data-rotate]"), function (button) {
+        button.onclick = function () { onLeakGuardRotate(button.dataset.rotate, button); };
+      });
     }
+  }
+}
+
+/* 手动更换某账号的 Key：登录→注销全部→新建→落盘→探测（服务端一次完成）。 */
+async function onLeakGuardRotate(account, button) {
+  if (!window.confirm("确定更换账号「" + account + "」的 Key？\n将注销该账号在平台侧的全部 Key 并新建一把，然后更新本地配置。")) return;
+  var old = button.textContent;
+  button.disabled = true;
+  button.innerHTML = '<span class="spin">◌</span>';
+  try {
+    var res = await api("/api/leak-guard/rotate", {
+      method: "POST", body: JSON.stringify({ account: account })
+    });
+    toast(res.message || "已更换 Key", res.verdict === "invalid" ? "err" : "ok");
+    await refreshState();
+  } catch (err) {
+    toast(err.message, "err");
+  } finally {
+    button.disabled = false;
+    button.textContent = old;
   }
 }
 

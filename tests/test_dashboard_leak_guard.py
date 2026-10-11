@@ -21,6 +21,14 @@ class DashboardLeakGuardTest(unittest.TestCase):
     def test_reuses_pill_class(self):
         self.assertIn('class="pill ', DASHBOARD_HTML)
 
+    def test_rotate_action_wired(self):
+        # 待轮换清单新增「操作」列与「更换 Key」按钮，点击调 /api/leak-guard/rotate。
+        self.assertIn("操作", DASHBOARD_HTML)
+        self.assertIn("更换 Key", DASHBOARD_HTML)
+        self.assertIn("data-rotate=", DASHBOARD_HTML)
+        self.assertIn("function onLeakGuardRotate", DASHBOARD_HTML)
+        self.assertIn("/api/leak-guard/rotate", DASHBOARD_HTML)
+
 
 if __name__ == "__main__":
     unittest.main()

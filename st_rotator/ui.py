@@ -828,6 +828,51 @@ class ConsoleState:
         self._save_and_log(f"通过控制台删除 Key：{label}")
         return UiResponse.json({"ok": True, "message": f"已删除 {label}"})
 
+    def rotate_account_key(self, name: str) -> UiResponse:
+        """手动更换某账号的 Key（泄漏守卫操作列）。
+
+        登录 → 注销该账号全部 Key → 新建 → 落盘，然后探测新 Key 可用性。
+        """
+        name = (name or "").strip()
+        if not name:
+            return UiResponse.error("账号名不能为空")
+        if self.leak_guard is None:
+            return UiResponse.error(
+                "泄漏守卫未运行（需启用 leak_guard 且账号配置了登录凭据）", status=409
+            )
+        result = self.leak_guard.rotate_now(name)
+        if not result.get("ok"):
+            status = {"not_found": 404, "no_credentials": 400}.get(
+                str(result.get("status")), 502
+            )
+            return UiResponse.error(
+                str(result.get("message") or "更换 Key 失败"), status=status
+            )
+        fresh = next((a for a in self.config.accounts if a.name == name), None)
+        new_key = fresh.api_keys[0] if fresh and fresh.api_keys else ""
+        if not new_key:
+            return UiResponse.json(
+                {
+                    "ok": True,
+                    "account": name,
+                    "verdict": "unknown",
+                    "message": f"账号 {name} 已更换 Key，但未取到新 Key 做探测",
+                }
+            )
+        verdict, detail = self.rotator.probe_key(new_key)
+        labels = {"ok": "可用", "invalid": "不可用", "unknown": "暂时无法确认"}
+        note = f"新 Key {labels.get(verdict, verdict)}"
+        if detail:
+            note += f"（{detail}）"
+        return UiResponse.json(
+            {
+                "ok": True,
+                "account": name,
+                "verdict": verdict,
+                "message": f"账号 {name} 已更换 Key；{note}",
+            }
+        )
+
     def set_model(self, model: str) -> UiResponse:
         model = (model or "").strip()
         if not model:
@@ -1257,6 +1302,8 @@ class ConsoleState:
                     return self.remove_one(
                         str(payload.get("id") or payload.get("key") or "")
                     )
+                if path == "/api/leak-guard/rotate":
+                    return self.rotate_account_key(str(payload.get("account") or ""))
                 if path == "/api/model":
                     return self.set_model(str(payload.get("model") or ""))
                 if path == "/api/models/refresh":

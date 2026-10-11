@@ -195,5 +195,75 @@ class BuildLeakGuardTest(unittest.TestCase):
             self.assertFalse(worker._thread.is_alive())  # type: ignore[union-attr]
 
 
+class _FakeGuardWorker:
+    """带 rotate_now() 的假泄漏守卫 worker。"""
+
+    def __init__(self, result: dict) -> None:
+        self._result = result
+        self.calls: list[str] = []
+
+    def rotate_now(self, name: str) -> dict:
+        self.calls.append(name)
+        return self._result
+
+
+class RotateAccountKeyTest(unittest.TestCase):
+    def _console(self, tmp: str, *, leak_guard) -> ConsoleState:
+        store = _load_store(tmp, credentials=True)
+        rotator = _FakeRotator(store.config)
+        return ConsoleState(  # type: ignore[arg-type]
+            store=store, rotator=rotator, leak_guard=leak_guard
+        )
+
+    def test_no_worker_returns_409(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _load_store(tmp)
+            rotator = _FakeRotator(store.config)
+            console = ConsoleState(store=store, rotator=rotator)  # type: ignore[arg-type]
+            self.assertEqual(console.rotate_account_key("账号1").status, 409)
+
+    def test_empty_name_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            console = self._console(tmp, leak_guard=_FakeGuardWorker({}))
+            self.assertEqual(console.rotate_account_key("  ").status, 400)
+
+    def test_not_found_returns_404(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = _FakeGuardWorker(
+                {"ok": False, "status": "not_found", "message": "账号 x 不存在"}
+            )
+            console = self._console(tmp, leak_guard=worker)
+            self.assertEqual(console.rotate_account_key("x").status, 404)
+
+    def test_no_credentials_returns_400(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = _FakeGuardWorker(
+                {"ok": False, "status": "no_credentials", "message": "未配置凭据"}
+            )
+            console = self._console(tmp, leak_guard=worker)
+            self.assertEqual(console.rotate_account_key("账号1").status, 400)
+
+    def test_success_probes_new_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = _FakeGuardWorker({"ok": True, "status": "ok", "message": "ok"})
+            console = self._console(tmp, leak_guard=worker)
+            resp = console.rotate_account_key("账号1")
+            self.assertEqual(resp.status, 200)
+            self.assertTrue(resp.payload["ok"])
+            self.assertEqual(resp.payload["verdict"], "ok")
+            self.assertIn("已更换 Key", resp.payload["message"])
+            self.assertEqual(worker.calls, ["账号1"])
+
+    def test_rotation_failure_returns_502(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = _FakeGuardWorker(
+                {"ok": False, "status": "check_error", "message": "boom"}
+            )
+            console = self._console(tmp, leak_guard=worker)
+            resp = console.rotate_account_key("账号1")
+            self.assertEqual(resp.status, 502)
+            self.assertIn("boom", resp.payload["error"]["message"])
+
+
 if __name__ == "__main__":
     unittest.main()

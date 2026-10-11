@@ -298,6 +298,50 @@ class LeakGuardWorkerTest(unittest.TestCase):
                 worker.status()["next_rotate_at"], _epoch_at(2026, 10, 10, 2, 0), places=0
             )
 
+    # ------------------------------------------------------------ 手动更换 Key
+    def test_rotate_now_success_removes_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = GuardStore.load(Path(tmp) / "guard.json")
+            store.add_pending(["A", "B"])
+            account = AccountConfig(name="A", api_keys=["sk-a"], user="u", password="p")
+            worker = self._worker(store=store, clock=_Clock(0.0), accounts=[account])
+            res = worker.rotate_now("A")
+            self.assertTrue(res["ok"])
+            self.assertEqual(self.rotate_calls, ["A"])
+            self.assertEqual(store.pending(), ["B"])
+
+    def test_rotate_now_not_found(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = GuardStore.load(Path(tmp) / "guard.json")
+            worker = self._worker(store=store, clock=_Clock(0.0), accounts=[])
+            res = worker.rotate_now("ghost")
+            self.assertFalse(res["ok"])
+            self.assertEqual(res["status"], "not_found")
+
+    def test_rotate_now_no_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = GuardStore.load(Path(tmp) / "guard.json")
+            account = AccountConfig(name="A", api_keys=["sk-a"], user="", password="")
+            worker = self._worker(store=store, clock=_Clock(0.0), accounts=[account])
+            res = worker.rotate_now("A")
+            self.assertFalse(res["ok"])
+            self.assertEqual(res["status"], "no_credentials")
+
+    def test_rotate_now_failure_reports_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = GuardStore.load(Path(tmp) / "guard.json")
+            account = AccountConfig(name="A", api_keys=["sk-a"], user="u", password="p")
+            worker = self._worker(
+                store=store,
+                clock=_Clock(0.0),
+                accounts=[account],
+                rotate=lambda _a: RotationOutcome(False, "password_error", "密码错误"),
+            )
+            res = worker.rotate_now("A")
+            self.assertFalse(res["ok"])
+            self.assertEqual(res["status"], "password_error")
+            self.assertEqual(res["message"], "密码错误")
+
 
 if __name__ == "__main__":
     unittest.main()

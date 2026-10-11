@@ -143,6 +143,15 @@ class GuardStore:
                 self._save()
             return added
 
+    def remove_pending(self, name: str) -> bool:
+        """从待轮换清单移除某账号并落盘；返回是否确实移除。"""
+        with self._lock:
+            if name not in self._pending:
+                return False
+            self._pending = [item for item in self._pending if item != name]
+            self._save()
+            return True
+
     def finish_rotation(self, date: str) -> None:
         """记录一次轮换完成：清空待轮换清单 + 记下日期，一次性落盘。"""
         with self._lock:
@@ -347,6 +356,38 @@ class LeakGuardWorker:
             f"轮换 {ok} 成功 / {failed} 失败",
             log_line=f"[泄漏守卫] {date} 定时轮换完成：成功 {ok}，失败 {failed}",
         )
+
+    # ------------------------------------------------------------ 手动操作
+
+    def rotate_now(self, name: str) -> dict[str, Any]:
+        """手动更换某账号的 Key：登录 → 注销全部 Key → 新建 → 落盘；成功则移出待轮换清单。
+
+        与定时轮换共用同一套 ``rotate`` 回调与 ``persist``；用 ``_cycle_lock`` 串行化，
+        避免与后台扫描 / 轮换并发。返回 ``{"ok", "status", "message"}``（**不含明文 Key**）。
+        """
+        account = next((a for a in self._accounts() if a.name == name), None)
+        if account is None:
+            return {"ok": False, "status": "not_found", "message": f"账号 {name} 不存在"}
+        if not account.user or not account.password:
+            return {
+                "ok": False,
+                "status": "no_credentials",
+                "message": f"账号 {name} 未配置登录凭据",
+            }
+        try:
+            with self._cycle_lock:
+                outcome = self._rotate(account)
+        except Exception as exc:  # noqa: BLE001 - 手动操作也要把异常收敛为结果
+            return {
+                "ok": False,
+                "status": "check_error",
+                "message": f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT],
+            }
+        if not outcome.ok:
+            return {"ok": False, "status": outcome.status, "message": outcome.message}
+        self._store.remove_pending(name)
+        self._log(f"[泄漏守卫] 手动更换 Key 成功：{name}")
+        return {"ok": True, "status": "ok", "message": f"账号 {name} 已更换 Key"}
 
     # ------------------------------------------------------------ 状态
 
