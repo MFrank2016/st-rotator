@@ -28,8 +28,8 @@ class DashboardQuotaTest(unittest.TestCase):
         self.assertIn("fmtCountdown(agg.reset5, false)", DASHBOARD_HTML)
         self.assertIn("fmtCountdown(agg.reset7, true)", DASHBOARD_HTML)
         # Key 池：5h 重置列短格式，7d 重置列长格式。
-        self.assertIn('countdownCell(quotaResetAt(general, "h5"))', DASHBOARD_HTML)
-        self.assertIn('countdownCell(quotaResetAt(general, "d7"), true)', DASHBOARD_HTML)
+        self.assertIn('countdownCell(quotaResetAt(general, "h5"), false, "通用 5h 重置")', DASHBOARD_HTML)
+        self.assertIn('countdownCell(quotaResetAt(general, "d7"), true, "通用 7d 重置")', DASHBOARD_HTML)
 
     def test_aggregate_cards_use_guard(self):
         # 无可用账号时聚合卡片显示 —，走 aggText 守卫。

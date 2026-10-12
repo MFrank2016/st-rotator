@@ -125,6 +125,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   td.mono { font-family: var(--mono); font-size: 11.5px; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
   th.num { text-align: right; }
+  /* 表格容器各自横向滚动：宽表不再把整页撑出横向滚动条（窄屏尤其明显） */
+  #pool, #samples, #import-result, #rp-reg-table, #leak-guard-pending { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 
   .pill {
     display: inline-block; padding: 2px 8px; border-radius: 20px;
@@ -220,6 +222,57 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     background: var(--accent-soft); color: var(--accent); margin-right: 3px;
   }
   svg.spark { display: block; width: 100%; height: 34px; margin-top: 6px; }
+
+  /* 手机（≤640px）：收紧留白、放大触控目标、允许宽行 / 宽标题换行 */
+  @media (max-width: 640px) {
+    .wrap { padding: 12px 12px 32px; }
+    header { flex-wrap: wrap; row-gap: 10px; padding: 13px 14px; }
+    header h1 { font-size: 14px; }
+    header .spacer { display: none; }
+    header > div:first-child { flex: 1 1 100%; }
+    header button { flex: 1 1 0; }
+    button { white-space: nowrap; padding: 8px 14px; }
+    button.tiny { padding: 7px 11px; }
+    .tabs button { padding: 6px 12px; }
+    .card { padding: 13px; }
+    .card h2 { flex-wrap: wrap; row-gap: 6px; }
+    .grid { gap: 12px; }
+    .kpis { grid-template-columns: repeat(auto-fit, minmax(136px, 1fr)); gap: 10px; }
+    .kpi .value { font-size: 20px; }
+    body { font-size: 13.5px; }
+    .row { flex-wrap: wrap; }
+    .row > .field { flex: 1 1 calc(50% - 5px); }
+    .row > .grow { flex: 1 1 100%; }
+    input, select, input.mono, select.mono { font-size: 16px; }
+    input[type=checkbox] { min-width: 17px; min-height: 17px; }
+    .banner { flex-wrap: wrap; }
+    .banner input { max-width: none; }
+    dialog { padding: 15px; }
+    .toast { left: 12px; right: 12px; align-items: stretch; }
+    .toast div { max-width: none; }
+
+    /* Key 池 / 采样表在手机上改为卡片：每行一张卡，字段前带标签 */
+    #pool table, #samples table { display: block; }
+    #pool thead, #samples thead { display: none; }
+    #pool tbody, #samples tbody { display: block; }
+    #pool tr, #samples tr {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 5px 14px;
+      border: 1px solid var(--border); border-radius: 10px;
+      padding: 11px 12px; margin-bottom: 10px;
+    }
+    #pool tr:last-child, #samples tr:last-child { margin-bottom: 0; }
+    #pool td, #samples td {
+      display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+      border: none; padding: 0; text-align: right;
+    }
+    #pool td::before, #samples td::before {
+      content: attr(data-label); flex: 0 0 auto; text-align: left;
+      color: var(--muted); font-size: 11px;
+    }
+    #pool td:nth-child(1), #pool td:nth-child(2), #pool td:nth-child(3),
+    #pool td:nth-last-child(2), #pool td:last-child { grid-column: 1 / -1; }
+    #pool td:last-child { justify-content: flex-end; padding-top: 6px; }
+  }
 </style>
 </head>
 <body>
@@ -721,9 +774,10 @@ function quotaResetAt(pair, window) {
   return pair && pair[window] ? pair[window].reset_at : null;
 }
 
-function countdownCell(resetAt, longForm) {
-  if (!resetAt) return '<td class="num">—</td>';
-  return '<td class="num" data-reset-at="' + esc(resetAt) + '"' + (longForm ? ' data-long="1"' : "") + '>' +
+function countdownCell(resetAt, longForm, label) {
+  var lab = label ? ' data-label="' + esc(label) + '"' : "";
+  if (!resetAt) return '<td class="num"' + lab + ">—</td>";
+  return '<td class="num"' + lab + ' data-reset-at="' + esc(resetAt) + '"' + (longForm ? ' data-long="1"' : "") + ">" +
     esc(fmtCountdown(resetAt, longForm)) + "</td>";
 }
 
@@ -775,9 +829,9 @@ function renderSamples() {
     var t = new Date(s.ts * 1000);
     var hh = ("0" + t.getHours()).slice(-2) + ":" + ("0" + t.getMinutes()).slice(-2) + ":" + ("0" + t.getSeconds()).slice(-2);
     var pool = s.pool === "general" ? "通用" : "专属";
-    return "<tr><td class='mono'>" + hh + "</td><td>" + esc(s.account) + "</td><td>" + pool + "</td><td class='num'>" + fmtInt(Math.round(s.used)) + "</td><td class='num'>+" + fmtInt(Math.round(s.delta)) + "</td></tr>";
+    return "<tr><td class='mono' data-label='时间'>" + hh + "</td><td data-label='账号'>" + esc(s.account) + "</td><td data-label='池'>" + pool + "</td><td class='num' data-label='used'>" + fmtInt(Math.round(s.used)) + "</td><td class='num' data-label='消耗 Δ'>+" + fmtInt(Math.round(s.delta)) + "</td></tr>";
   }).join("");
-  host.innerHTML = "<table>" + head + body + "</table>";
+  host.innerHTML = "<table><thead>" + head + "</thead><tbody>" + body + "</tbody></table>";
   if (note) note.textContent = "共 " + data.length + " 条差异采样";
 }
 
@@ -1592,32 +1646,32 @@ function renderPool(state) {
       var flash = q && q.status === "ok" ? q.flash_lite : null;
       var label = k.username || k.account;
       return "<tr>" +
-        '<td class="num">' + esc(k.id) + "</td>" +
-        "<td>" + esc(label) +
+        '<td class="num" data-label="ID">' + esc(k.id) + "</td>" +
+        '<td data-label="账号">' + esc(label) +
           (as[k.account] && as[k.account].status === "password_error"
             ? ' <span class="pill invalid" title="' + esc(as[k.account].message || "登录失败：密码错误") + '">密码错误</span>'
             : "") +
         "</td>" +
-        '<td class="mono">' + esc(k.key) + "</td>" +
-        '<td><span class="pill ' + esc(k.status) + '">' + esc(statusText) + "</span></td>" +
-        '<td class="num">' + esc(cooldown) + "</td>" +
-        '<td class="mono">' + esc(k.rpm_window) + "</td>" +
-        '<td class="num">' + fmtInt(st.successes) + " / " + fmtInt(st.failures) + "</td>" +
-        '<td class="num">' + fmtInt(st.rate_limited) + "</td>" +
-        '<td class="num">' + (st.avg_latency_ms ? Math.round(st.avg_latency_ms) + "ms" : "—") + "</td>" +
-        '<td class="num">' + esc(quotaRemaining(general, "h5")) + "</td>" +
-        countdownCell(quotaResetAt(general, "h5")) +
-        '<td class="num">' + esc(quotaRemaining(general, "d7")) + "</td>" +
-        countdownCell(quotaResetAt(general, "d7"), true) +
-        '<td class="num">' + esc(quotaRemaining(flash, "h5")) + "</td>" +
-        '<td class="num">' + esc(quotaRemaining(flash, "d7")) + "</td>" +
-        '<td class="num" title="' + esc(k.updated_at ? fmtTime(k.updated_at) : "未知") + '">' + esc(fmtTime(k.updated_at)) + "</td>" +
+        '<td class="mono" data-label="Key">' + esc(k.key) + "</td>" +
+        '<td data-label="状态"><span class="pill ' + esc(k.status) + '">' + esc(statusText) + "</span></td>" +
+        '<td class="num" data-label="冷却">' + esc(cooldown) + "</td>" +
+        '<td class="mono" data-label="RPM">' + esc(k.rpm_window) + "</td>" +
+        '<td class="num" data-label="成功 / 失败">' + fmtInt(st.successes) + " / " + fmtInt(st.failures) + "</td>" +
+        '<td class="num" data-label="429">' + fmtInt(st.rate_limited) + "</td>" +
+        '<td class="num" data-label="延迟">' + (st.avg_latency_ms ? Math.round(st.avg_latency_ms) + "ms" : "—") + "</td>" +
+        '<td class="num" data-label="通用 5h 余量">' + esc(quotaRemaining(general, "h5")) + "</td>" +
+        countdownCell(quotaResetAt(general, "h5"), false, "通用 5h 重置") +
+        '<td class="num" data-label="通用 7d 余量">' + esc(quotaRemaining(general, "d7")) + "</td>" +
+        countdownCell(quotaResetAt(general, "d7"), true, "通用 7d 重置") +
+        '<td class="num" data-label="FL 5h 余量">' + esc(quotaRemaining(flash, "h5")) + "</td>" +
+        '<td class="num" data-label="FL 7d 余量">' + esc(quotaRemaining(flash, "d7")) + "</td>" +
+        '<td class="num" data-label="更新时间" title="' + esc(k.updated_at ? fmtTime(k.updated_at) : "未知") + '">' + esc(fmtTime(k.updated_at)) + "</td>" +
         '<td style="text-align:right;white-space:nowrap">' +
           '<button class="tiny" data-act="verify" data-id="' + esc(k.id) + '" data-label="' + esc(label + " / " + k.key) + '">测试</button> ' +
           '<button class="tiny danger" data-act="remove" data-id="' + esc(k.id) + '" data-label="' + esc(label + " / " + k.key) + '">删除</button>' +
         "</td></tr>";
     }).join("");
-    $("pool").innerHTML = "<table>" + head + body + "</table>";
+    $("pool").innerHTML = "<table><thead>" + head + "</thead><tbody>" + body + "</tbody></table>";
     Array.prototype.forEach.call($("pool").querySelectorAll("button[data-act]"), function (button) {
       button.onclick = function () {
         onPoolAction(button.dataset.act, button.dataset.id, button.dataset.label, button);
