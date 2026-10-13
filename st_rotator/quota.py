@@ -48,6 +48,10 @@ class QuotaAuthError(RuntimeError):
     """登录/凭据校验失败。"""
 
 
+class QuotaHTTPError(RuntimeError):
+    """登录/查询途中的 HTTP 失败，带状态码、URL 与响应体片段。"""
+
+
 @dataclass(frozen=True)
 class TokenBundle:
     access_token: str
@@ -260,21 +264,41 @@ class HttpQuotaTransport:
         jar = http.cookiejar.CookieJar()
         return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
+    def _open(self, opener: Any, req: Any, *, step: str) -> Any:
+        """包装 opener.open：HTTP 失败时带上状态码 / URL / 响应体片段再抛。
+
+        原生 ``HTTPError`` 的字符串只有 "HTTP Error 403: Forbidden"，既不知道是哪一步、
+        也不知道上游为什么拒；曾因此完全无法定位一次反复出现的 403。这里补齐这三样信息。
+        """
+        try:
+            return opener.open(req, timeout=self.timeout)
+        except urllib.error.HTTPError as exc:
+            snippet = ""
+            try:
+                snippet = exc.read().decode("utf-8", "replace")[:300]
+            except Exception:  # noqa: BLE001 - 读不到响应体就不带
+                pass
+            url = getattr(req, "full_url", str(req))
+            detail = f"HTTP {exc.code} {exc.reason} [{step}] {url}"
+            raise QuotaHTTPError(detail + (f" :: {snippet}" if snippet else "")) from exc
+
     def _get(
         self, opener: Any, url: str, *, params: Mapping[str, Any] | None = None
     ) -> Any:
         if params:
             url = url + "?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
-        return opener.open(req, timeout=self.timeout)
+        return self._open(opener, req, step="oidc-auth")
 
     def _public_key(self) -> Any:
         if self._pubkey is not None:
             return self._pubkey
         _jwe, jwk, _je = _jwcrypto()
         opener = self._opener()
-        resp = opener.open(
-            urllib.request.Request(JWKS_URL, headers={"User-Agent": USER_AGENT}), timeout=self.timeout
+        resp = self._open(
+            opener,
+            urllib.request.Request(JWKS_URL, headers={"User-Agent": USER_AGENT}),
+            step="jwks",
         )
         jwks = json.loads(resp.read().decode("utf-8"))
         key = next(k for k in jwks["keys"] if k.get("kid") == JWKS_KID)
@@ -321,7 +345,7 @@ class HttpQuotaTransport:
                 "User-Agent": USER_AGENT,
             },
         )
-        resp = opener.open(req, timeout=self.timeout)
+        resp = self._open(opener, req, step="nova-login")
         payload = json.loads(resp.read().decode("utf-8"))
         redirect = payload.get("redirect")
         if not redirect:
@@ -344,7 +368,7 @@ class HttpQuotaTransport:
             ).encode("utf-8"),
             headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": USER_AGENT},
         )
-        tok = json.loads(opener.open(token_req, timeout=self.timeout).read().decode("utf-8"))
+        tok = json.loads(self._open(opener, token_req, step="oidc-token").read().decode("utf-8"))
         access = tok.get("access_token")
         if not access:
             raise QuotaAuthError(str(tok.get("error_description") or tok.get("error") or "未返回 access_token"))
@@ -370,9 +394,10 @@ class HttpQuotaTransport:
                 return None
             if predicate(location):
                 return location
-            resp = opener.open(
+            resp = self._open(
+                opener,
                 urllib.request.Request(location, headers={"User-Agent": USER_AGENT, "Accept": "*/*"}),
-                timeout=self.timeout,
+                step="oidc-redirect",
             )
             final_url = resp.geturl()
             if final_url and predicate(final_url):
@@ -398,7 +423,7 @@ class HttpQuotaTransport:
                 "User-Agent": USER_AGENT,
             },
         )
-        resp = opener.open(req, timeout=self.timeout)
+        resp = self._open(opener, req, step="pool-usage")
         return normalize_pools(json.loads(resp.read().decode("utf-8")))
 
 

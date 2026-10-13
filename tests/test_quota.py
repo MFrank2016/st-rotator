@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.request
 from unittest import mock
 
 from st_rotator import quota
@@ -146,6 +147,39 @@ class FollowUntilTest(unittest.TestCase):
             )
             self.assertIsNotNone(url)
             self.assertIn("code=ABC123", url)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+
+class HttpErrorDetailTest(unittest.TestCase):
+    def test_http_error_carries_status_url_and_body(self):
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"account forbidden"}')
+
+            def log_message(self, *args) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            transport = quota.HttpQuotaTransport()
+            opener = transport._opener()
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/nova/login", data=b"{}")
+            with self.assertRaises(quota.QuotaHTTPError) as ctx:
+                transport._open(opener, req, step="nova-login")
+            msg = str(ctx.exception)
+            self.assertIn("403", msg)
+            self.assertIn("nova-login", msg)
+            self.assertIn("/nova/login", msg)
+            self.assertIn("account forbidden", msg)
         finally:
             server.shutdown()
             server.server_close()
