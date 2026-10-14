@@ -47,6 +47,18 @@ class UsageTrackerTest(unittest.TestCase):
         self.assertEqual([b["total"] for b in series], [0, 0, 0])
 
 
+class UsageTrackerActivityTest(unittest.TestCase):
+    def test_mark_activity_sets_last_at_without_tokens(self) -> None:
+        clock = _Clock(0.0)
+        tracker = UsageTracker(hours=48, clock=clock)
+        self.assertIsNone(tracker.last_at())
+        clock.t = 500.0
+        tracker.mark_activity()
+        self.assertEqual(tracker.last_at(), 500.0)
+        self.assertTrue(tracker.has_usage_since(500.0))
+        self.assertEqual([b["total"] for b in tracker.series(hours=1)], [0])
+
+
 class CreditTrackerTest(unittest.TestCase):
     def test_delta_and_window_reset(self) -> None:
         clock = _Clock(0.0)
@@ -55,18 +67,18 @@ class CreditTrackerTest(unittest.TestCase):
         clock.t = 300.0
         tracker.note("a", "general", reset_at=100, used=25.0)   # 差值 15
         clock.t = 600.0
-        tracker.note("a", "general", reset_at=200, used=7.0)    # 复位 → 差值 7
+        tracker.note("a", "general", reset_at=200, used=7.0)    # 复位 → 本区间归零
         snap = tracker.snapshot()
-        self.assertEqual(snap["general"]["h1"], 22.0)
+        self.assertEqual(snap["general"]["h1"], 15.0)
         self.assertEqual(snap["flash_lite"]["h1"], 0.0)
 
-    def test_used_drop_counts_as_reset(self) -> None:
+    def test_used_drop_not_counted(self) -> None:
         clock = _Clock(0.0)
         tracker = CreditTracker(hours=48, clock=clock)
         tracker.note("a", "general", reset_at=100, used=50.0)
         clock.t = 300.0
-        tracker.note("a", "general", reset_at=100, used=5.0)    # used 变小 → 视为复位，差值 5
-        self.assertEqual(tracker.snapshot()["general"]["h1"], 5.0)
+        tracker.note("a", "general", reset_at=100, used=5.0)    # 同窗口 used 变小 → 0
+        self.assertEqual(tracker.snapshot()["general"]["h1"], 0.0)
 
     def test_windows(self) -> None:
         clock = _Clock(0.0)

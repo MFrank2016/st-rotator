@@ -22,10 +22,10 @@ class AccountsWithDeltaSinceTest(unittest.TestCase):
         tracker.note("a", "general", reset_at=1, used=10.0)   # ts=0，delta=0
         clock.t = 300.0
         tracker.note("a", "general", reset_at=1, used=25.0)   # ts=300，delta=15
-        self.assertEqual(tracker.accounts_with_delta_since(300.0), ["a"])
+        self.assertEqual(tracker.accounts_with_delta_since(300.0), [("a", 15.0)])
         self.assertEqual(tracker.accounts_with_delta_since(301.0), [])
         # ts 含边界：早于有增量采样的时间点也拿不到
-        self.assertEqual(tracker.accounts_with_delta_since(100.0), ["a"])
+        self.assertEqual(tracker.accounts_with_delta_since(100.0), [("a", 15.0)])
 
     def test_pool_filter(self) -> None:
         clock = _Clock(0.0)
@@ -35,22 +35,37 @@ class AccountsWithDeltaSinceTest(unittest.TestCase):
         clock.t = 300.0
         tracker.note("g", "general", reset_at=1, used=5.0)     # general delta=5
         tracker.note("f", "flash_lite", reset_at=1, used=7.0)  # flash_lite delta=7
-        self.assertEqual(tracker.accounts_with_delta_since(0.0), ["g"])
-        self.assertEqual(tracker.accounts_with_delta_since(0.0, pool="flash_lite"), ["f"])
+        self.assertEqual(tracker.accounts_with_delta_since(0.0), [("g", 5.0)])
+        self.assertEqual(tracker.accounts_with_delta_since(0.0, pool="flash_lite"), [("f", 7.0)])
 
-    def test_zero_and_negative_delta_excluded(self) -> None:
+    def test_same_window_decrease_excluded(self) -> None:
         clock = _Clock(0.0)
         tracker = CreditTracker(hours=48, clock=clock)
         tracker.note("a", "general", reset_at=1, used=10.0)   # 首次采样 delta=0
         clock.t = 300.0
-        tracker.note("a", "general", reset_at=1, used=5.0)    # used 变小 → 视为复位，delta=5
-        self.assertEqual(tracker.accounts_with_delta_since(0.0), ["a"])
-        # 再采一次同值 → delta=0，不应改变结果
+        tracker.note("a", "general", reset_at=1, used=5.0)    # 同窗口 used 变小 → delta=0
+        self.assertEqual(tracker.accounts_with_delta_since(0.0), [])
         clock.t = 600.0
-        tracker.note("a", "general", reset_at=1, used=5.0)
-        self.assertEqual(tracker.accounts_with_delta_since(0.0), ["a"])
-        # 只要求 ts 落在两次有增量采样之间时也能拿到（去重后仍是 a）
+        tracker.note("a", "general", reset_at=1, used=5.0)    # 同值 → 仍无增量
+        self.assertEqual(tracker.accounts_with_delta_since(0.0), [])
         self.assertEqual(tracker.accounts_with_delta_since(600.0), [])
+
+    def test_window_reset_not_counted(self) -> None:
+        clock = _Clock(0.0)
+        tracker = CreditTracker(hours=48, clock=clock)
+        tracker.note("a", "general", reset_at=1, used=100.0)
+        clock.t = 300.0
+        tracker.note("a", "general", reset_at=2, used=7.0)    # reset_at 变化 → delta=0
+        self.assertEqual(tracker.accounts_with_delta_since(0.0), [])
+
+    def test_min_delta_threshold(self) -> None:
+        clock = _Clock(0.0)
+        tracker = CreditTracker(hours=48, clock=clock)
+        tracker.note("a", "general", reset_at=1, used=0.0)
+        clock.t = 300.0
+        tracker.note("a", "general", reset_at=1, used=0.5)    # delta=0.5，低于阈值
+        self.assertEqual(tracker.accounts_with_delta_since(0.0, min_delta=1.0), [])
+        self.assertEqual(tracker.accounts_with_delta_since(0.0), [("a", 0.5)])
 
     def test_dedupe_single_entry(self) -> None:
         clock = _Clock(0.0)
@@ -60,7 +75,7 @@ class AccountsWithDeltaSinceTest(unittest.TestCase):
         tracker.note("a", "general", reset_at=1, used=10.0)   # delta=10
         clock.t = 600.0
         tracker.note("a", "general", reset_at=1, used=30.0)   # delta=20
-        self.assertEqual(tracker.accounts_with_delta_since(0.0), ["a"])
+        self.assertEqual(tracker.accounts_with_delta_since(0.0), [("a", 30.0)])
 
     def test_order_preserved(self) -> None:
         clock = _Clock(0.0)
@@ -72,7 +87,7 @@ class AccountsWithDeltaSinceTest(unittest.TestCase):
         tracker.note("b", "general", reset_at=1, used=1.0)    # 首个有增量
         tracker.note("a", "general", reset_at=1, used=1.0)
         tracker.note("c", "general", reset_at=1, used=1.0)
-        self.assertEqual(tracker.accounts_with_delta_since(0.0), ["b", "a", "c"])
+        self.assertEqual(tracker.accounts_with_delta_since(0.0), [("b", 1.0), ("a", 1.0), ("c", 1.0)])
 
     def test_sample_records_coverage_start(self) -> None:
         clock = _Clock(0.0)
@@ -96,7 +111,7 @@ class AccountsWithDeltaSinceTest(unittest.TestCase):
         )
         # 网关消耗早于覆盖区间起点（since=0）→ 增量确属外部，计入
         self.assertEqual(
-            tracker.accounts_with_delta_since(0.0, idle_since=-10.0), ["a"]
+            tracker.accounts_with_delta_since(0.0, idle_since=-10.0), [("a", 50.0)]
         )
         # idle_since 恰好等于覆盖起点 → 仍排除（边界保守）
         self.assertEqual(

@@ -140,6 +140,17 @@ class UsageTracker:
             for old in [h for h in self._buckets if h < cutoff]:
                 del self._buckets[old]
 
+    def mark_activity(self) -> None:
+        """标记「网关有活动」：只刷新 ``_last_at``，不计入任何 token 分桶。
+
+        请求发出即代表网关正在使用池子；即便上游没有回 ``usage``（例如客户端中途断开、
+        或纯流式响应没有 usage 块），也不能据此认为「网关空转」。因此 ``_last_at`` 的语义
+        是「网关最近一次活动时刻」，而不是「最近一次记录到用量」——泄漏守卫正是拿它当
+        空转判据，漏掉这条信号会把正常在用量的账号误判为疑似泄漏。
+        """
+        with self._lock:
+            self._last_at = self._clock()
+
     def series(self, *, hours: int = 24) -> list[dict[str, int]]:
         hours = max(1, min(int(hours), self._hours))
         now_hour = self._hour_of(self._clock())
@@ -192,6 +203,15 @@ class GatewayMetrics:
             self.client_requests += 1
             if stream:
                 self.stream_requests += 1
+
+    def note_activity(self) -> None:
+        """标记一次「网关活动」（有请求发往上游）——只刷新用量追踪器的最近活动时刻。
+
+        与 ``note_usage`` 的区别：用量只在拿到上游 ``usage`` 时才记录，而活动在请求发出
+        时即记录。泄漏守卫用「最近活动」而非「最近用量」判断网关是否空转，避免把
+        「有用量消耗但上游没回 usage」的请求误判为泄漏。
+        """
+        self.usage.mark_activity()
 
     def note_error(self) -> None:
         with self._lock:

@@ -85,18 +85,23 @@ class LeakGuardWorkerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = GuardStore.load(Path(tmp) / "guard.json")
             clock = _Clock(_epoch_at(2026, 10, 9, 1, 0))  # 01:00，未到轮换点
-            worker = self._worker(store=store, clock=clock, changes=["A", "B"])
+            worker = self._worker(
+                store=store, clock=clock, changes=[("A", 40.0), ("B", 5.0)]
+            )
             worker.run_once()
             self.assertEqual(store.pending(), ["A", "B"])
             self.assertEqual(worker.status()["status"], LeakGuardWorker.STATUS_FLAGGED)
             self.assertEqual(worker.status()["pending_count"], 2)
             self.assertEqual(self.rotate_calls, [])
+            self.assertTrue(any("A(+40)" in line for line in self.log_lines))
 
     def test_usage_present_no_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = GuardStore.load(Path(tmp) / "guard.json")
             clock = _Clock(_epoch_at(2026, 10, 9, 1, 0))
-            worker = self._worker(store=store, clock=clock, usage_last=clock.t, changes=["A"])
+            worker = self._worker(
+                store=store, clock=clock, usage_last=clock.t, changes=[("A", 40.0)]
+            )
             worker.run_once()
             self.assertEqual(store.pending(), [])
             self.assertEqual(worker.status()["status"], LeakGuardWorker.STATUS_IDLE)
@@ -162,7 +167,7 @@ class LeakGuardWorkerTest(unittest.TestCase):
             )
             clock = _Clock(_epoch_at(2026, 10, 9, 1, 0))
             worker = self._worker(
-                store=store, clock=clock, accounts=[account], changes=["A"]
+                store=store, clock=clock, accounts=[account], changes=[("A", 40.0)]
             )
             worker.run_once()  # 01:00 记录
             self.assertEqual(store.pending(), ["A"])
@@ -186,7 +191,7 @@ class LeakGuardWorkerTest(unittest.TestCase):
             )
             clock = _Clock(_epoch_at(2026, 10, 9, 1, 0))
             worker = self._worker(
-                store=store, clock=clock, accounts=[account], changes=["A"]
+                store=store, clock=clock, accounts=[account], changes=[("A", 40.0)]
             )
             worker.run_once()
             worker.run_once()

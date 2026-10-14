@@ -121,7 +121,7 @@ class GuardE2ETest(unittest.TestCase):
             worker = LeakGuardWorker(
                 accounts=lambda: rotator.config.accounts,
                 token_usage_last=lambda: None,  # 网关空转
-                credit_changes=lambda _since, _idle: ["账号1"],
+                credit_changes=lambda _since, _idle: [("账号1", 40.0)],
                 rotate=rotate,
                 store=guard_store,
                 clock=clock,

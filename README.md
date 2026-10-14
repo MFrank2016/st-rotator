@@ -249,8 +249,11 @@ pip install -r requirements-quota.txt     # 即 jwcrypto>=1.5
 
 行为要点：
 
-- **判定口径（全局）**：「没有 token 消耗记录」= 窗口内网关整体没有任何 token 用量；
-  「积分变动」= 该账号**通用池（general）**采样增量 `delta > 0`。
+- **判定口径（全局）**：「没有 token 消耗记录」= 窗口内网关整体没有任何**活动**——
+  只要窗口内发过请求就算「有活动」，不要求上游回 `usage`（故纯流式、客户端中途断开都不会
+  被误判为空转）；「积分变动」= 该账号**通用池（general）**采样增量达到 `MIN_CREDIT_DELTA`
+  （默认 `1.0`，滤掉采样浮点噪声）。窗口复位 / `used` 回退的区间增量无法可靠归因，按 `0`
+  处理，不会把一次复位放大成一个假增量。
 - **只看通用池**：`flash_lite_exchange` 的「一换一烧点」只消耗专属池且**绕过 HTTP 代理**，
   不会被 token 统计记录；只看通用池可避免把正在烧点的账号误判为泄漏（模型测试同理，属手动操作）。
 - **轮换动作**：与 `auto_renew` 相同（登录 → 注销全部 Key → 新建 Key → 落盘），但由独立 worker 执行，
@@ -265,8 +268,9 @@ pip install -r requirements-quota.txt     # 即 jwcrypto>=1.5
   真被外部盗用时，这一轮可能漏判（待网关再次空闲的窗口仍会捕获）。
 - **模型测试是例外**：控制台「模型测试」直连上游、消耗通用池积分却不经网关 token 统计；
   若在网关空转时跑测试，可能把该账号误记为疑似泄漏（属手动操作，留意即可）。
-- **流式用量依赖注入**：若关闭 `track_stream_usage` 或上游不返回 `usage`，纯流式流量可能不更新
-  token 记录从而误判；建议保持 `track_stream_usage=true`。
+- **空转判据不依赖 `usage`**：网关「最近活动时刻」在请求发出时即刷新，与是否拿到上游
+  `usage` 无关；因此关闭 `track_stream_usage` 或上游不回 `usage` 都**不会**再把正常用量
+  误判为泄漏（`track_stream_usage` 现在只影响控制台的 token 用量曲线）。
 - **不累加补号轮换计数**：守卫的轮换不计入 `replenish.json` 的 `rotations`（那是 `auto_renew` 的口径）。
 
 ## 自动补充账号（auto replenish）

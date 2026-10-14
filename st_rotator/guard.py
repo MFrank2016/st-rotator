@@ -14,8 +14,11 @@
 
 判定口径（与需求一致）
 ----------------------
-* 「没有 token 消耗记录」= **全局口径**：窗口内网关整体没有任何 token 用量记录。
-* 「积分采样变动」= 该账号**通用池（general）**的采样增量 ``delta > 0``。
+* 「没有 token 消耗记录」= **全局口径**：窗口内网关整体没有任何 token 用量记录。判据来自
+  ``UsageTracker`` 的「最近活动」时刻——请求发出即标记活动，不依赖上游是否回 ``usage``；
+  否则「确实消耗了积分但上游没回 usage」的流式请求会把在用量的账号误判为泄漏。
+* 「积分采样变动」= 该账号**通用池（general）**的采样增量达到 ``MIN_CREDIT_DELTA`` 以上；
+  窗口复位 / ``used`` 回退的区间无法可靠归因，按 0 处理（见 ``CreditTracker.note``）。
   只看通用池，是为了规避「一换一烧点」只消耗专属池（flash_lite）却绕过 HTTP 代理、
   不被 token 统计记录而造成的误判（模型测试同理，属手动操作，文档已说明）。
 
@@ -41,6 +44,9 @@ from typing import Any, Callable
 from .autorenew import DETAIL_LIMIT, RotationOutcome
 from .config import AccountConfig
 
+# 通用池积分增量的最小可辨识阈值（单位同积分采样）：低于它视为浮点噪声，不计入泄漏判定。
+MIN_CREDIT_DELTA = 1.0
+
 
 class GuardError(RuntimeError):
     """``guard.json`` 读取 / 结构校验 / 写入失败。"""
@@ -49,6 +55,13 @@ class GuardError(RuntimeError):
 def local_date(ts: float) -> str:
     """把 epoch 秒转成本地日期 ``YYYY-MM-DD``。"""
     return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+
+def _fmt_ts(ts: float | None) -> str:
+    """把 epoch 秒转成本地 ``MM-DD HH:MM``；None 表示从未记录，返回「无记录」。"""
+    if ts is None:
+        return "无记录"
+    return time.strftime("%m-%d %H:%M", time.localtime(ts))
 
 
 class GuardStore:
@@ -183,7 +196,7 @@ class LeakGuardWorker:
         *,
         accounts: Callable[[], Sequence[AccountConfig]],
         token_usage_last: Callable[[], float | None],
-        credit_changes: Callable[[float, float | None], Sequence[str]],
+        credit_changes: Callable[[float, float | None], Sequence[tuple[str, float]]],
         rotate: Callable[[AccountConfig], RotationOutcome],
         store: GuardStore,
         clock: Callable[[], float] = time.time,
@@ -269,32 +282,37 @@ class LeakGuardWorker:
     def _scan(self, now: float) -> None:
         """窗口内网关空转却有通用池积分消耗 → 把相关账号并入待轮换清单。
 
-        「空转」= 网关最近一次 token 消耗时刻早于窗口起点；积分增量还要求其
+        「空转」= 网关最近一次活动时刻早于窗口起点；积分增量还要求其
         **覆盖区间整体晚于**该时刻（采样最长有一个采样周期的滞后），避免把网关
-        自身刚发生的请求误判为外部盗用。
+        自身刚发生的请求误判为外部盗用。日志给出触发账号、增量与时间区间，便于
+        事后判读是否误报。
         """
         since = now - self._window
         last_usage = self._token_usage_last()
         if last_usage is not None and last_usage >= since:
-            # 网关在窗口内有 token 消耗 → 正常，不记录（避免把正常用量误判为泄漏）
             if not self._store.pending():
                 self._set_status(self.STATUS_IDLE, "")
             return
         changed = [
-            name for name in self._credit_changes(since, last_usage) if name
+            (name, float(delta))
+            for name, delta in self._credit_changes(since, last_usage)
+            if name
         ]
         if not changed:
             if not self._store.pending():
                 self._set_status(self.STATUS_IDLE, "")
             return
-        added = self._store.add_pending(changed)
+        deltas = dict(changed)
+        added = self._store.add_pending([name for name, _ in changed])
         if added:
+            detail = "、".join(f"{name}(+{deltas[name]:g})" for name in added)
             self._set_status(
                 self.STATUS_FLAGGED,
                 f"新增待轮换账号 {len(added)} 个",
                 log_line=(
-                    f"[泄漏守卫] 网关空转却有积分消耗，新增待轮换账号 "
-                    f"{len(added)} 个：{'、'.join(added)}"
+                    f"[泄漏守卫] 网关空转（最近活动 {_fmt_ts(last_usage)}，"
+                    f"回看 {self._window:.0f}s）却有积分消耗，"
+                    f"新增待轮换账号 {len(added)} 个：{detail}"
                 ),
             )
 

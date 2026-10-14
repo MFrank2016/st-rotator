@@ -625,6 +625,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
 
         if self.console is not None:
             self.console.metrics.note_request(stream=stream)
+            self.console.metrics.note_activity()
 
         headers = self._forwardable_headers()
         if stream:
@@ -860,6 +861,8 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
                     error_payload(f"invalid JSON body: {exc}", "invalid_request_error"),
                 )
                 return
+        if self.console is not None:
+            self.console.metrics.note_activity()
         headers = self._forwardable_headers()
         try:
             result = self.rotator.request(

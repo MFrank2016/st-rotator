@@ -431,7 +431,9 @@ class CreditTracker:
     """按小时累计「积分消耗」：每 5 分钟采样一次池的 ``used``，与上次做差。
 
     差值口径为 ``window_7d.used``（7 天才复位一次，30 天累计误差最小）。
-    窗口滚动复位处理：``reset_at`` 变化或 ``used`` 变小 → 视为新窗口，消耗 = 当前 ``used``（不取负）。
+    窗口滚动复位处理：``reset_at`` 变化（跨了两个窗口）或 ``used`` 变小（回退 / 修正）
+    时，本区间的消耗**无法可靠归因**，一律记为 0（不取负、也不把新窗口的 ``used``
+    整段算作本区间消耗——那会把一次复位放大成一个巨大的假增量）。
     线程安全；按池（general / flash_lite）分桶，只保留最近 N 小时。
     """
 
@@ -460,10 +462,8 @@ class CreditTracker:
             if prev is not None:
                 prev_reset, prev_used, prev_ts = prev
                 covered_since = prev_ts
-                if int(reset_at or 0) == prev_reset and used >= prev_used:
-                    delta = used - prev_used
-                else:
-                    delta = used  # 窗口复位或回退 → 新窗口，消耗即当前 used
+                if int(reset_at or 0) == prev_reset:
+                    delta = max(0.0, used - prev_used)
             self._samples.append({
                 "ts": ts,
                 "since": covered_since,
@@ -525,32 +525,44 @@ class CreditTracker:
         return items[-limit:]
 
     def accounts_with_delta_since(
-        self, ts: float, *, pool: str = "general", idle_since: float | None = None
-    ) -> list[str]:
-        """返回在 ``ts`` 之后（含）该池有消耗增量（delta>0）的账号名，按出现顺序去重。
+        self,
+        ts: float,
+        *,
+        pool: str = "general",
+        idle_since: float | None = None,
+        min_delta: float = 0.0,
+    ) -> list[tuple[str, float]]:
+        """返回在 ``ts`` 之后（含）该池有消耗增量的 ``(账号名, 增量合计)``，按首次出现顺序去重。
 
         用于「网关空转却有积分变动」的泄漏检测：只看指定池（默认 general），
-        以规避一换一烧点只动 flash_lite 池造成的误判。
+        以规避一换一烧点只动 flash_lite 池造成的误判。``min_delta`` 用于滤掉采样
+        浮点噪声 / 极小增量（默认 0 = 不过滤，阈值由调用方按业务量级给定）。
 
         每条采样都带 ``since``（该增量覆盖区间的起点 = 上一次采样时刻）；当传入
         ``idle_since``（网关最近一次 token 消耗时刻）时，**只在覆盖区间整体晚于
         ``idle_since`` 时才计入** —— 否则该增量可能来自网关自身刚发生的请求
         （采样最长有一个采样周期的滞后），会造成误判。
+
+        同一账号在窗口内可能有多条合格采样，增量**求和**后返回（即该账号窗口内的总消耗），
+        便于调用方在日志里给出可判读的幅度。
         """
         with self._lock:
             items = list(self._samples)
-        seen: set[str] = set()
-        out: list[str] = []
+        totals: dict[str, float] = {}
+        order: list[str] = []
         for s in items:
             if s["ts"] < ts or s["delta"] <= 0 or s["pool"] != pool:
+                continue
+            if s["delta"] < min_delta:
                 continue
             if idle_since is not None and idle_since >= s["since"]:
                 continue
             account = s["account"]
-            if account not in seen:
-                seen.add(account)
-                out.append(account)
-        return out
+            if account not in totals:
+                totals[account] = 0.0
+                order.append(account)
+            totals[account] += s["delta"]
+        return [(name, totals[name]) for name in order]
 
 
 class QuotaService:

@@ -101,6 +101,30 @@ class GuardUsageIntegrationTest(unittest.TestCase):
             # 采样覆盖区间 [1000,1300] 含网关用量 → 排除，不误记
             self.assertEqual(store.pending(), [])
 
+    def test_activity_without_usage_not_flagged(self) -> None:
+        """请求发出但上游未回 usage（只标记活动）→ 不算空转，不误记（F1 回归）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            clock = _Clock(1000.0)
+            usage = UsageTracker(clock=clock)
+            credits = CreditTracker(clock=clock)
+            store = GuardStore.load(Path(tmp) / "guard.json")
+            credits.note("A", "general", reset_at=1, used=0.0)  # ts=1000
+            clock.t = 1300.0
+            credits.note("A", "general", reset_at=1, used=40.0)  # ts=1300, delta=40
+            usage.mark_activity()  # 网关有活动（无 usage）
+            worker = self._worker(
+                store=store,
+                clock=clock,
+                usage=usage,
+                credits=credits,
+                accounts=[
+                    AccountConfig(name="A", api_keys=["sk-a"], user="u", password="p")
+                ],
+            )
+            clock.t = 1500.0  # since=900；last_at=1300 >= 900 → 窗口内有过活动
+            worker.run_once()
+            self.assertEqual(store.pending(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

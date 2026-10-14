@@ -522,7 +522,7 @@ def build_leak_guard(
     （重新登录 → 注销该账号全部 Key → 新建 Key → 更新配置并落盘）。
     """
     from .autorenew import HttpKeyManager, RotationOutcome, rotate_account
-    from .guard import GuardError, GuardStore, LeakGuardWorker
+    from .guard import MIN_CREDIT_DELTA, GuardError, GuardStore, LeakGuardWorker
     from .quota import HttpQuotaTransport
 
     if not config.leak_guard.enabled:
@@ -559,7 +559,7 @@ def build_leak_guard(
         accounts=lambda: rotator.config.accounts,
         token_usage_last=console.metrics.usage.last_at,
         credit_changes=lambda since, idle_since: quota.credits.accounts_with_delta_since(
-            since, idle_since=idle_since
+            since, idle_since=idle_since, min_delta=MIN_CREDIT_DELTA
         ),
         rotate=rotate,
         store=guard_store,
