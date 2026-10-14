@@ -145,13 +145,27 @@ def _decode_json(raw: bytes) -> dict[str, Any] | None:
 
 
 class AuthnError(RuntimeError):
-    """认证 API 失败。status=0 表示网络层错误；reason 取自封闭集合。"""
+    """认证 API 失败。status=0 表示网络层错误；reason 取自封闭集合。
 
-    def __init__(self, status: int, reason: str, detail: str) -> None:
+    ``request`` / ``response`` 是失败时用于排查的可读报文（请求体敏感字段已打码、
+    响应体为原始错误报文），**仅供日志**，不参与任何控制流。
+    """
+
+    def __init__(
+        self,
+        status: int,
+        reason: str,
+        detail: str,
+        *,
+        request: str | None = None,
+        response: str | None = None,
+    ) -> None:
         super().__init__(detail)
         self.status = status
         self.reason = reason
         self.detail = detail
+        self.request = request
+        self.response = response
 
 
 def jwt_sub(token: str) -> str | None:
@@ -279,22 +293,76 @@ def _endpoint_label(method: str, url: str) -> str:
     return f"{method} {urllib.parse.urlsplit(url).path}"
 
 
+# 请求体里绝不明文落日志的字段：密码 / 短信验证码 / token / 签名 / 授权码
+_SENSITIVE_KEYS = frozenset(
+    {
+        "password",
+        "verify_code",
+        "token_code",
+        "sign",
+        "access_token",
+        "refresh_token",
+        "code",
+    }
+)
+
+
+def _redact_body(data: object) -> str:
+    """把请求体压成一行摘要；敏感字段打码，非 JSON 体（token 交换等）不落值。"""
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        return ""
+    try:
+        obj = json.loads(bytes(data).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return "[非 JSON 体，已省略]"
+    if not isinstance(obj, Mapping):
+        return "[非对象体，已省略]"
+    return (
+        "{"
+        + ", ".join(
+            f"{key}={'***' if key in _SENSITIVE_KEYS else str(value)[:40]}"
+            for key, value in obj.items()
+        )
+        + "}"
+    )
+
+
+def _request_line(method: str, url: str, data: object) -> str:
+    label = _endpoint_label(method, url)
+    body = _redact_body(data)
+    return f"{label} {body}" if body else label
+
+
 def _map_authn_error(
-    status: int, body: Mapping[str, Any] | None, *, where: str | None = None
+    status: int,
+    body: Mapping[str, Any] | None,
+    *,
+    where: str | None = None,
+    request: str | None = None,
+    response: str | None = None,
 ) -> AuthnError:
     """把 HTTP/gRPC 错误映射为 AuthnError。全部 reason 判定都收敛在这里。
 
     ``where``（``METHOD /path``）拼进 ``detail`` 前缀，让日志能直接看出**哪个端点**
     失败——否则只剩一句上游文案（如 ``InvalidArgument 无效参数``），无法定位是哪一步。
-    reason 判定只用上游文案，不受 ``where`` 影响。
+    reason 判定只用上游文案，不受 ``where`` 影响。``request`` / ``response`` 原样挂到
+    异常上供日志打印（请求体已在调用方打码）。
     """
     if status == 0:
-        return AuthnError(0, "network", _error_text(body) or "网络请求失败")
+        return AuthnError(
+            0,
+            "network",
+            _error_text(body) or "网络请求失败",
+            request=request,
+            response=response,
+        )
     text = _error_text(body)
     detail = text or f"HTTP {status}"
     if where:
         detail = f"{where}: {detail}"
-    return AuthnError(status, _classify_reason(text), detail)
+    return AuthnError(
+        status, _classify_reason(text), detail, request=request, response=response
+    )
 
 
 class HttpAuthn:
@@ -353,18 +421,23 @@ class HttpAuthn:
         try:
             return opener.open(req, timeout=self.timeout)
         except urllib.error.HTTPError as exc:
+            body, text = self._http_error_body(exc)
             raise _map_authn_error(
                 exc.code,
-                self._http_error_body(exc),
+                body,
                 where=_endpoint_label(req.get_method(), req.full_url),
+                request=_request_line(req.get_method(), req.full_url, req.data),
+                response=text,
             ) from exc
         except (urllib.error.URLError, OSError) as exc:
             # socket.timeout / TimeoutError 均为 OSError 子类，一并归为网络层
             raise AuthnError(0, "network", f"{type(exc).__name__}: {exc}") from exc
 
     @staticmethod
-    def _http_error_body(exc: urllib.error.HTTPError) -> Mapping[str, Any] | None:
-        """读错误响应体为 JSON 信封；读不到 / 非 JSON 返回 None。"""
+    def _http_error_body(
+        exc: urllib.error.HTTPError,
+    ) -> tuple[Mapping[str, Any] | None, str]:
+        """读错误响应体；返回 ``(JSON 信封或 None, 原始文本)``（文本供日志打印报文）。"""
         try:
             raw = exc.read()
         except Exception:  # noqa: BLE001 - 读不到响应体不阻塞错误上报
@@ -372,12 +445,13 @@ class HttpAuthn:
         finally:
             exc.close()
         if not raw:
-            return None
+            return None, ""
+        text = raw.decode("utf-8", "replace")
         try:
-            parsed = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            return None
-        return parsed if isinstance(parsed, Mapping) else None
+            parsed = json.loads(text)
+        except ValueError:
+            return None, text
+        return (parsed if isinstance(parsed, Mapping) else None), text
 
     @staticmethod
     def _parse_json(resp: Any) -> dict[str, Any]:
@@ -437,7 +511,17 @@ class HttpAuthn:
         parsed = _decode_json(resp.content)
         if resp.status_code >= 400:
             raise _map_authn_error(
-                resp.status_code, parsed, where=_endpoint_label(method, url)
+                resp.status_code,
+                parsed,
+                where=_endpoint_label(method, url),
+                request=_request_line(
+                    method,
+                    url,
+                    json.dumps(body).encode("utf-8") if body is not None else None,
+                ),
+                response=(
+                    resp.content.decode("utf-8", "replace") if resp.content else ""
+                ),
             )
         return parsed if parsed is not None else {}
 

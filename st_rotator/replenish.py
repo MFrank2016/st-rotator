@@ -408,6 +408,7 @@ class ReplenishWorker:
             except Exception as exc:  # noqa: BLE001 - 号码级失败跳过，不拖垮整轮
                 hard_failures += 1
                 detail = f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT]
+                self._log_failure_context(exc)
                 self._record_registration(
                     phone=self._active_phone,
                     username="",
@@ -838,6 +839,15 @@ class ReplenishWorker:
         if isinstance(exc, AuthnError):
             return _AUTHN_EXC_REASONS.get(exc.reason, "authn_error")
         return "unknown"
+
+    def _log_failure_context(self, exc: Exception) -> None:
+        """失败时打印请求 / 响应报文，便于排查（请求体敏感字段已在 authn 侧打码）。"""
+        request = getattr(exc, "request", None)
+        response = getattr(exc, "response", None)
+        if request:
+            self._log(f"[补号] 失败请求：{request}"[:DETAIL_LIMIT])
+        if response:
+            self._log(f"[补号] 失败响应：{response}"[:DETAIL_LIMIT])
 
     def _recover_username(self, access_token: str, user_id: str) -> str:
         """尽力取回用户名；失败返回空串（不抛错，仅用于落账）。"""

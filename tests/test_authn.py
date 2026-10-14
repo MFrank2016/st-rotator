@@ -546,6 +546,46 @@ class LoginNextTest(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
+    def test_login_next_error_carries_request_and_response(self):
+        envelope = {
+            "code": 3,
+            "message": "InvalidArgument",
+            "details": [
+                {
+                    "@type": "LocalizedMessage",
+                    "reason": "invalidArgument",
+                    "message": "无效参数",
+                }
+            ],
+        }
+        server, thread, base = serve(
+            {
+                ("POST", self.LOGIN_NEXT): lambda rec: (
+                    400,
+                    {"Content-Type": "application/json"},
+                    json.dumps(envelope).encode("utf-8"),
+                )
+            }
+        )
+        try:
+            auth = authn.HttpAuthn(timeout=5.0, iam_base=base, oidc_base=base)
+            with self.assertRaises(authn.AuthnError) as ctx:
+                auth.login_next(
+                    challenge="CHAL", username="u", user_id="u1", sign="s3cr3t"
+                )
+            exc = ctx.exception
+            request = exc.request or ""
+            response = exc.response or ""
+            self.assertIn("loginNext", request)
+            self.assertIn("username=u", request)
+            self.assertIn("sign=***", request)
+            self.assertNotIn("s3cr3t", request)
+            self.assertIn("InvalidArgument", response)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
 
 class ResetSessionTest(unittest.TestCase):
     def test_reset_session_replaces_cookie_jar(self):

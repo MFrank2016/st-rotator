@@ -1059,6 +1059,35 @@ class ReplenishWorkerTest(unittest.TestCase):
         worker.run_once()
         self.assertEqual(authn.reset_calls, 2)
 
+    def test_failure_logs_request_and_response(self):
+        registry = self._registry()
+        authn = _FakeAuthn(
+            sms_login_excs=[
+                AuthnError(
+                    400,
+                    "invalid",
+                    "POST /iam/authn/v1/auth/nova/smsLogin: InvalidArgument",
+                    request=(
+                        "POST /iam/authn/v1/auth/nova/smsLogin "
+                        '{"token_code": "***", "verify_code": "***"}'
+                    ),
+                    response='{"message":"InvalidArgument","details":[{"message":"无效参数"}]}',
+                )
+            ]
+        )
+        worker = self._worker(
+            sms=_FakeSms(phones=["13800000012", "13800000013"]),
+            authn=authn,
+            keys=_FakeKeys(),
+            registry=registry,
+            target=1,
+        )
+        worker.run_once()
+        joined = "\n".join(self.log_lines)
+        self.assertIn("失败请求：POST /iam/authn/v1/auth/nova/smsLogin", joined)
+        self.assertIn("失败响应：", joined)
+        self.assertIn("无效参数", joined)
+
     def test_unexpected_exception_records_failure(self):
         class _BoomKeys(_FakeKeys):
             def create_key(self, access_token, *, displayname, key_type):
