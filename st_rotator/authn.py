@@ -213,6 +213,7 @@ class AuthnTransport(Protocol):
         password: str,
     ) -> None: ...
     def get_user_info(self, access_token: str, user_id: str) -> Mapping[str, Any]: ...
+    def reset_session(self) -> None: ...
 
 
 def _pkce() -> tuple[str, str]:
@@ -324,6 +325,20 @@ class HttpAuthn:
         # urllib 分支共用一个 Cookie 罐：register/smsLogin 建立的会话 Cookie 必须在随后
         # 跟随 OIDC 重定向换取 code 时可见，否则 /oauth2/auth 不返回 code（curl 分支同理）。
         self._shared_opener = self._opener()
+
+    def reset_session(self) -> None:
+        """清空会话 Cookie，隔离每个补号尝试。
+
+        register/smsLogin 建立的会话 Cookie 只需在**同一账号**的流程内
+        （smsLogin → 跟随 OIDC 重定向换 code）可见；跨账号复用会让上一个账号的登录
+        会话串进下一个账号的认证请求。每次尝试前调用即可（尝试内不重置）。
+        """
+        self._shared_opener = self._opener()
+        if self._curl is not None:
+            try:
+                self._curl.cookies.clear()
+            except Exception:  # noqa: BLE001 - curl 会话清理失败不致命，忽略
+                pass
 
     # --- 低层 HTTP ---
     @staticmethod

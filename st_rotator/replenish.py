@@ -55,6 +55,8 @@ DETAIL_LIMIT = 200
 DEDUPE_MAX = 20
 # 软重试上限：短信持续超时（need 不递减）时，连续超过此数即放弃本轮，避免死循环
 SOFT_RETRY_MAX = 10
+# 号码级硬失败上限：号码失败只跳过、继续下一个；连续失败达此数才放弃本轮（防烧短信费）
+NUMBER_FAILURE_MAX = 5
 
 # 用户名 / 密码字符集：**刻意排除 $ { }** —— 避免 ConfigStore 的 ${ENV}
 # 占位符展开误伤生成的凭据。
@@ -343,6 +345,7 @@ class ReplenishWorker:
             )
         finally:
             self._cycle_lock.release()
+
     def _loop(self) -> None:
         """先立即跑一轮，再按 interval 周期循环。
 
@@ -358,7 +361,7 @@ class ReplenishWorker:
             self.run_once()
 
     def _cycle(self) -> None:
-        """统计可用数 vs 目标；不足则逐个补齐，单次失败即停本轮。"""
+        """统计可用数 vs 目标；不足则逐个补齐。号码级失败跳过继续，连续失败达上限才停本轮。"""
         accounts = list(self._accounts())
         available = count_available(accounts, self._status_source())
         if available >= self._target:
@@ -373,6 +376,7 @@ class ReplenishWorker:
             f"[补号] 可用账号 {available} < 目标 {self._target}，需补充 {need} 个"
         )
         soft_retries = 0
+        hard_failures = 0
         while need > 0:
             try:
                 if self._replenish_one():
@@ -401,7 +405,8 @@ class ReplenishWorker:
                 if stop.record is not None:
                     self._record_registration(**stop.record)
                 return
-            except Exception as exc:  # noqa: BLE001 - 单次迭代失败不拖垮循环
+            except Exception as exc:  # noqa: BLE001 - 号码级失败跳过，不拖垮整轮
+                hard_failures += 1
                 detail = f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT]
                 self._record_registration(
                     phone=self._active_phone,
@@ -413,12 +418,17 @@ class ReplenishWorker:
                     reason=self._failure_reason(exc),
                     detail=detail,
                 )
-                self._set_status(
-                    self.STATUS_CHECK_ERROR,
-                    detail,
-                    log_line=f"[补号] 本轮补充出错：{detail}",
-                )
-                return
+                if hard_failures >= NUMBER_FAILURE_MAX:
+                    self._set_status(
+                        self.STATUS_CHECK_ERROR,
+                        f"连续 {NUMBER_FAILURE_MAX} 个号码失败，本轮放弃",
+                        log_line=(
+                            f"[补号] 连续 {NUMBER_FAILURE_MAX} 个号码失败，本轮放弃"
+                            f"（最后：{detail}）"
+                        ),
+                    )
+                    return
+                self._log(f"[补号] 号码 {self._active_phone} 失败，跳过继续：{detail}")
 
     # ------------------------------------------------------------ 单次补齐
     def _replenish_one(self) -> bool:
@@ -451,6 +461,7 @@ class ReplenishWorker:
         self._log(f"[补号] 已取号 {phone}")
 
         # c. 发短信验证码；None -> 需要滑块（不花钱），除非有 solver 带 code_key 重发
+        self._authn.reset_session()
         token_code = self._authn.send_sms_code(phone)
         if token_code is None:
             if self._captcha_solver is None:

@@ -547,6 +547,14 @@ class LoginNextTest(unittest.TestCase):
             thread.join(timeout=5)
 
 
+class ResetSessionTest(unittest.TestCase):
+    def test_reset_session_replaces_cookie_jar(self):
+        auth = authn.HttpAuthn(timeout=5.0)
+        before = auth._shared_opener
+        auth.reset_session()
+        self.assertIsNot(auth._shared_opener, before)
+
+
 class ChangePasswordFlowTest(unittest.TestCase):
     def test_change_password_flow_request_shapes(self):
         step1 = "/iam/idp/v1/users/u-123:novaSendUserSmsCode"

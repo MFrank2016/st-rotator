@@ -34,6 +34,7 @@ from st_rotator.config import AccountConfig
 from st_rotator.quota import TokenBundle
 from st_rotator.registry import Registry
 from st_rotator.replenish import (
+    NUMBER_FAILURE_MAX,
     ReplenishWorker,
     SOFT_RETRY_MAX,
     count_available,
@@ -176,6 +177,10 @@ class _FakeAuthn:
         self.pw_code_calls: list[tuple[object, object]] = []
         self.change_pw_calls: list[tuple[str, str, str, str, str]] = []
         self.user_info_calls: list[tuple[object, object]] = []
+        self.reset_calls: int = 0
+
+    def reset_session(self) -> None:
+        self.reset_calls += 1
 
     def mint_login_challenge(self, *, intent: str | None = None) -> tuple[str, str]:
         self.mint_calls.append(intent)
@@ -1019,9 +1024,9 @@ class ReplenishWorkerTest(unittest.TestCase):
         self.assertEqual(entry["reason"], "captcha_required")
         self.assertEqual(entry["phone"], "13800000008")
 
-    def test_register_error_records_failure(self):
+    def test_register_error_records_failure_then_continues(self):
         registry = self._registry()
-        sms = _FakeSms(phones=["13800000012"])
+        sms = _FakeSms(phones=["13800000012", "13800000013"])
         authn = _FakeAuthn(
             register_excs=[AuthnError(400, "invalid_sms_code", "注册失败")]
         )
@@ -1029,11 +1034,30 @@ class ReplenishWorkerTest(unittest.TestCase):
             sms=sms, authn=authn, keys=_FakeKeys(), registry=registry, target=1
         )
         worker.run_once()
-        (entry,) = registry.registrations()
-        self.assertFalse(entry["success"])
-        self.assertEqual(entry["reason"], "authn_error")
-        self.assertTrue(entry["detail"])
-        self.assertEqual(entry["phone"], "13800000012")
+        entries = registry.registrations()
+        first = entries[-1]
+        self.assertFalse(first["success"])
+        self.assertEqual(first["reason"], "authn_error")
+        self.assertTrue(first["detail"])
+        self.assertEqual(first["phone"], "13800000012")
+        self.assertTrue(entries[0]["success"])
+        self.assertEqual(entries[0]["phone"], "13800000013")
+        self.assertEqual(self._status(worker), ReplenishWorker.STATUS_OK)
+
+    def test_reset_session_called_per_attempt(self):
+        registry = self._registry()
+        authn = _FakeAuthn(
+            register_excs=[AuthnError(400, "invalid_sms_code", "注册失败")]
+        )
+        worker = self._worker(
+            sms=_FakeSms(phones=["13800000012", "13800000013"]),
+            authn=authn,
+            keys=_FakeKeys(),
+            registry=registry,
+            target=1,
+        )
+        worker.run_once()
+        self.assertEqual(authn.reset_calls, 2)
 
     def test_unexpected_exception_records_failure(self):
         class _BoomKeys(_FakeKeys):
@@ -1042,17 +1066,20 @@ class ReplenishWorkerTest(unittest.TestCase):
 
         registry = self._registry()
         worker = self._worker(
-            sms=_FakeSms(phones=["13800000015"]),
+            sms=_FakeSms(phones=[f"138000000{i}" for i in range(15, 20)]),
             authn=_FakeAuthn(),
             keys=_BoomKeys(),
             registry=registry,
             target=1,
         )
         worker.run_once()
-        (entry,) = registry.registrations()
-        self.assertFalse(entry["success"])
-        self.assertEqual(entry["reason"], "unknown")
-        self.assertEqual(entry["phone"], "13800000015")
+        entries = registry.registrations()
+        self.assertEqual(len(entries), NUMBER_FAILURE_MAX)
+        self.assertFalse(entries[0]["success"])
+        self.assertEqual(entries[0]["reason"], "unknown")
+        self.assertEqual(entries[0]["phone"], "13800000019")
+        self.assertEqual(entries[-1]["phone"], "13800000015")
+        self.assertEqual(self._status(worker), ReplenishWorker.STATUS_CHECK_ERROR)
 
     def test_audit_write_failure_does_not_kill_cycle(self):
         tmp = tempfile.TemporaryDirectory()
