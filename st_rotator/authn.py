@@ -273,12 +273,27 @@ def _classify_reason(text: str) -> str:
     return "unknown"
 
 
-def _map_authn_error(status: int, body: Mapping[str, Any] | None) -> AuthnError:
-    """把 HTTP/gRPC 错误映射为 AuthnError。全部 reason 判定都收敛在这里。"""
+def _endpoint_label(method: str, url: str) -> str:
+    """``METHOD /path`` 端点标签（去掉 query，避免把 challenge 等值带进日志）。"""
+    return f"{method} {urllib.parse.urlsplit(url).path}"
+
+
+def _map_authn_error(
+    status: int, body: Mapping[str, Any] | None, *, where: str | None = None
+) -> AuthnError:
+    """把 HTTP/gRPC 错误映射为 AuthnError。全部 reason 判定都收敛在这里。
+
+    ``where``（``METHOD /path``）拼进 ``detail`` 前缀，让日志能直接看出**哪个端点**
+    失败——否则只剩一句上游文案（如 ``InvalidArgument 无效参数``），无法定位是哪一步。
+    reason 判定只用上游文案，不受 ``where`` 影响。
+    """
     if status == 0:
         return AuthnError(0, "network", _error_text(body) or "网络请求失败")
-    detail = _error_text(body)
-    return AuthnError(status, _classify_reason(detail), detail or f"HTTP {status}")
+    text = _error_text(body)
+    detail = text or f"HTTP {status}"
+    if where:
+        detail = f"{where}: {detail}"
+    return AuthnError(status, _classify_reason(text), detail)
 
 
 class HttpAuthn:
@@ -323,7 +338,11 @@ class HttpAuthn:
         try:
             return opener.open(req, timeout=self.timeout)
         except urllib.error.HTTPError as exc:
-            raise _map_authn_error(exc.code, self._http_error_body(exc)) from exc
+            raise _map_authn_error(
+                exc.code,
+                self._http_error_body(exc),
+                where=_endpoint_label(req.get_method(), req.full_url),
+            ) from exc
         except (urllib.error.URLError, OSError) as exc:
             # socket.timeout / TimeoutError 均为 OSError 子类，一并归为网络层
             raise AuthnError(0, "network", f"{type(exc).__name__}: {exc}") from exc
@@ -402,7 +421,9 @@ class HttpAuthn:
             raise AuthnError(0, "network", f"{type(exc).__name__}: {exc}") from exc
         parsed = _decode_json(resp.content)
         if resp.status_code >= 400:
-            raise _map_authn_error(resp.status_code, parsed)
+            raise _map_authn_error(
+                resp.status_code, parsed, where=_endpoint_label(method, url)
+            )
         return parsed if parsed is not None else {}
 
     def _follow_until(

@@ -649,7 +649,12 @@ class ReplenishWorker:
         """
         redirect = sms_login_redirect(login_data)
         if not redirect:
-            tenant = pick_tenant(sms_login_tenants(login_data))
+            tenants = sms_login_tenants(login_data)
+            fields = sorted({k for t in tenants if isinstance(t, Mapping) for k in t})
+            self._log(
+                f"[补号] 接管：smsLogin 未返回 redirect，需 loginNext；tenant 字段={fields}"
+            )
+            tenant = pick_tenant(tenants)
             if tenant is None:
                 self._set_status(
                     self.STATUS_CHECK_ERROR,

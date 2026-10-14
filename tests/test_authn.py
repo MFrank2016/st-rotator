@@ -510,6 +510,43 @@ class SmsLoginTest(unittest.TestCase):
             thread.join(timeout=5)
 
 
+class LoginNextTest(unittest.TestCase):
+    LOGIN_NEXT = "/iam/authn/v1/auth/nova/loginNext"
+
+    def test_login_next_error_names_endpoint(self):
+        envelope = {
+            "code": 3,
+            "message": "InvalidArgument",
+            "details": [
+                {
+                    "@type": "LocalizedMessage",
+                    "reason": "invalidArgument",
+                    "message": "无效参数",
+                }
+            ],
+        }
+        server, thread, base = serve(
+            {
+                ("POST", self.LOGIN_NEXT): lambda rec: (
+                    400,
+                    {"Content-Type": "application/json"},
+                    json.dumps(envelope).encode("utf-8"),
+                )
+            }
+        )
+        try:
+            auth = authn.HttpAuthn(timeout=5.0, iam_base=base, oidc_base=base)
+            with self.assertRaises(authn.AuthnError) as ctx:
+                auth.login_next(challenge="CHAL", username="u", user_id="u1", sign="s")
+            self.assertEqual(ctx.exception.reason, "invalid")
+            self.assertEqual(ctx.exception.status, 400)
+            self.assertIn("loginNext", ctx.exception.detail)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+
 class ChangePasswordFlowTest(unittest.TestCase):
     def test_change_password_flow_request_shapes(self):
         step1 = "/iam/idp/v1/users/u-123:novaSendUserSmsCode"
