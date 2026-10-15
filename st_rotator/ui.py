@@ -848,6 +848,29 @@ class ConsoleState:
         self._save_and_log(f"通过控制台删除 Key：{label}")
         return UiResponse.json({"ok": True, "message": f"已删除 {label}"})
 
+    def remove_account(self, name: str) -> UiResponse:
+        """从内存池和配置文件里同时删除某账号（连同其全部 Key 与登录凭据）。"""
+        name = (name or "").strip()
+        if not name:
+            return UiResponse.error("账号名不能为空")
+        account = next((a for a in self.config.accounts if a.name == name), None)
+        if account is None:
+            return UiResponse.error(f"账号 {name} 不存在", status=404)
+        if len(self.config.accounts) <= 1:
+            return UiResponse.error(
+                "这是配置里最后一个账号，删掉后就无法提供服务了；请先添加新账号"
+            )
+        with self.lock:
+            for key in list(account.api_keys):
+                self.rotator.remove_key(key)
+            removed = self.store.remove_account(name)
+            self.store.reload()
+            self.rotator.config.accounts = list(self.store.config.accounts)
+        if not removed:
+            return UiResponse.error("删除失败：配置里已无该账号", status=409)
+        self._save_and_log(f"通过控制台删除账号：{name}")
+        return UiResponse.json({"ok": True, "message": f"已删除账号 {name}"})
+
     def rotate_account_key(self, name: str) -> UiResponse:
         """手动轮换某账号的 Key（Key 池「轮换 Key」按钮 / 泄漏守卫操作列共用）。
 
@@ -1347,6 +1370,8 @@ class ConsoleState:
                     return self.remove_one(
                         str(payload.get("id") or payload.get("key") or "")
                     )
+                if path == "/api/accounts/remove":
+                    return self.remove_account(str(payload.get("account") or ""))
                 if path == "/api/leak-guard/rotate":
                     return self.rotate_account_key(str(payload.get("account") or ""))
                 if path == "/api/pool/rotate":

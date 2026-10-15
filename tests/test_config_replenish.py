@@ -175,6 +175,25 @@ class AddAccountTest(unittest.TestCase):
                 )
 
 
+class RemoveAccountTest(unittest.TestCase):
+    def _store(self, tmp: str) -> ConfigStore:
+        path = Path(tmp) / "config.json"
+        path.write_text(json.dumps(_cfg()), encoding="utf-8")
+        store = ConfigStore.load(path)
+        store.add_account(
+            "账号2", user="u2", phone="13900000000", password="p2", api_keys=["sk-new"]
+        )
+        return store
+
+    def test_remove_account_drops_it_and_keeps_others(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self.assertTrue(store.remove_account("账号2"))
+            store.reload()
+            self.assertEqual([a.name for a in store.config.accounts], ["账号1"])
+            self.assertFalse(store.remove_account("不存在"))
+
+
 def test_add_account_survives_save_and_reload(tmp_path):
     path = tmp_path / "config.json"
     path.write_text(json.dumps(_cfg()), encoding="utf-8")

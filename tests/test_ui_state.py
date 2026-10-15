@@ -66,6 +66,60 @@ class _FakeRotator:
         return {"models": []}
 
 
+class _FakeRotatorWithKeys(_FakeRotator):
+    """带 remove_key 的假 rotator（删账号用）。"""
+
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        self.removed: list[str] = []
+
+    def remove_key(self, key: str) -> bool:
+        self.removed.append(key)
+        return True
+
+
+class RemoveAccountTest(unittest.TestCase):
+    def test_remove_account_removes_keys_and_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_config(tmp)
+            store = ConfigStore.load(path)
+            rotator = _FakeRotatorWithKeys(store.config)
+            console = ConsoleState(store=store, rotator=rotator)  # type: ignore[arg-type]
+            resp = console.remove_account("账号B")
+            self.assertTrue(resp.payload["ok"])
+            self.assertEqual(rotator.removed, ["sk-b1", "sk-b2"])
+            self.assertEqual([a.name for a in store.config.accounts], ["账号A"])
+            self.assertEqual([a.name for a in rotator.config.accounts], ["账号A"])
+            disk = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual([a["name"] for a in disk["accounts"]], ["账号A"])
+
+    def test_remove_account_not_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConfigStore.load(_write_config(tmp))
+            console = ConsoleState(  # type: ignore[arg-type]
+                store=store, rotator=_FakeRotatorWithKeys(store.config)
+            )
+            self.assertEqual(console.remove_account("ghost").status, 404)
+
+    def test_remove_account_last_one_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "http://127.0.0.1:9/v1",
+                        "accounts": [{"name": "账号A", "api_keys": ["sk-a1"]}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            store = ConfigStore.load(path)
+            console = ConsoleState(  # type: ignore[arg-type]
+                store=store, rotator=_FakeRotatorWithKeys(store.config)
+            )
+            self.assertFalse(console.remove_account("账号A").payload["ok"])
+
+
 class SnapshotAccountNamesTest(unittest.TestCase):
     """RED：snapshot() 当前没有 account_names 键；GREEN：等于配置账号名的有序列表。"""
 

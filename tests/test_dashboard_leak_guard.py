@@ -38,5 +38,13 @@ class DashboardPoolRotateTest(unittest.TestCase):
         self.assertIn("/api/pool/rotate", DASHBOARD_HTML)
 
 
+class DashboardRemoveAccountTest(unittest.TestCase):
+    def test_remove_account_button_wired(self):
+        self.assertIn("删账号", DASHBOARD_HTML)
+        self.assertIn('data-act="remove-account"', DASHBOARD_HTML)
+        self.assertIn("function onRemoveAccount", DASHBOARD_HTML)
+        self.assertIn("/api/accounts/remove", DASHBOARD_HTML)
+
+
 if __name__ == "__main__":
     unittest.main()

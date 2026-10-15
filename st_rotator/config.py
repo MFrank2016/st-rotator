@@ -1100,6 +1100,19 @@ class ConfigStore:
                     self._touch(item)
         return removed
 
+    def remove_account(self, name: str) -> bool:
+        """从配置文件里整体删掉某账号（连同其 Key 与登录凭据）；不存在返回 False。
+
+        不 reload（与 ``remove_key`` 一致），由调用方在需要时自行 ``reload``。
+        """
+        name = (name or "").strip()
+        accounts = self._accounts_raw()
+        for item in list(accounts):
+            if isinstance(item, dict) and item.get("name") == name:
+                accounts.remove(item)
+                return True
+        return False
+
     def set_default_model(self, model: str) -> str:
         model = (model or "").strip()
         if not model:

@@ -1628,6 +1628,7 @@ function renderPool(state) {
     if (S.poolPage < 1) S.poolPage = 1;
     var start = (S.poolPage - 1) * size;
     var pageKeys = filtered.slice(start, start + size);
+    var seenAccounts = {};
     var head = "<tr><th class='num'>ID</th><th>账号</th><th>Key</th><th>状态</th><th>冷却</th><th>RPM</th>" +
       "<th class='num'>成功/失败</th><th class='num'>429</th><th class='num'>延迟</th>" +
       "<th class='num' title='通用积分池 5 小时窗口剩余额度'>通用 5h 余量</th>" +
@@ -1645,11 +1646,16 @@ function renderPool(state) {
       var general = q && q.status === "ok" ? q.general : null;
       var flash = q && q.status === "ok" ? q.flash_lite : null;
       var label = k.username || k.account;
+      var firstOfAccount = !seenAccounts[k.account];
+      seenAccounts[k.account] = true;
       return "<tr>" +
         '<td class="num" data-label="ID">' + esc(k.id) + "</td>" +
         '<td data-label="账号">' + esc(label) +
           (as[k.account] && as[k.account].status === "password_error"
             ? ' <span class="pill invalid" title="' + esc(as[k.account].message || "登录失败：密码错误") + '">密码错误</span>'
+            : "") +
+          (firstOfAccount
+            ? ' <button class="tiny danger" data-act="remove-account" data-account="' + esc(k.account) + '">删账号</button>'
             : "") +
         "</td>" +
         '<td class="mono" data-label="Key">' + esc(k.key) + "</td>" +
@@ -1677,6 +1683,8 @@ function renderPool(state) {
       button.onclick = function () {
         if (button.dataset.act === "rotate") {
           onPoolRotate(button.dataset.account, button.dataset.label, button);
+        } else if (button.dataset.act === "remove-account") {
+          onRemoveAccount(button.dataset.account, button);
         } else {
           onPoolAction(button.dataset.act, button.dataset.id, button.dataset.label, button);
         }
@@ -1825,6 +1833,27 @@ async function onPoolRotate(account, label, button) {
       body: JSON.stringify({ account: account })
     });
     toast(result.message || "已轮换 Key", result.ok === false ? "err" : "ok");
+    await refreshState();
+  } catch (err) {
+    toast(err.message, "err");
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+/* Key 池：删除某账号（移除池中该账号全部 Key + 从配置文件删除该账号）。 */
+async function onRemoveAccount(account, button) {
+  if (!confirm("确定要删除账号吗？\n\n" + account + "\n\n会从池中移除该账号的全部 Key，并从配置文件里删除该账号（含登录凭据）。")) return;
+  button.disabled = true;
+  var original = button.textContent;
+  button.innerHTML = '<span class="spin">◌</span>';
+  try {
+    var result = await api("/api/accounts/remove", {
+      method: "POST",
+      body: JSON.stringify({ account: account })
+    });
+    toast(result.message || "已删除账号", result.ok === false ? "err" : "ok");
     await refreshState();
   } catch (err) {
     toast(err.message, "err");
