@@ -578,6 +578,7 @@ class ReplenishWorker:
             self.STATUS_OK,
             "",
             log_line=f"[补号] 已注册新账号 {user}（{phone}）",
+            always_log=True,
         )
         return True
 
@@ -631,6 +632,7 @@ class ReplenishWorker:
                 self.STATUS_CHECK_ERROR,
                 f"用户名重试仍失败: {exc.detail}"[:DETAIL_LIMIT],
                 log_line=f"[补号] 用户名重试仍失败：{exc.detail}"[:DETAIL_LIMIT],
+                always_log=True,
             )
             raise _StopCycle(
                 record=dict(
@@ -672,6 +674,7 @@ class ReplenishWorker:
                     self.STATUS_CHECK_ERROR,
                     "接管：smsLogin 无 redirect 且无租户",
                     log_line=f"[补号] 号码 {phone} 接管失败：smsLogin 无 redirect 且无租户",
+                    always_log=True,
                 )
                 raise _StopCycle(
                     record=dict(
@@ -697,6 +700,7 @@ class ReplenishWorker:
                 self.STATUS_CHECK_ERROR,
                 "接管：登录未返回 redirect",
                 log_line=f"[补号] 号码 {phone} 接管失败：登录未返回 redirect",
+                always_log=True,
             )
             raise _StopCycle(
                 record=dict(
@@ -717,6 +721,7 @@ class ReplenishWorker:
                 self.STATUS_CHECK_ERROR,
                 "接管后无法解析 user_id",
                 log_line=f"[补号] 号码 {phone} 接管失败：无法解析 user_id",
+                always_log=True,
             )
             raise _StopCycle(
                 record=dict(
@@ -764,6 +769,7 @@ class ReplenishWorker:
                     f"[补号] 号码 {phone} 改密短信超时：已接管并保留 Key，"
                     f"用户名={username or '未取到'}（密码未改，需人工补录）"
                 ),
+                always_log=True,
             )
             raise _StopCycle(
                 record=dict(
@@ -798,6 +804,7 @@ class ReplenishWorker:
             self.STATUS_OK,
             "",
             log_line=f"[补号] 已接管账号 {username or phone}（{phone}）并改密",
+            always_log=True,
         )
         return True
 
@@ -859,9 +866,19 @@ class ReplenishWorker:
 
     # ------------------------------------------------------------ 状态
     def _set_status(
-        self, status: str, message: str, *, log_line: str | None = None
+        self,
+        status: str,
+        message: str,
+        *,
+        log_line: str | None = None,
+        always_log: bool = False,
     ) -> None:
-        """写入 ``_replenish`` 状态；仅在状态迁移时输出日志。"""
+        """写入 ``_replenish`` 状态；默认仅在状态迁移时输出日志。
+
+        ``always_log=True`` 用于**账号级结果**日志（注册成功 / 接管成功 / 接管失败等）：
+        这些是每个账号各记一条的结果，不能因「状态没变」被吞掉（连续两次接管成功时，
+        第二次的状态仍是 ok，默认口径会漏掉它的「已接管…」日志）。
+        """
         with self._status_lock:
             current = self._status.get("_replenish")
             changed = (
@@ -871,5 +888,5 @@ class ReplenishWorker:
             )
             if changed:
                 self._status["_replenish"] = {"status": status, "message": message}
-        if changed and log_line is not None:
+        if log_line is not None and (changed or always_log):
             self._log(log_line)

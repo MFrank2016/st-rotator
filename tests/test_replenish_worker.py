@@ -594,6 +594,28 @@ class ReplenishWorkerTest(unittest.TestCase):
         self.assertEqual(keys.ops, ["list", "delete", "create"])
         self.assertEqual(self._status(worker), ReplenishWorker.STATUS_OK)
 
+    def test_two_consecutive_takeovers_both_log_success(self):
+        registry = self._registry()
+        sms = _FakeSms(
+            phones=["13800000002", "13800000004"], msg="【商汤】验证码 888888"
+        )
+        authn = _FakeAuthn(
+            sms_login_result={
+                "tenant_list": [{"user_id": "user-42"}],
+                "redirect": "http://redirect/login?code=def",
+            }
+        )
+        worker = self._worker(
+            sms=sms,
+            authn=authn,
+            keys=_FakeKeys(list_result=[_key("old-1")]),
+            registry=registry,
+            target=2,
+        )
+        worker.run_once()
+        joined = "\n".join(self.log_lines)
+        self.assertEqual(joined.count("已接管账号"), 2)
+
     def test_takeover_password_sms_timeout_persists_with_partial_outcome(self):
         registry = self._registry()
         sms = _FakeSms(phones=["13800000013"])
