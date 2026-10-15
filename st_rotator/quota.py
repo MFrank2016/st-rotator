@@ -49,7 +49,22 @@ class QuotaAuthError(RuntimeError):
 
 
 class QuotaHTTPError(RuntimeError):
-    """登录/查询途中的 HTTP 失败，带状态码、URL 与响应体片段。"""
+    """登录/查询途中的 HTTP 失败，带状态码、URL 与响应体片段。
+
+    ``request`` / ``response`` 供失败日志打印排查：``request`` 为 ``METHOD /path``（**不含
+    请求体**，避免把 JWE 密码等带进日志），``response`` 为上游原始错误报文。
+    """
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        request: str | None = None,
+        response: str | None = None,
+    ) -> None:
+        super().__init__(detail)
+        self.request = request
+        self.response = response
 
 
 @dataclass(frozen=True)
@@ -273,14 +288,19 @@ class HttpQuotaTransport:
         try:
             return opener.open(req, timeout=self.timeout)
         except urllib.error.HTTPError as exc:
-            snippet = ""
+            raw = ""
             try:
-                snippet = exc.read().decode("utf-8", "replace")[:300]
+                raw = exc.read().decode("utf-8", "replace")
             except Exception:  # noqa: BLE001 - 读不到响应体就不带
                 pass
             url = getattr(req, "full_url", str(req))
+            method = req.get_method() if hasattr(req, "get_method") else "?"
             detail = f"HTTP {exc.code} {exc.reason} [{step}] {url}"
-            raise QuotaHTTPError(detail + (f" :: {snippet}" if snippet else "")) from exc
+            raise QuotaHTTPError(
+                detail + (f" :: {raw[:300]}" if raw else ""),
+                request=f"{method} {urllib.parse.urlsplit(url).path}",
+                response=raw[:2000],
+            ) from exc
 
     def _get(
         self, opener: Any, url: str, *, params: Mapping[str, Any] | None = None

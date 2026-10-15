@@ -17,7 +17,12 @@ from unittest import mock
 from st_rotator import autorenew
 from st_rotator.autorenew import AutoRenewWorker, KeyInfo
 from st_rotator.config import AccountConfig
-from st_rotator.quota import QuotaAuthError, QuotaUnavailable, TokenBundle
+from st_rotator.quota import (
+    QuotaAuthError,
+    QuotaHTTPError,
+    QuotaUnavailable,
+    TokenBundle,
+)
 
 TOKEN = TokenBundle(
     access_token="tok-plain-abc",
@@ -582,6 +587,24 @@ class CleanupTest(AutoRenewWorkerTest):
         )
         worker.run_cleanup()
         self.assertNotIn("账号1", worker.account_status())
+
+    def test_cleanup_login_failure_logs_request_and_response(self):
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-cur"], user="u1", password="p1"
+        )
+        err = QuotaHTTPError(
+            "HTTP 403 Forbidden [nova-login] http://x/nova/login",
+            request="POST /iam/authn/v1/auth/nova/login",
+            response='{"code":7,"message":"PermissionDenied","details":[]}',
+        )
+        worker = self._worker(
+            accounts=[account], keys=_FakeKeys(), login=_FakeLogin(exc=err)
+        )
+        worker.run_cleanup()
+        joined = "\n".join(self.log_lines[0])
+        self.assertIn("失败请求：POST /iam/authn/v1/auth/nova/login", joined)
+        self.assertIn("失败响应：", joined)
+        self.assertIn("PermissionDenied", joined)
 
     def test_loop_runs_cleanup_periodically(self):
         account = AccountConfig(name="空账号", api_keys=["sk-1"], user="", password="")

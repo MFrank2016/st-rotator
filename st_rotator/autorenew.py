@@ -414,6 +414,7 @@ class AutoRenewWorker:
                     :DETAIL_LIMIT
                 ]
             )
+            self._log_failure_context(account.name, exc)
             return
         try:
             extras = [
@@ -432,6 +433,15 @@ class AutoRenewWorker:
             return
         if extras:
             self._log(f"账号 {account.name}：已清理 {len(extras)} 把多余 Key")
+
+    def _log_failure_context(self, account_name: str, exc: Exception) -> None:
+        """失败时打印请求 / 响应报文，便于排查（请求只记端点，不含请求体）。"""
+        request = getattr(exc, "request", None)
+        response = getattr(exc, "response", None)
+        if request:
+            self._log(f"账号 {account_name}：失败请求：{request}")
+        if response:
+            self._log(f"账号 {account_name}：失败响应：{response}")
 
     def _loop(self) -> None:
         """先立即跑一轮检测与清理，再按 interval 周期检测、按 cleanup_interval 周期清理。"""

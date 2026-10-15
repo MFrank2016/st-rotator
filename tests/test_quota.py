@@ -180,6 +180,8 @@ class HttpErrorDetailTest(unittest.TestCase):
             self.assertIn("nova-login", msg)
             self.assertIn("/nova/login", msg)
             self.assertIn("account forbidden", msg)
+            self.assertEqual(ctx.exception.request, "POST /nova/login")
+            self.assertIn("account forbidden", ctx.exception.response or "")
         finally:
             server.shutdown()
             server.server_close()
