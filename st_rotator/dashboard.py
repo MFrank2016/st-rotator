@@ -170,6 +170,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   #logbox .err { color: var(--red); }
   #logbox .ok { color: var(--green); }
   #logbox .dim { color: var(--muted); }
+  #logbox .lg-time {
+    color: var(--muted); margin-right: 8px; cursor: default;
+    font-variant-numeric: tabular-nums;
+  }
 
   .toast {
     position: fixed; right: 22px; bottom: 22px; z-index: 50;
@@ -303,7 +307,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
     <div id="sk-table-sec"></div>
     <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
-      <h2 style="margin-bottom:10px">子 Key 用量明细（最近 100 条）</h2>
+      <h2 style="margin-bottom:10px">子 Key 用量明细 <span class="muted" style="font-size:12px">（分页显示，每页 10 条，最新在前）</span></h2>
+      <div id="sk-hist-bar"></div>
       <div id="sk-history"></div>
     </div>
   </div>
@@ -774,7 +779,13 @@ function appendLogs(items) {
   items.forEach(function (item) {
     var line = document.createElement("div");
     line.className = classifyLog(item.text);
-    line.textContent = item.text;
+    var time = document.createElement("span");
+    time.className = "lg-time";
+    time.textContent = item.t ? fmtTime(Number(item.t)) : "";
+    time.title = item.t ? fmtTime(Number(item.t)) : "";
+    line.appendChild(time);
+    var text = document.createTextNode(item.text);
+    line.appendChild(text);
     box.appendChild(line);
   });
   while (box.childElementCount > 800) box.removeChild(box.firstChild);
@@ -926,12 +937,14 @@ function renderSubkeys(state) {
   var createBox = $("sk-create");
   var stateBox = $("sk-state");
   var tableBox = $("sk-table-sec");
+  var histBar = $("sk-hist-bar");
   var historyBox = $("sk-history");
   if (!sk) {
     note.textContent = "";
     createBox.style.display = "none";
     stateBox.innerHTML = "";
     tableBox.innerHTML = '<div class="empty">子 Key 未启用（当前进程未挂载 subkeys 管理器，可能是旧版本或直接调用代理）。</div>';
+    histBar.innerHTML = "";
     historyBox.innerHTML = "";
     return;
   }
@@ -984,31 +997,80 @@ function renderSubkeys(state) {
       button.onclick = function () { onSubkeyAction(button.dataset.sk, button); };
     });
   }
-  var history = sk.history || [];
-  if (!history.length) {
-    historyBox.innerHTML = '<div class="empty">暂无调用记录（子 Key 尚未被使用）。</div>';
-  } else {
-    var hhead = "<tr><th>时间</th><th>子 Key</th><th>模型</th><th>模式</th><th>结果</th>" +
-      "<th class='num'>输入</th><th class='num'>输出</th><th class='num'>缓存</th><th class='num'>延迟</th></tr>";
-    var hbody = history.map(function (h) {
-      var mode = h.stream ? "流式" : "普通";
-      var okBadge = h.ok
-        ? '<span class="pill healthy">成功</span>'
-        : '<span class="pill invalid">失败</span>';
-      var estimate = h.estimated ? ' <span class="muted" style="font-size:10.5px">估</span>' : "";
-      return "<tr>" +
-        "<td>" + esc(fmtTime(h.t)) + "</td>" +
-        "<td>" + esc(h.name || "—") + "</td>" +
-        "<td>" + esc(h.model || "—") + "</td>" +
-        "<td>" + mode + "</td>" +
-        "<td>" + okBadge + "</td>" +
-        '<td class="num">' + fmtCtx(h.prompt) + estimate + "</td>" +
-        '<td class="num">' + fmtCtx(h.completion) + "</td>" +
-        '<td class="num">' + (h.cached ? fmtCtx(h.cached) : "—") + "</td>" +
-        '<td class="num">' + (h.latency_ms != null ? Math.round(h.latency_ms) + "ms" : "—") + "</td></tr>";
-    }).join("");
-    historyBox.innerHTML = "<table>" + hhead + hbody + "</table>";
+}
+
+/* ------------------------------------------------- 用量明细（分页，默认每页 10 条） */
+
+var skHist = { page: 1, pageSize: 10, total: 0, loading: false, pending: 0 };
+
+async function loadSubkeyHistory(page) {
+  if (skHist.loading) {
+    if (page) skHist.pending = page;
+    return;
   }
+  skHist.loading = true;
+  var bar = $("sk-hist-bar");
+  var box = $("sk-history");
+  try {
+    var data = await api(
+      "/api/subkeys/history?page=" + (page || skHist.page) + "&page_size=" + skHist.pageSize
+    );
+    skHist.page = data.page;
+    skHist.total = data.total;
+    renderSubkeyHistory(data, bar, box);
+  } catch (err) {
+    bar.innerHTML = "";
+    box.innerHTML = '<div class="empty">' + esc(err.message) + "</div>";
+  } finally {
+    skHist.loading = false;
+    if (skHist.pending) {
+      var target = skHist.pending;
+      skHist.pending = 0;
+      loadSubkeyHistory(target);
+    }
+  }
+}
+
+function renderSubkeyHistory(data, bar, box) {
+  var history = data.history || [];
+  var pages = Math.max(1, Math.ceil(data.total / data.page_size));
+  bar.innerHTML =
+    '<div class="row" style="margin-bottom:8px;align-items:center">' +
+      '<button class="tiny" id="sk-page-prev"' + (data.page <= 1 ? " disabled" : "") + ">上一页</button>" +
+      '<span class="muted" style="margin:0 10px">第 ' + data.page + " / " + pages + " 页 · 共 " + fmtInt(data.total) + " 条</span>" +
+      '<button class="tiny" id="sk-page-next"' + (data.page >= pages ? " disabled" : "") + ">下一页</button>" +
+    "</div>";
+  var prev = $("sk-page-prev");
+  var next = $("sk-page-next");
+  if (prev) prev.onclick = function () { loadSubkeyHistory(skHist.page - 1); };
+  if (next) next.onclick = function () { loadSubkeyHistory(skHist.page + 1); };
+  if (!history.length) {
+    box.innerHTML = '<div class="empty">' +
+      (data.total ? "本页暂无记录。" : "暂无调用记录（子 Key 尚未被使用）。") + "</div>";
+    return;
+  }
+  var hhead = "<tr><th>时间</th><th>子 Key</th><th>模型</th><th>模式</th><th>结果</th>" +
+    "<th class='num'>输入</th><th class='num'>输出</th><th class='num'>缓存命中率</th><th class='num'>延迟</th></tr>";
+  var hbody = history.map(function (h) {
+    var mode = h.stream ? "流式" : "普通";
+    var okBadge = h.ok
+      ? '<span class="pill healthy">成功</span>'
+      : '<span class="pill invalid">失败</span>';
+    var estimate = h.estimated ? ' <span class="muted" style="font-size:10.5px">估</span>' : "";
+    var rate = h.estimated || h.prompt <= 0 ? "—" : Math.round((h.cached || 0) / h.prompt * 100) + "%";
+    var rateCell = '<td class="num"' + (rate !== "—" ? ' title="缓存 ' + fmtInt(h.cached || 0) + " / 输入 " + fmtInt(h.prompt) + '"' : "") + ">" + rate + "</td>";
+    return "<tr>" +
+      "<td>" + esc(fmtTime(h.t)) + "</td>" +
+      "<td>" + esc(h.name || "—") + "</td>" +
+      "<td>" + esc(h.model || "—") + "</td>" +
+      "<td>" + mode + "</td>" +
+      "<td>" + okBadge + "</td>" +
+      '<td class="num">' + fmtCtx(h.prompt) + estimate + "</td>" +
+      '<td class="num">' + fmtCtx(h.completion) + "</td>" +
+      rateCell +
+      '<td class="num">' + (h.latency_ms != null ? Math.round(h.latency_ms) + "ms" : "—") + "</td></tr>";
+  }).join("");
+  box.innerHTML = "<table>" + hhead + hbody + "</table>";
 }
 
 async function postSubkey(path, body, button) {
@@ -1097,6 +1159,7 @@ async function refreshState() {
     renderPool(state);
     renderOptions(state);
     renderSubkeys(state);
+    if (state.subkeys) loadSubkeyHistory(skHist.page);
     var g = state.gateway || {};
     $("subline").innerHTML = '<span class="dot ' + (state.metrics.paused ? "paused" : "on") + '"></span>' +
       (state.metrics.paused ? "已暂停接入（上层会收到 503）" : "运行中") +

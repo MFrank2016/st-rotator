@@ -261,12 +261,22 @@ class SubKeyManager:
             items.sort(key=lambda item: item["created_at"], reverse=True)
             return items
 
-    def history_snapshot(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """最近使用记录（最新的在前）。"""
+    def history_snapshot(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        """最近使用记录的分页切片（最新的在前）。
+
+        ``offset`` 从最新一条算起；``limit`` 与 ``offset`` 都会被钳制为非负整数。
+        """
         with self._lock:
             items = list(self._history)
         items.reverse()
-        return items[: max(0, int(limit))]
+        limit = max(0, int(limit))
+        offset = max(0, int(offset))
+        return items[offset : offset + limit]
+
+    def history_count(self) -> int:
+        """当前保留的调用记录总数（缓冲上限内）。"""
+        with self._lock:
+            return len(self._history)
 
     # ------------------------------------------------------------------ 认证
 

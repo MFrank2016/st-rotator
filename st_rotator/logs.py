@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import deque
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -26,7 +27,7 @@ class LogBuffer:
     """
 
     def __init__(self, maxlen: int = DEFAULT_BUFFER_LINES) -> None:
-        self._lines: deque[tuple[int, str]] = deque(maxlen=maxlen)
+        self._lines: deque[tuple[int, str, float]] = deque(maxlen=maxlen)
         self._lock = threading.Lock()
         self._cursor = 0
 
@@ -36,7 +37,7 @@ class LogBuffer:
             return
         with self._lock:
             self._cursor += 1
-            self._lines.append((self._cursor, message))
+            self._lines.append((self._cursor, message, time.time()))
 
     def since(self, cursor: int = 0) -> tuple[int, list[dict[str, Any]]]:
         """返回 ``(最新游标, 游标之后的新日志)``。"""
@@ -44,8 +45,8 @@ class LogBuffer:
             if cursor >= self._cursor:
                 return self._cursor, []
             items = [
-                {"seq": seq, "text": text}
-                for seq, text in self._lines
+                {"seq": seq, "text": text, "t": t}
+                for seq, text, t in self._lines
                 if seq > cursor
             ]
             return self._cursor, items
@@ -53,7 +54,7 @@ class LogBuffer:
     def tail(self, limit: int = 200) -> list[dict[str, Any]]:
         with self._lock:
             items = list(self._lines)[-limit:]
-        return [{"seq": seq, "text": text} for seq, text in items]
+        return [{"seq": seq, "text": text, "t": t} for seq, text, t in items]
 
     def clear(self) -> None:
         with self._lock:

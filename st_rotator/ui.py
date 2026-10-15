@@ -263,7 +263,6 @@ class ConsoleState:
             "configured": True,
             "admin_token_set": bool(self.token),
             "keys": self.subkeys.snapshot(),
-            "history": self.subkeys.history_snapshot(limit=100),
         }
 
     # ------------------------------------------------------------ 子 Key 管理
@@ -340,10 +339,22 @@ class ConsoleState:
         self._log(f"[子Key] 清零用量：{sub.name}")
         return UiResponse.json({"ok": True, "message": f"已清零子 Key {sub.name} 的用量统计"})
 
-    def subkey_history(self, limit: int = 200) -> UiResponse:
+    def subkey_history(self, page: int = 1, page_size: int = 10) -> UiResponse:
+        """子 Key 用量明细分页：默认每页 10 条，最新在前。"""
         if self.subkeys is None:
             return UiResponse.error("未启用子 Key", status=404)
-        return UiResponse.json({"ok": True, "history": self.subkeys.history_snapshot(limit=limit)})
+        page = max(1, int(page))
+        page_size = max(1, min(100, int(page_size)))
+        offset = (page - 1) * page_size
+        return UiResponse.json(
+            {
+                "ok": True,
+                "page": page,
+                "page_size": page_size,
+                "total": self.subkeys.history_count(),
+                "history": self.subkeys.history_snapshot(limit=page_size, offset=offset),
+            }
+        )
 
     # ------------------------------------------------------------ 写操作
 
@@ -653,7 +664,10 @@ class ConsoleState:
                     cursor = _first_int(query, "cursor", 0)
                     return UiResponse.json(self.logs_since(cursor))
                 if path == "/api/subkeys/history":
-                    return self.subkey_history(_clamp_int(_first_int(query, "limit", 200), 200, 1, 1000))
+                    return self.subkey_history(
+                        _clamp_int(_first_int(query, "page", 1), 1, 1, 100000),
+                        _clamp_int(_first_int(query, "page_size", 10), 10, 1, 100),
+                    )
                 return UiResponse.error(f"未知接口 {path}", status=404)
 
             if method == "POST":
