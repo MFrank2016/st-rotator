@@ -606,6 +606,41 @@ class CleanupTest(AutoRenewWorkerTest):
         self.assertIn("失败响应：", joined)
         self.assertIn("PermissionDenied", joined)
 
+    def test_rotate_now_success(self):
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-old"], user="u1", password="p1"
+        )
+        worker = self._worker(accounts=[account], login=_FakeLogin(), keys=_FakeKeys())
+        res = worker.rotate_now("账号1")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(worker.account_status()["账号1"]["status"], "ok")
+
+    def test_rotate_now_not_found(self):
+        worker = self._worker(accounts=[])
+        res = worker.rotate_now("ghost")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["status"], "not_found")
+
+    def test_rotate_now_no_credentials(self):
+        account = AccountConfig(name="账号1", api_keys=["sk-a"], user="", password="")
+        worker = self._worker(accounts=[account])
+        res = worker.rotate_now("账号1")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["status"], "no_credentials")
+
+    def test_rotate_now_password_error_sets_status(self):
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-a"], user="u1", password="p1"
+        )
+        worker = self._worker(
+            accounts=[account], login=_FakeLogin(exc=QuotaAuthError("用户名或密码错误"))
+        )
+        res = worker.rotate_now("账号1")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["status"], "password_error")
+        self.assertEqual(worker.account_status()["账号1"]["status"], "password_error")
+
     def test_loop_runs_cleanup_periodically(self):
         account = AccountConfig(name="空账号", api_keys=["sk-1"], user="", password="")
         worker = self._worker(accounts=[account], interval=0.05, cleanup_interval=0.05)

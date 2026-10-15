@@ -3,6 +3,20 @@
 版本号规则与发版标准流程见 [AGENTS.md](AGENTS.md)。
 一句话规则：**小版本 `+0.0.1`**（如 `1.3.0 → 1.3.1`），**大版本 `+0.1`**（如 `1.3.0 → 1.4.0`）。
 
+## [1.3.9] - 2026-10-15
+
+### 新增
+
+- **账号「密码错误」状态修复**：登录时服务端以 HTTP 400 `incorrectUsernameOrPassword`
+  表达「用户名或密码错误」，此前被当成**瞬时** `check_error`，导致「密码错误」徽标几乎从不
+  显示、且被无谓重试。现在 `HttpQuotaTransport.login` 识别该响应并改抛 `QuotaAuthError`，
+  归类为 `password_error`（控制台显示红色「密码错误」徽标）。账号被锁（`forbidLoginForMoment`）
+  **不算**密码错，仍按 `check_error` 瞬时处理。
+- **Key 池「轮换 Key」按钮**：Key 池每个 Key 行新增「轮换 Key」按钮 → 点击确认后调用
+  `POST /api/pool/rotate`，复用 `rotate_account`（登录 → 注销该账号平台侧全部 Key →
+  新建一把 → 落池+落盘），并探测新 Key。轮换能力由 `auto_renew`（优先）或 `leak_guard`
+  提供；两者都未运行时返回 409。
+
 ## [1.3.8] - 2026-10-15
 
 ### 新增

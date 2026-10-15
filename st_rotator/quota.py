@@ -67,6 +67,19 @@ class QuotaHTTPError(RuntimeError):
         self.response = response
 
 
+# 服务端用 HTTP 400 + ``incorrectUsernameOrPassword`` 表达「用户名或密码错误」。
+_WRONG_CREDENTIALS_MARKERS = (
+    "incorrectusernameorpassword",
+    "wrong account or password",
+    "用户名或密码错误",
+)
+
+
+def _is_wrong_credentials(exc: "QuotaHTTPError") -> bool:
+    text = f"{exc.response or ''} {exc}".lower()
+    return any(marker in text for marker in _WRONG_CREDENTIALS_MARKERS)
+
+
 @dataclass(frozen=True)
 class TokenBundle:
     access_token: str
@@ -365,7 +378,12 @@ class HttpQuotaTransport:
                 "User-Agent": USER_AGENT,
             },
         )
-        resp = self._open(opener, req, step="nova-login")
+        try:
+            resp = self._open(opener, req, step="nova-login")
+        except QuotaHTTPError as exc:
+            if _is_wrong_credentials(exc):
+                raise QuotaAuthError("用户名或密码错误") from exc
+            raise
         payload = json.loads(resp.read().decode("utf-8"))
         redirect = payload.get("redirect")
         if not redirect:

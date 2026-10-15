@@ -222,6 +222,20 @@ class RotateAccountKeyTest(unittest.TestCase):
             console = ConsoleState(store=store, rotator=rotator)  # type: ignore[arg-type]
             self.assertEqual(console.rotate_account_key("账号1").status, 409)
 
+    def test_falls_back_to_auto_renew_when_leak_guard_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = _FakeGuardWorker({"ok": True, "status": "ok", "message": "ok"})
+            store = _load_store(tmp, credentials=True)
+            rotator = _FakeRotator(store.config)
+            console = ConsoleState(  # type: ignore[arg-type]
+                store=store,
+                rotator=rotator,
+                auto_renew=worker,  # type: ignore[arg-type]
+            )
+            resp = console.rotate_account_key("账号1")
+            self.assertTrue(resp.payload["ok"])
+            self.assertEqual(worker.calls, ["账号1"])
+
     def test_empty_name_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             console = self._console(tmp, leak_guard=_FakeGuardWorker({}))
@@ -261,7 +275,7 @@ class RotateAccountKeyTest(unittest.TestCase):
             console.rotate_account_key("账号1")
             _cursor, items = console.buffer.since(0)
             text = "\n".join(str(i["text"]) for i in items)
-            self.assertIn("手动更换 Key：账号 账号1", text)
+            self.assertIn("手动轮换 Key：账号 账号1", text)
             self.assertIn("新 Key", text)
             self.assertIn("检测", text)
 

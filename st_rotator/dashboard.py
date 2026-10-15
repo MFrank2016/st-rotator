@@ -1668,13 +1668,18 @@ function renderPool(state) {
         '<td class="num" data-label="更新时间" title="' + esc(k.updated_at ? fmtTime(k.updated_at) : "未知") + '">' + esc(fmtTime(k.updated_at)) + "</td>" +
         '<td style="text-align:right;white-space:nowrap">' +
           '<button class="tiny" data-act="verify" data-id="' + esc(k.id) + '" data-label="' + esc(label + " / " + k.key) + '">测试</button> ' +
+          '<button class="tiny" data-act="rotate" data-account="' + esc(k.account) + '" data-label="' + esc(label) + '">轮换 Key</button> ' +
           '<button class="tiny danger" data-act="remove" data-id="' + esc(k.id) + '" data-label="' + esc(label + " / " + k.key) + '">删除</button>' +
         "</td></tr>";
     }).join("");
     $("pool").innerHTML = "<table><thead>" + head + "</thead><tbody>" + body + "</tbody></table>";
     Array.prototype.forEach.call($("pool").querySelectorAll("button[data-act]"), function (button) {
       button.onclick = function () {
-        onPoolAction(button.dataset.act, button.dataset.id, button.dataset.label, button);
+        if (button.dataset.act === "rotate") {
+          onPoolRotate(button.dataset.account, button.dataset.label, button);
+        } else {
+          onPoolAction(button.dataset.act, button.dataset.id, button.dataset.label, button);
+        }
       };
     });
     if ($("pool-page")) $("pool-page").textContent = "第 " + S.poolPage + " / " + lastPage + " 页（共 " + filtered.length + " 把）";
@@ -1799,6 +1804,27 @@ async function onPoolAction(action, keyId, label, button) {
       body: JSON.stringify({ id: keyId })
     });
     toast(result.message || "操作完成", result.ok === false ? "err" : "ok");
+    await refreshState();
+  } catch (err) {
+    toast(err.message, "err");
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+/* Key 池：手动轮换某账号的 Key（登录 → 注销该账号平台侧全部 Key → 新建一把 → 落盘）。 */
+async function onPoolRotate(account, label, button) {
+  if (!confirm("确定要轮换该账号的 Key 吗？\n\n" + label + "\n\n会注销该账号在平台侧的全部 Key，再新建一把。")) return;
+  button.disabled = true;
+  var original = button.textContent;
+  button.innerHTML = '<span class="spin">◌</span>';
+  try {
+    var result = await api("/api/pool/rotate", {
+      method: "POST",
+      body: JSON.stringify({ account: account })
+    });
+    toast(result.message || "已轮换 Key", result.ok === false ? "err" : "ok");
     await refreshState();
   } catch (err) {
     toast(err.message, "err");

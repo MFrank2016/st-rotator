@@ -188,6 +188,52 @@ class HttpErrorDetailTest(unittest.TestCase):
             thread.join(timeout=5)
 
 
+class WrongCredentialsTest(unittest.TestCase):
+    def _exc(self, body: str) -> quota.QuotaHTTPError:
+        return quota.QuotaHTTPError("HTTP err", request="POST /x", response=body)
+
+    def test_incorrect_username_or_password_detected(self):
+        self.assertTrue(
+            quota._is_wrong_credentials(
+                self._exc('{"details":[{"reason":"incorrectUsernameOrPassword"}]}')
+            )
+        )
+
+    def test_account_locked_is_not_wrong_credentials(self):
+        self.assertFalse(
+            quota._is_wrong_credentials(
+                self._exc('{"details":[{"reason":"forbidLoginForMoment"}]}')
+            )
+        )
+
+    def test_login_maps_wrong_credentials_to_auth_error(self):
+        transport = quota.HttpQuotaTransport()
+        resp = mock.Mock()
+        resp.geturl.return_value = "http://x/login?login_challenge=LC1"
+
+        def fake_open(opener, req, *, step):
+            raise quota.QuotaHTTPError(
+                "HTTP 400 Bad Request [nova-login]",
+                request="POST /iam/authn/v1/auth/nova/login",
+                response='{"details":[{"reason":"incorrectUsernameOrPassword"}]}',
+            )
+
+        with (
+            mock.patch.object(transport, "_get", lambda *a, **k: resp),
+            mock.patch.object(
+                transport,
+                "_follow_until",
+                lambda *a, **k: "http://x/login?login_challenge=LC1",
+            ),
+            mock.patch.object(transport, "_public_key", lambda: object()),
+            mock.patch.object(transport, "_open", fake_open),
+            mock.patch.object(quota, "_jwcrypto", lambda: (None, None, None)),
+            mock.patch.object(quota, "encrypt_password", lambda pw, *, pubkey: "enc"),
+        ):
+            with self.assertRaises(quota.QuotaAuthError):
+                transport.login("u", "p")
+
+
 class _FakeTransport:
     def __init__(self, *, fail_login=False, fail_fetch=False):
         self.calls = {"login": 0, "fetch": 0}

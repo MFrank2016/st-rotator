@@ -849,19 +849,22 @@ class ConsoleState:
         return UiResponse.json({"ok": True, "message": f"已删除 {label}"})
 
     def rotate_account_key(self, name: str) -> UiResponse:
-        """手动更换某账号的 Key（泄漏守卫操作列）。
+        """手动轮换某账号的 Key（Key 池「轮换 Key」按钮 / 泄漏守卫操作列共用）。
 
-        登录 → 注销该账号全部 Key → 新建 → 落盘，然后探测新 Key 可用性。
+        登录 → 注销该账号平台侧全部 Key → 新建一把 → 落盘，然后探测新 Key 可用性。
+        轮换能力由 auto_renew（优先）或 leak_guard 提供；两者都未运行时返回 409。
         """
         name = (name or "").strip()
         if not name:
             return UiResponse.error("账号名不能为空")
-        if self.leak_guard is None:
+        worker = self.auto_renew or self.leak_guard
+        if worker is None:
             return UiResponse.error(
-                "泄漏守卫未运行（需启用 leak_guard 且账号配置了登录凭据）", status=409
+                "自动轮换未运行（需启用 auto_renew 或 leak_guard 且账号配置了登录凭据）",
+                status=409,
             )
-        self._log(f"[控制台] 手动更换 Key：账号 {name}")
-        result = self.leak_guard.rotate_now(name)
+        self._log(f"[控制台] 手动轮换 Key：账号 {name}")
+        result = worker.rotate_now(name)
         if not result.get("ok"):
             status = {"not_found": 404, "no_credentials": 400}.get(
                 str(result.get("status")), 502
@@ -1345,6 +1348,8 @@ class ConsoleState:
                         str(payload.get("id") or payload.get("key") or "")
                     )
                 if path == "/api/leak-guard/rotate":
+                    return self.rotate_account_key(str(payload.get("account") or ""))
+                if path == "/api/pool/rotate":
                     return self.rotate_account_key(str(payload.get("account") or ""))
                 if path == "/api/model":
                     return self.set_model(str(payload.get("model") or ""))

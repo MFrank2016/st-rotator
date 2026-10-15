@@ -30,5 +30,13 @@ class DashboardLeakGuardTest(unittest.TestCase):
         self.assertIn("/api/leak-guard/rotate", DASHBOARD_HTML)
 
 
+class DashboardPoolRotateTest(unittest.TestCase):
+    def test_pool_rotate_button_wired(self):
+        self.assertIn("轮换 Key", DASHBOARD_HTML)
+        self.assertIn('data-act="rotate"', DASHBOARD_HTML)
+        self.assertIn("function onPoolRotate", DASHBOARD_HTML)
+        self.assertIn("/api/pool/rotate", DASHBOARD_HTML)
+
+
 if __name__ == "__main__":
     unittest.main()

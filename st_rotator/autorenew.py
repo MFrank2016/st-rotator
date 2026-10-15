@@ -490,7 +490,9 @@ class AutoRenewWorker:
             return
         self._rotate(account)
 
-    def _rotate(self, account: AccountConfig) -> None:
+    def _rotate(
+        self, account: AccountConfig, *, reason: str = "key 失效"
+    ) -> RotationOutcome:
         """登录 → 先 delete-all 后 create → persist；异常分类到对应状态。"""
         outcome = rotate_account(
             account,
@@ -499,7 +501,7 @@ class AutoRenewWorker:
             persist=self._persist,
             key_name=self._key_name,
             key_type=self._key_type,
-            on_login=lambda: self._log(f"账号 {account.name}：key 失效，开始轮换"),
+            on_login=lambda: self._log(f"账号 {account.name}：{reason}，开始轮换"),
         )
         if outcome.status == self.STATUS_PASSWORD_ERROR:
             self._set_status(
@@ -519,6 +521,33 @@ class AutoRenewWorker:
                 "",
                 log_line=f"账号 {account.name}：轮换成功，Key 已更新",
             )
+        return outcome
+
+    def rotate_now(self, name: str) -> dict[str, Any]:
+        """手动轮换某账号的 Key：登录 → 注销该账号全部 Key → 新建 → 落盘。
+
+        返回 ``{"ok", "status", "message"}``（**不含明文 Key**）。与自动轮换共用同一套
+        登录 / 平台调用 / persist，并同样把结果写入账号状态。
+        """
+        account = next((a for a in self._accounts() if a.name == name), None)
+        if account is None:
+            return {
+                "ok": False,
+                "status": "not_found",
+                "message": f"账号 {name} 不存在",
+            }
+        if not account.user or not account.password:
+            return {
+                "ok": False,
+                "status": "no_credentials",
+                "message": f"账号 {name} 未配置登录凭据",
+            }
+        outcome = self._rotate(account, reason="手动轮换")
+        return {
+            "ok": outcome.ok,
+            "status": outcome.status,
+            "message": outcome.message,
+        }
 
     def _set_status(
         self, name: str, status: str, message: str, *, log_line: str | None = None
