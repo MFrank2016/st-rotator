@@ -23,7 +23,17 @@
    - `git add` 只加本次相关文件，不带无关改动。
    - 提交信息用 Conventional Commits 中文风格：`feat:` / `fix:` / `style:` / `docs:` / `refactor:` / `chore:`。
    - `git push origin main`。
-6. **服务器拉取并重新部署**：
+6. **打标签并推送**：给本次发版的 commit 打一个 **annotated tag**（命名 `v<版本号>`，与 `version.py` 严格一致），并推送：
+
+   ```bash
+   git tag -a v1.3.7 -m "v1.3.7"
+   git push origin v1.3.7
+   ```
+
+   > 用 annotated tag（`-a`）而非轻量 tag；`-m` 可放一句话发版摘要。tag 名必须与
+   > `version.py` 的版本号一致（如 `v1.3.7`），一个版本号只打一个 tag。
+
+7. **服务器拉取并重新部署**：
 
    ```bash
    ssh root@107.151.246.25
