@@ -20,6 +20,9 @@ WorkBuddy / 各类 Agent 框架只认「OpenAI 兼容端点 + API Key」，没�
   response_format……）原样透传给上游。
 * **错误要映射成 OpenAI 的错误结构**，上层框架才能正确识别和重试。
 * **暂停开关**。控制台可以暂停对外服务（返回 503）而进程继续活着，方便临时止损。
+* **子 Key 与鉴权分层**。控制台接口（``/api/*``）只认管理 Token；``/v1/*`` 除了管理
+  Token 还接受签发的对外子 Key（见 ``subkeys.py``）。子 Key 只能调 API，永远不能访问
+  控制台，每次调用都会按子 Key 累计输入 / 输出 token 与缓存命中，供管理页面监控。
 """
 
 from __future__ import annotations
@@ -28,12 +31,14 @@ import hmac
 import json
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 from urllib.parse import parse_qs, urlparse
 
 from .client import StRotator, note_serve_begin, note_serve_end
 from .errors import AllKeysInvalid, ApiError, NoAvailableKey, RotationExhausted, RotatorError
+from .subkeys import SubKey, SubKeyManager
 from . import ui
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -64,6 +69,78 @@ def _passthrough_error(status: int, body: str) -> dict:
     return error_payload(body[:800] or f"upstream returned {status}", code=str(status))
 
 
+def _extract_usage(result: Any) -> tuple[int, int, int] | None:
+    """从上游响应中提取 (输入 token, 输出 token, 缓存命中 token)；取不到返回 None。"""
+    if not isinstance(result, dict):
+        return None
+    usage = result.get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    def _int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    prompt = _int(usage.get("prompt_tokens"))
+    completion = _int(usage.get("completion_tokens"))
+    cached = 0
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        cached = _int(details.get("cached_tokens"))
+    if not cached:
+        # 兼容各家上游的不同字段名（OpenAI / DeepSeek / 商汤等）
+        cached = _int(usage.get("prompt_cache_hit_tokens")) or _int(usage.get("cached_tokens"))
+    return (prompt, completion, cached)
+
+
+def _estimate_content_tokens(content: Any) -> int:
+    """粗略估算一段消息内容的 token 数（中英混合按字符数 / 4 估算）。"""
+    if isinstance(content, str):
+        return max(0, len(content) // 4)
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                total += len(part["text"]) // 4
+            elif isinstance(part, str):
+                total += len(part) // 4
+        return total
+    return 0
+
+
+def _estimate_messages_tokens(messages: Any) -> int:
+    """估算整组 messages 的输入 token 数（仅作上游未返回 usage 时的兜底）。"""
+    if not isinstance(messages, list):
+        return 0
+    return sum(
+        _estimate_content_tokens(message.get("content"))
+        for message in messages
+        if isinstance(message, dict)
+    )
+
+
+def _chunk_text(chunk: Any) -> str:
+    """取流式 chunk 的文本增量（choices[0].delta.content / text），用于估算输出长度。"""
+    if not isinstance(chunk, dict):
+        return ""
+    choices = chunk.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return ""
+    choice = choices[0]
+    delta = choice.get("delta")
+    if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+        return delta["content"]
+    if isinstance(choice.get("text"), str):
+        return choice["text"]
+    return ""
+
+
+def _elapsed_ms(started: float) -> float:
+    return (time.monotonic() - started) * 1000.0
+
+
 class RotatorProxyHandler(BaseHTTPRequestHandler):
     """把请求转交给轮换池的 HTTP 处理器。"""
 
@@ -77,6 +154,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
     verbose: bool = False
     log_sink: Callable[[str], None] | None = None
     console: "ConsoleState | None" = None
+    subkeys: SubKeyManager | None = None
 
     # ------------------------------------------------------------ 基础设施
 
@@ -123,12 +201,27 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             raise ValueError("请求体过大")
         return self.rfile.read(length)
 
-    def _authorized(self) -> bool:
-        if not self.token:
-            return True
+    def _authenticate(self) -> tuple[str, SubKey | None]:
+        """识别调用方凭据，返回 (角色, 命中的子 Key)。
+
+        角色：
+        * "admin" — 匹配管理 Token（--token）；
+        * "sub"   — 匹配某个已启用的对外子 Key（只能调 /v1/*，永远进不了控制台）；
+        * "open"  — 未配置管理 Token 且未启用任何子 Key（完全开放，仅监听本机）；
+        * None    — 凭据缺失或无效。
+        """
         header = self.headers.get("Authorization") or ""
         supplied = header[7:].strip() if header.lower().startswith("bearer ") else header.strip()
-        return hmac.compare_digest(supplied, self.token)
+        if self.token and supplied and hmac.compare_digest(supplied, self.token):
+            return "admin", None
+        subkeys = type(self).subkeys
+        if subkeys is not None and supplied:
+            sub = subkeys.authenticate(supplied)
+            if sub is not None:
+                return "sub", sub
+        if not self.token and (subkeys is None or not subkeys.any_enabled()):
+            return "open", None
+        return None, None
 
     def _send_json(self, status: int, payload: Mapping[str, Any], *, retry_after: float | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -175,6 +268,45 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             ):
                 forward_headers[key] = val
         return forward_headers
+
+    # ------------------------------------------------------------ 子 Key 用量统计
+
+    def _record_subkey_usage(
+        self,
+        *,
+        ok: bool,
+        model: str | None = None,
+        stream: bool = False,
+        usage: tuple[int, int, int] | None = None,
+        messages: Any = None,
+        text_len: int = 0,
+        latency_ms: float | None = None,
+    ) -> None:
+        """把一次调用计入当前请求所用的子 Key（非子 Key 请求为空操作）。
+
+        优先用上游返回的 usage；缺失时用 messages / 输出文本长度做粗略估算兜底，
+        保证监控面板上每个子 Key 都有输入、输出两列数据。
+        """
+        sub = self._auth_subkey
+        subkeys = type(self).subkeys
+        if sub is None or subkeys is None:
+            return
+        if usage is None:
+            estimated = (_estimate_messages_tokens(messages), max(0, text_len // 4))
+        else:
+            estimated = (0, 0)
+        try:
+            subkeys.record(
+                sub,
+                ok=ok,
+                model=model,
+                stream=stream,
+                usage=usage,
+                estimated=estimated,
+                latency_ms=latency_ms,
+            )
+        except Exception:  # pragma: no cover - 用量统计失败不能影响主流程
+            pass
 
     # ------------------------------------------------------------ 控制台
 
@@ -237,16 +369,22 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         if path == STATS_PATH:
             self._send_json(200, self.rotator.status())
             return
-        # 控制台：页面免鉴权（空壳，不含密钥），接口要鉴权
+        role, sub = self._authenticate()
+        # 控制台：页面免鉴权（空壳，不含密钥），接口要鉴权；子 Key 一律不能访问控制台
         if self.console is not None and self.console.is_console_path(path):
-            if path.startswith(ui.API_PREFIX) and not self._authorized():
+            if role == "sub":
+                self._send_json(401, error_payload("子 Key 不能访问控制台", "authentication_error"))
+                return
+            if path.startswith(ui.API_PREFIX) and role not in ("admin", "open"):
                 self._send_json(401, error_payload("invalid console token", "authentication_error"))
                 return
             self._dispatch_console("GET", path, query=parse_qs(parsed.query))
             return
-        if not self._authorized():
+        if role not in ("admin", "open", "sub"):
             self._send_json(401, error_payload("invalid proxy token", "authentication_error"))
             return
+        self._auth_role = role
+        self._auth_subkey = sub
         if self._paused:
             self._send_json(503, error_payload("gateway paused from console", "service_unavailable", "503"))
             return
@@ -262,16 +400,25 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
-        if not self._authorized():
+        role, sub = self._authenticate()
+        is_console = self.console is not None and path.startswith(ui.API_PREFIX)
+        if is_console:
+            # 控制台接口只认管理 Token（或未设 Token 时的开放模式），子 Key 一律拒绝
+            if role != "admin" and role != "open":
+                self._send_json(401, error_payload("invalid console token", "authentication_error"))
+                return
+        elif role not in ("admin", "open", "sub"):
             self._send_json(401, error_payload("invalid proxy token", "authentication_error"))
             return
+        self._auth_role = role
+        self._auth_subkey = sub
         try:
             raw = self._read_body()
         except ValueError as exc:
             self._send_json(413, error_payload(str(exc), "invalid_request_error"))
             return
 
-        if self.console is not None and path.startswith(ui.API_PREFIX):
+        if is_console:
             try:
                 body = json.loads(raw or b"{}")
             except json.JSONDecodeError as exc:
@@ -332,30 +479,41 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
     def _chat_complete(
         self, messages: Any, model: str | None, params: dict, headers: Mapping[str, str] | None = None
     ) -> None:
+        started = time.monotonic()
         try:
             result = self.rotator.chat(messages, model=model, headers=headers, **params)
         except ApiError as exc:
             self._send_json(exc.status, _passthrough_error(exc.status, exc.body))
+            self._record_subkey_usage(ok=False, model=model, latency_ms=_elapsed_ms(started))
             return
         except RotationExhausted as exc:
             status = exc.last_status if (exc.last_status or 0) >= 400 else 502
             self._send_json(status, error_payload(str(exc), "upstream_exhausted", str(status)))
+            self._record_subkey_usage(ok=False, model=model, latency_ms=_elapsed_ms(started))
             return
         except NoAvailableKey as exc:
             self._send_json(429, error_payload(str(exc), "rate_limit_exceeded", "429"),
                             retry_after=exc.retry_after)
+            self._record_subkey_usage(ok=False, model=model, latency_ms=_elapsed_ms(started))
             return
         except AllKeysInvalid as exc:
             self._send_json(503, error_payload(str(exc), "all_keys_invalid", "503"))
+            self._record_subkey_usage(ok=False, model=model, latency_ms=_elapsed_ms(started))
             return
         except RotatorError as exc:
             self._send_json(502, error_payload(str(exc), "upstream_error", "502"))
+            self._record_subkey_usage(ok=False, model=model, latency_ms=_elapsed_ms(started))
             return
+        self._record_subkey_usage(
+            ok=True, model=model, usage=_extract_usage(result), messages=messages,
+            latency_ms=_elapsed_ms(started),
+        )
         self._send_json(200, result)
 
     def _chat_stream(
         self, messages: Any, model: str | None, params: dict, headers: Mapping[str, str] | None = None
     ) -> None:
+        started = time.monotonic()
         stream = self.rotator.chat_stream_raw(messages, model=model, headers=headers, **params)
         first_chunk = None
         has_first = False
@@ -369,50 +527,79 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
                 self._end_stream()
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
+            self._record_subkey_usage(ok=True, model=model, stream=True,
+                                      messages=messages, latency_ms=_elapsed_ms(started))
             return
         except ApiError as exc:
             self._send_json(exc.status, _passthrough_error(exc.status, exc.body))
+            self._record_subkey_usage(ok=False, model=model, stream=True,
+                                      messages=messages, latency_ms=_elapsed_ms(started))
             return
         except RotationExhausted as exc:
             status = exc.last_status if (exc.last_status or 0) >= 400 else 502
             self._send_json(status, error_payload(str(exc), "upstream_exhausted", str(status)))
+            self._record_subkey_usage(ok=False, model=model, stream=True,
+                                      messages=messages, latency_ms=_elapsed_ms(started))
             return
         except NoAvailableKey as exc:
             self._send_json(429, error_payload(str(exc), "rate_limit_exceeded", "429"), retry_after=exc.retry_after)
+            self._record_subkey_usage(ok=False, model=model, stream=True,
+                                      messages=messages, latency_ms=_elapsed_ms(started))
             return
         except AllKeysInvalid as exc:
             self._send_json(503, error_payload(str(exc), "all_keys_invalid", "503"))
+            self._record_subkey_usage(ok=False, model=model, stream=True,
+                                      messages=messages, latency_ms=_elapsed_ms(started))
             return
         except RotatorError as exc:
             self._send_json(502, error_payload(str(exc), "upstream_error", "502"))
+            self._record_subkey_usage(ok=False, model=model, stream=True,
+                                      messages=messages, latency_ms=_elapsed_ms(started))
             return
 
         self._begin_stream()
+        ok = True
+        usage: tuple[int, int, int] | None = None
+        text_len = 0
         try:
             if has_first:
                 self._write_chunk(self._sse(first_chunk))
+                if usage is None:
+                    usage = _extract_usage(first_chunk)
+                text_len += len(_chunk_text(first_chunk))
             for chunk in stream:
                 self._write_chunk(self._sse(chunk))
+                if usage is None:
+                    usage = _extract_usage(chunk)
+                text_len += len(_chunk_text(chunk))
         except RotatorError as exc:
             # 已经发出 200 了，改不了状态码，只能补一条 error 事件收尾
+            ok = False
             try:
                 self._write_chunk(self._sse(error_payload(str(exc), "upstream_error", "502")))
             except (BrokenPipeError, ConnectionResetError, OSError):
-                return
+                pass
         except (BrokenPipeError, ConnectionResetError, OSError):
-            return  # 客户端主动断开，正常情况
+            ok = False  # 客户端主动断开：计为未完成
         finally:
             try:
                 self._write_chunk(b"data: [DONE]\n\n")
                 self._end_stream()
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
+            self._record_subkey_usage(
+                ok=ok, model=model, stream=True, usage=usage, messages=messages,
+                text_len=text_len, latency_ms=_elapsed_ms(started),
+            )
 
     def _forward_simple(self, method: str, upstream_path: str, raw: bytes = b"") -> None:
         """其余端点（embeddings / images / models…）原样透传，同样享受轮换。"""
         if self._paused:
             self._send_json(503, error_payload("gateway paused from console", "service_unavailable", "503"))
             return
+        started = time.monotonic()
+        # 用量统计只对写请求（POST 透传）记账；GET /v1/models 之类的查询不消耗上游额度。
+        record_usage = method == "POST"
         body = None
         if raw:
             try:
@@ -425,24 +612,36 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             result = self.rotator.request(upstream_path, method=method, json_body=body, headers=headers)
         except ApiError as exc:
             self._send_json(exc.status, _passthrough_error(exc.status, exc.body))
+            if record_usage:
+                self._record_subkey_usage(ok=False, latency_ms=_elapsed_ms(started))
             return
         except RotationExhausted as exc:
             status = exc.last_status if (exc.last_status or 0) >= 400 else 502
             self._send_json(status, error_payload(str(exc), "upstream_exhausted", str(status)))
+            if record_usage:
+                self._record_subkey_usage(ok=False, latency_ms=_elapsed_ms(started))
             return
         except NoAvailableKey as exc:
             self._send_json(429, error_payload(str(exc), "rate_limit_exceeded", "429"), retry_after=exc.retry_after)
+            if record_usage:
+                self._record_subkey_usage(ok=False, latency_ms=_elapsed_ms(started))
             return
         except AllKeysInvalid as exc:
             self._send_json(503, error_payload(str(exc), "all_keys_invalid", "503"))
+            if record_usage:
+                self._record_subkey_usage(ok=False, latency_ms=_elapsed_ms(started))
             return
         except RotatorError as exc:
             self._send_json(502, error_payload(str(exc), "upstream_error", "502"))
+            if record_usage:
+                self._record_subkey_usage(ok=False, latency_ms=_elapsed_ms(started))
             return
         # 模型清单按配置过滤：上层应用看到的清单与控制台保持一致，
         # 避免 agent 自动挑中那些"几乎不可用"的模型（见 model_filter 配置）。
         if method == "GET" and upstream_path.split("?", 1)[0].rstrip("/") == "models":
             result = self.rotator.filter_models_payload(result)
+        if record_usage:
+            self._record_subkey_usage(ok=True, usage=_extract_usage(result), latency_ms=_elapsed_ms(started))
         self._send_json(200, result)
 
 
@@ -455,8 +654,14 @@ def create_server(
     verbose: bool = False,
     log_sink: Callable[[str], None] | None = None,
     console: "ConsoleState | None" = None,
+    subkeys: SubKeyManager | None = None,
 ) -> ThreadingHTTPServer:
-    """创建网关服务实例（不启动）。"""
+    """创建网关服务实例（不启动）。
+
+    Args:
+        subkeys: 传入子 Key 管理器后启用对外子 Key 鉴权与用量统计
+            （子 Key 只能调 /v1/*，永远不能访问控制台）。
+    """
     handler = type(
         "BoundRotatorProxyHandler",
         (RotatorProxyHandler,),
@@ -468,6 +673,7 @@ def create_server(
             # 绑定成方法，调用时多传一个 self。
             "log_sink": staticmethod(log_sink),
             "console": console,
+            "subkeys": subkeys,
         },
     )
     server = ThreadingHTTPServer((host, port), handler)
@@ -487,16 +693,18 @@ def serve(
     ready: Callable[[str], None] | None = None,
     console: "ConsoleState | None" = None,
     on_ready: Callable[[ThreadingHTTPServer], None] | None = None,
+    subkeys: SubKeyManager | None = None,
 ) -> None:
     """阻塞式启动网关，Ctrl+C 退出。
 
     Args:
         console: 传入控制台状态则同时提供 Web 控制台。
         on_ready: 服务已绑定端口、进入循环前回调（用于自动开窗，避免开在服务就绪之前）。
+        subkeys: 传入子 Key 管理器后启用对外子 Key 鉴权与用量统计。
     """
     server = create_server(
         rotator, host=host, port=port, token=token, verbose=verbose,
-        log_sink=log_sink, console=console,
+        log_sink=log_sink, console=console, subkeys=subkeys,
     )
     actual_host, actual_port = server.server_address[:2]
     base = f"http://{actual_host}:{actual_port}/v1"
@@ -509,6 +717,8 @@ def serve(
         # 端口可能是 0（自动分配），回填真实端口，否则控制台里显示的地址是错的
         console.host, console.port = actual_host, actual_port
         lines.append(f"  - 控制台   : http://{actual_host}:{actual_port}/")
+    if subkeys is not None:
+        lines.append(f"  - 子 Key    : 已启用（只能调用 API，不能访问控制台）")
     lines.append(
         f"  - 本地鉴权 : {'已开启' if token else '未开启（仅监听本机，建议加 --token）'}"
     )
@@ -535,3 +745,5 @@ def serve(
             log_sink("网关已停止")
         server.shutdown()
         server.server_close()
+        if subkeys is not None:
+            subkeys.close()

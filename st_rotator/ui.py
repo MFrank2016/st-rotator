@@ -6,6 +6,7 @@
 
 * 运行状态总览（Key 池、限速、吞吐、运行时长）
 * Key 的增 / 删 / 单把体检 —— 不用再手改配置文件
+* 对外子 Key 的签发 / 管理 / 用量监控（每个子 Key 独立统计输入输出 token、缓存命中）
 * 模型选择（清单从上游 ``/models`` 实时拉，带缓存）
 * 网关接入信息 + 各语言可直接复制的接入片段
 * 实时日志（内存环形缓冲，游标增量拉取，不重复传输）
@@ -28,6 +29,8 @@
   所以可以免鉴权加载，Token 由用户在前端输入后存 localStorage。
 * 页面展示的 Key 永远是脱敏值；对 Key 的操作走 ``key_id``（sha256 前 12 位），
   前端拿不到也不需要明文。
+* 对外子 Key（见 ``subkeys.py``）只能调用 ``/v1/*`` 接口，控制台接口与页面一律对其
+  拒绝（401）；子 Key 的完整密钥只在创建时返回一次，页面列表只展示脱敏值。
 """
 
 from __future__ import annotations
@@ -49,6 +52,7 @@ from .config import STRATEGIES, Config, ConfigStore, FlashLiteExchangeConfig, Ra
 from .dashboard import DASHBOARD_HTML
 from .errors import ConfigError, RotatorError
 from .logs import LogBuffer
+from .subkeys import SubKeyManager
 from .version import __version__
 
 # 控制台页面路径（免鉴权，内容只是空壳）
@@ -169,6 +173,7 @@ class ConsoleState:
         token: 本地鉴权 Token；为空表示不鉴权。
         buffer: 日志环形缓冲。
         log_file: 日志文件路径（仅用于展示）。
+        subkeys: 对外子 Key 管理器；为 None 表示未启用子 Key 功能。
     """
 
     store: ConfigStore
@@ -180,6 +185,7 @@ class ConsoleState:
     log_file: str | None = None
     metrics: GatewayMetrics = field(default_factory=GatewayMetrics)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    subkeys: SubKeyManager | None = None
 
     # ------------------------------------------------------------ 只读
 
@@ -218,6 +224,7 @@ class ConsoleState:
             "models": self.rotator.available_models(),
             "default_model": self.config.default_model,
             "log_file": self.log_file,
+            "subkeys": self._subkeys_snapshot(),
             "options": {
                 "strategy": self.config.strategy,
                 "rate_mode": self.config.rate_control.mode,
@@ -247,6 +254,96 @@ class ConsoleState:
     def logs_since(self, cursor: int) -> dict[str, Any]:
         new_cursor, items = self.buffer.since(cursor)
         return {"cursor": new_cursor, "items": items}
+
+    def _subkeys_snapshot(self) -> dict[str, Any] | None:
+        """子 Key 区块的状态；未启用时为 None（前端显示不可用提示）。"""
+        if self.subkeys is None:
+            return None
+        return {
+            "configured": True,
+            "admin_token_set": bool(self.token),
+            "keys": self.subkeys.snapshot(),
+            "history": self.subkeys.history_snapshot(limit=100),
+        }
+
+    # ------------------------------------------------------------ 子 Key 管理
+
+    def _require_subkeys(self) -> SubKeyManager | None:
+        if self.subkeys is None:
+            raise ConfigError("未启用子 Key（缺少 subkeys 管理器）")
+        return self.subkeys
+
+    def create_subkey(self, name: str, note: str = "") -> UiResponse:
+        """创建一个对外子 Key；完整密钥只在创建响应里返回一次。"""
+        try:
+            manager = self._require_subkeys()
+            sub = manager.create(name, note=note)
+        except ConfigError:
+            return UiResponse.error("未启用子 Key", status=404)
+        except ValueError as exc:  # 名称空 / 太长 / 重名
+            return UiResponse.error(str(exc))
+        self._log(f"[子Key] 创建 {sub.name}（{sub.masked}）")
+        return UiResponse.json(
+            {
+                "ok": True,
+                "id": sub.id,
+                "name": sub.name,
+                "key": sub.key,
+                "message": f"已创建子 Key：{sub.name}。完整密钥只显示这一次，请立即复制保存。",
+            }
+        )
+
+    def update_subkey(self, identifier: str, *, name: str | None = None, note: str | None = None) -> UiResponse:
+        try:
+            manager = self._require_subkeys()
+            sub = manager.update(identifier, name=name, note=note)
+        except ConfigError:
+            return UiResponse.error("未启用子 Key", status=404)
+        except ValueError as exc:
+            return UiResponse.error(str(exc))
+        except KeyError as exc:
+            return UiResponse.error(str(exc), status=404)
+        self._log(f"[子Key] 更新 {sub.name} 信息")
+        return UiResponse.json({"ok": True, "message": f"已更新子 Key：{sub.name}"})
+
+    def toggle_subkey(self, identifier: str, enabled: bool) -> UiResponse:
+        try:
+            manager = self._require_subkeys()
+            sub = manager.set_enabled(identifier, enabled)
+        except ConfigError:
+            return UiResponse.error("未启用子 Key", status=404)
+        except KeyError as exc:
+            return UiResponse.error(str(exc), status=404)
+        state = "启用" if sub.enabled else "停用"
+        self._log(f"[子Key] {state} {sub.name}（{sub.masked}）")
+        return UiResponse.json({"ok": True, "enabled": sub.enabled, "message": f"已{state}子 Key：{sub.name}"})
+
+    def revoke_subkey(self, identifier: str) -> UiResponse:
+        try:
+            manager = self._require_subkeys()
+            sub = manager.revoke(identifier)
+        except ConfigError:
+            return UiResponse.error("未启用子 Key", status=404)
+        except KeyError as exc:
+            return UiResponse.error(str(exc), status=404)
+        self._log(f"[子Key] 删除 {sub.name}（{sub.masked}）")
+        return UiResponse.json({"ok": True, "message": f"已删除子 Key：{sub.name}，该 Key 立即失效"})
+
+    def reset_subkey_usage(self, identifier: str) -> UiResponse:
+        try:
+            manager = self._require_subkeys()
+            sub = manager.reset_usage(identifier)
+        except ConfigError:
+            return UiResponse.error("未启用子 Key", status=404)
+        except KeyError as exc:
+            return UiResponse.error(str(exc), status=404)
+        self._log(f"[子Key] 清零用量：{sub.name}")
+        return UiResponse.json({"ok": True, "message": f"已清零子 Key {sub.name} 的用量统计"})
+
+    def subkey_history(self, limit: int = 200) -> UiResponse:
+        if self.subkeys is None:
+            return UiResponse.error("未启用子 Key", status=404)
+        return UiResponse.json({"ok": True, "history": self.subkeys.history_snapshot(limit=limit)})
 
     # ------------------------------------------------------------ 写操作
 
@@ -555,6 +652,8 @@ class ConsoleState:
                 if path == "/api/logs":
                     cursor = _first_int(query, "cursor", 0)
                     return UiResponse.json(self.logs_since(cursor))
+                if path == "/api/subkeys/history":
+                    return self.subkey_history(_clamp_int(_first_int(query, "limit", 200), 200, 1, 1000))
                 return UiResponse.error(f"未知接口 {path}", status=404)
 
             if method == "POST":
@@ -585,6 +684,24 @@ class ConsoleState:
                     return self.set_options(payload)
                 if path == "/api/pause":
                     return self.set_paused(bool(payload.get("paused")))
+                if path == "/api/subkeys/create":
+                    return self.create_subkey(
+                        str(payload.get("name") or ""), note=str(payload.get("note") or "")
+                    )
+                if path == "/api/subkeys/update":
+                    return self.update_subkey(
+                        str(payload.get("id") or ""),
+                        name=payload.get("name"),
+                        note=payload.get("note"),
+                    )
+                if path == "/api/subkeys/toggle":
+                    return self.toggle_subkey(
+                        str(payload.get("id") or ""), bool(payload.get("enabled"))
+                    )
+                if path == "/api/subkeys/revoke":
+                    return self.revoke_subkey(str(payload.get("id") or ""))
+                if path == "/api/subkeys/reset":
+                    return self.reset_subkey_usage(str(payload.get("id") or ""))
                 return UiResponse.error(f"未知接口 {path}", status=404)
 
             return UiResponse.error(f"不支持的方法 {method}", status=405)

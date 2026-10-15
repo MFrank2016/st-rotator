@@ -199,6 +199,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10.5px;
     background: var(--accent-soft); color: var(--accent); margin-right: 3px;
   }
+  .notice {
+    margin-bottom: 10px; background: var(--amber-bg); border: 1px solid var(--amber);
+    color: var(--amber); border-radius: 10px; padding: 10px 15px; font-size: 12.5px; line-height: 1.7;
+  }
   svg.spark { display: block; width: 100%; height: 34px; margin-top: 6px; }
 </style>
 </head>
@@ -273,6 +277,34 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="muted" style="font-size:11.5px;margin-top:9px">
         添加前会先逐把校验凭据（失败的直接拒收，不污染池子）；成功后立即写入配置文件并参与轮换。
       </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <h2>对外子 Key <span class="spacer"></span><span class="muted" id="sk-note" style="text-transform:none;letter-spacing:0"></span></h2>
+    <div id="sk-state"></div>
+    <div id="sk-create" style="display:none">
+      <div class="row" style="margin-bottom:10px">
+        <label class="field grow" style="margin-bottom:0">
+          <span>名称（必填，1-64 字符）</span>
+          <input id="sk-name" class="mono" placeholder="例如：WorkBuddy-前端" autocomplete="off">
+        </label>
+        <label class="field grow" style="margin-bottom:0">
+          <span>备注（可选）</span>
+          <input id="sk-note-input" placeholder="给谁用、什么时候发的">
+        </label>
+        <button class="primary" id="btn-sk-create" style="height:33px">签发子 Key</button>
+      </div>
+    </div>
+    <div class="muted" style="font-size:11.5px;margin-bottom:10px;line-height:1.7">
+      子 Key 是网关签发的对外凭据：<b>只能调用 API（/v1/*）与健康检查，永远无法访问本管理页面</b>，
+      也无法查看或改动 Key 池与配置。每次调用按子 Key 独立累计输入 / 输出 token、缓存命中与成功失败，
+      可直接作为计费或审计依据。已停用的子 Key 立即失效。完整密钥只在签发时显示一次。
+    </div>
+    <div id="sk-table-sec"></div>
+    <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
+      <h2 style="margin-bottom:10px">子 Key 用量明细（最近 100 条）</h2>
+      <div id="sk-history"></div>
     </div>
   </div>
 
@@ -875,6 +907,181 @@ function copyText(text, label) {
   area.remove();
 }
 
+/* ------------------------------------------------------------------ 子 Key */
+
+var skRevealed = {};
+
+function fmtTime(value) {
+  if (!value) return "—";
+  var d = new Date(Number(value) * 1000);
+  if (isNaN(d.getTime())) return "—";
+  function p(n) { return (n < 10 ? "0" : "") + n; }
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+    " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+
+function renderSubkeys(state) {
+  var sk = state.subkeys;
+  var note = $("sk-note");
+  var createBox = $("sk-create");
+  var stateBox = $("sk-state");
+  var tableBox = $("sk-table-sec");
+  var historyBox = $("sk-history");
+  if (!sk) {
+    note.textContent = "";
+    createBox.style.display = "none";
+    stateBox.innerHTML = "";
+    tableBox.innerHTML = '<div class="empty">子 Key 未启用（当前进程未挂载 subkeys 管理器，可能是旧版本或直接调用代理）。</div>';
+    historyBox.innerHTML = "";
+    return;
+  }
+  createBox.style.display = "block";
+  var warns = [];
+  if (!sk.admin_token_set) {
+    warns.push("未设置管理 Token（--token）：本管理页面与 /api/* 接口当前无需凭据即可访问。" +
+      "启用子 Key 后请务必设置管理 Token，否则任何知道地址的人都能绕过子 Key 直接调 API 或改配置。");
+  }
+  stateBox.innerHTML = warns.map(function (w) {
+    return '<div class="notice">' + esc(w) + "</div>";
+  }).join("");
+  var keys = sk.keys || [];
+  note.textContent = keys.length + " 个 · " + keys.filter(function (k) { return k.enabled; }).length + " 启用";
+  if (!keys.length) {
+    tableBox.innerHTML = '<div class="empty">还没有子 Key。填好名称点「签发子 Key」即可生成一把对外凭据。</div>';
+  } else {
+    var head = "<tr><th>名称</th><th>Key</th><th>状态</th><th>创建时间</th>" +
+      "<th class='num'>请求</th><th class='num'>成功</th><th class='num'>失败</th>" +
+      "<th class='num'>输入</th><th class='num'>输出</th><th class='num'>缓存命中</th>" +
+      "<th>最近使用</th><th></th></tr>";
+    var body = keys.map(function (k) {
+      var u = k.usage || {};
+      var last = u.last_used_at ? fmtTime(u.last_used_at) : "—";
+      var shown = skRevealed[k.id] ? k.key : k.masked;
+      var keyCell = '<span class="mono">' + esc(shown) + "</span> " +
+        '<button class="tiny" data-sk="reveal" data-id="' + esc(k.id) + '">' + (skRevealed[k.id] ? "隐藏" : "显示") + "</button> " +
+        '<button class="tiny" data-sk="copy" data-id="' + esc(k.id) + '">复制</button>';
+      return "<tr>" +
+        '<td><b>' + esc(k.name) + "</b>" + (k.note ? '<div class="muted" style="font-size:11px">' + esc(k.note) + "</div>" : "") + "</td>" +
+        "<td>" + keyCell + "</td>" +
+        '<td style="white-space:nowrap"><span class="pill ' + (k.enabled ? "healthy" : "neutral") + '">' + (k.enabled ? "启用" : "停用") + "</span> " +
+          '<button class="tiny" data-sk="toggle" data-id="' + esc(k.id) + '" data-enabled="' + (k.enabled ? 1 : 0) + '">' + (k.enabled ? "停用" : "启用") + "</button></td>" +
+        "<td>" + esc(k.created_at || "—") + "</td>" +
+        '<td class="num">' + fmtInt(u.requests) + "</td>" +
+        '<td class="num">' + fmtInt(u.successes) + "</td>" +
+        '<td class="num">' + fmtInt(u.errors) + "</td>" +
+        '<td class="num">' + fmtCtx(u.prompt_tokens) + "</td>" +
+        '<td class="num">' + fmtCtx(u.completion_tokens) + "</td>" +
+        '<td class="num">' + fmtInt(u.cached_tokens) + "</td>" +
+        "<td>" + esc(last) + "</td>" +
+        '<td style="text-align:right;white-space:nowrap">' +
+          '<button class="tiny" data-sk="rename" data-id="' + esc(k.id) + '" data-name="' + esc(k.name) + '">改名</button> ' +
+          '<button class="tiny" data-sk="reset" data-id="' + esc(k.id) + '" data-name="' + esc(k.name) + '">清零</button> ' +
+          '<button class="tiny danger" data-sk="revoke" data-id="' + esc(k.id) + '" data-name="' + esc(k.name) + '">删除</button>' +
+        "</td></tr>";
+    }).join("");
+    tableBox.innerHTML = "<table>" + head + body + "</table>";
+    Array.prototype.forEach.call(tableBox.querySelectorAll("button[data-sk]"), function (button) {
+      button.onclick = function () { onSubkeyAction(button.dataset.sk, button); };
+    });
+  }
+  var history = sk.history || [];
+  if (!history.length) {
+    historyBox.innerHTML = '<div class="empty">暂无调用记录（子 Key 尚未被使用）。</div>';
+  } else {
+    var hhead = "<tr><th>时间</th><th>子 Key</th><th>模型</th><th>模式</th><th>结果</th>" +
+      "<th class='num'>输入</th><th class='num'>输出</th><th class='num'>缓存</th><th class='num'>延迟</th></tr>";
+    var hbody = history.map(function (h) {
+      var mode = h.stream ? "流式" : "普通";
+      var okBadge = h.ok
+        ? '<span class="pill healthy">成功</span>'
+        : '<span class="pill invalid">失败</span>';
+      var estimate = h.estimated ? ' <span class="muted" style="font-size:10.5px">估</span>' : "";
+      return "<tr>" +
+        "<td>" + esc(fmtTime(h.t)) + "</td>" +
+        "<td>" + esc(h.name || "—") + "</td>" +
+        "<td>" + esc(h.model || "—") + "</td>" +
+        "<td>" + mode + "</td>" +
+        "<td>" + okBadge + "</td>" +
+        '<td class="num">' + fmtCtx(h.prompt) + estimate + "</td>" +
+        '<td class="num">' + fmtCtx(h.completion) + "</td>" +
+        '<td class="num">' + (h.cached ? fmtCtx(h.cached) : "—") + "</td>" +
+        '<td class="num">' + (h.latency_ms != null ? Math.round(h.latency_ms) + "ms" : "—") + "</td></tr>";
+    }).join("");
+    historyBox.innerHTML = "<table>" + hhead + hbody + "</table>";
+  }
+}
+
+async function postSubkey(path, body, button) {
+  button.disabled = true;
+  var original = button.innerHTML || button.textContent;
+  button.innerHTML = '<span class="spin">◌</span>';
+  try {
+    var result = await api(path, { method: "POST", body: JSON.stringify(body) });
+    toast(result.message || "操作完成", result.ok === false ? "err" : "ok");
+    await refreshState();
+  } catch (err) { toast(err.message, "err"); }
+  finally { button.disabled = false; button.innerHTML = original; }
+}
+
+async function onSubkeyCreate() {
+  var name = $("sk-name").value.trim();
+  if (!name) { toast("请先填子 Key 名称", "err"); return; }
+  var button = $("btn-sk-create");
+  button.disabled = true;
+  var original = button.textContent;
+  button.innerHTML = '<span class="spin">◌</span> 签发中…';
+  try {
+    var result = await api("/api/subkeys/create", {
+      method: "POST",
+      body: JSON.stringify({ name: name, note: $("sk-note-input").value.trim() })
+    });
+    toast(result.message || "已创建", "ok");
+    $("sk-name").value = "";
+    $("sk-note-input").value = "";
+    if (result.key) copyText(result.key, "子 Key（完整密钥只显示这一次）");
+    await refreshState();
+  } catch (err) { toast(err.message, "err"); }
+  finally { button.disabled = false; button.textContent = original; }
+}
+
+async function onSubkeyAction(action, button) {
+  var id = button.dataset.id, name = button.dataset.name || "";
+  if (action === "toggle") {
+    var enable = !(button.dataset.enabled === "1");
+    await postSubkey("/api/subkeys/toggle", { id: id, enabled: enable }, button);
+    return;
+  }
+  if (action === "rename") {
+    var next = prompt("新的名称（1-64 字符）：", name);
+    if (next === null) return;
+    next = next.trim();
+    if (!next) { toast("名称不能为空", "err"); return; }
+    await postSubkey("/api/subkeys/update", { id: id, name: next }, button);
+    return;
+  }
+  if (action === "reset") {
+    if (!confirm("确定清零子 Key「" + name + "」的用量统计吗？")) return;
+    await postSubkey("/api/subkeys/reset", { id: id }, button);
+    return;
+  }
+  if (action === "revoke") {
+    if (!confirm("确定删除子 Key「" + name + "」吗？该 Key 立即失效，历史用量明细仍然保留。")) return;
+    await postSubkey("/api/subkeys/revoke", { id: id }, button);
+    return;
+  }
+  if (action === "reveal") {
+    skRevealed[id] = !skRevealed[id];
+    refreshState();
+    return;
+  }
+  if (action === "copy") {
+    var sk = lastState.subkeys || {};
+    var found = (sk.keys || []).filter(function (k) { return k.id === id; })[0];
+    copyText(found ? found.key : "", "子 Key");
+    return;
+  }
+}
+
 /* ------------------------------------------------------------------ 主循环 */
 
 var lastState = {};
@@ -889,6 +1096,7 @@ async function refreshState() {
     renderModels(state);
     renderPool(state);
     renderOptions(state);
+    renderSubkeys(state);
     var g = state.gateway || {};
     $("subline").innerHTML = '<span class="dot ' + (state.metrics.paused ? "paused" : "on") + '"></span>' +
       (state.metrics.paused ? "已暂停接入（上层会收到 503）" : "运行中") +
@@ -905,6 +1113,8 @@ function bind() {
   $("btn-refresh").onclick = function () { refreshState(); toast("已刷新"); };
   $("btn-pause").onclick = onTogglePause;
   $("btn-add").onclick = onAddKeys;
+  $("btn-sk-create").onclick = onSubkeyCreate;
+  $("sk-name").addEventListener("keydown", function (event) { if (event.key === "Enter") onSubkeyCreate(); });
   $("btn-apply-model").onclick = onApplyModel;
   $("btn-apply-options").onclick = onApplyOptions;
   $("btn-models").onclick = async function () {
