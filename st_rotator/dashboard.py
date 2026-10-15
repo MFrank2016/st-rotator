@@ -308,8 +308,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div id="sk-table-sec"></div>
     <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
       <h2 style="margin-bottom:10px">子 Key 用量明细 <span class="muted" style="font-size:12px">（分页显示，每页 10 条，最新在前）</span></h2>
-      <div id="sk-hist-bar"></div>
       <div id="sk-history"></div>
+      <div id="sk-hist-bar"></div>
     </div>
   </div>
 
@@ -349,6 +349,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <input id="opt-attempts" type="number" min="1" max="50">
         </label>
         <button class="primary" id="btn-apply-options" style="height:33px">应用</button>
+      </div>
+      <div class="row" style="margin-bottom:12px">
+        <label class="field grow" style="margin-bottom:0">
+          <span>屏蔽模型（不出现在模型清单与选择器里，支持 * 通配，逗号分隔）</span>
+          <input id="opt-hidden" type="text" placeholder="如 deepseek-v4.1-flash, deepseek-v4.1-*">
+        </label>
       </div>
       <div class="row" style="margin-bottom:12px;align-items:flex-end;flex-wrap:wrap">
         <label class="field" style="width:auto;margin-bottom:0;flex-direction:row;align-items:center;gap:6px">
@@ -748,6 +754,8 @@ function renderOptions(state) {
   if (document.activeElement !== wait) wait.value = opt.max_total_wait;
   var attempts = $("opt-attempts");
   if (document.activeElement !== attempts) attempts.value = opt.max_attempts;
+  var hidden = $("opt-hidden");
+  if (document.activeElement !== hidden) hidden.value = (opt.hidden_models || []).join(", ");
   var fx = opt.flash_lite || {};
   var fe = $("opt-fx-enabled");
   if (document.activeElement !== fe) fe.checked = !!fx.enabled;
@@ -866,12 +874,15 @@ async function onApplyModel() {
 }
 
 async function onApplyOptions() {
+  var hiddenModels = $("opt-hidden").value.split(/[\s,;]+/).map(function (s) { return s.trim(); })
+    .filter(function (s) { return s.length > 0; });
   var body = {
     strategy: $("opt-strategy").value,
     rate_mode: $("opt-rate-mode").value,
     qps: parseFloat($("opt-qps").value),
     max_total_wait: parseFloat($("opt-wait").value),
     max_attempts: parseInt($("opt-attempts").value, 10),
+    hidden_models: hiddenModels,
     flash_lite: {
       enabled: $("opt-fx-enabled").checked,
       image_enabled: $("opt-fx-image").checked,
@@ -964,11 +975,12 @@ function renderSubkeys(state) {
   } else {
     var head = "<tr><th>名称</th><th>Key</th><th>状态</th><th>创建时间</th>" +
       "<th class='num'>请求</th><th class='num'>成功</th><th class='num'>失败</th>" +
-      "<th class='num'>输入</th><th class='num'>输出</th><th class='num'>缓存命中</th>" +
+      "<th class='num'>输入</th><th class='num'>输出</th><th class='num'>缓存命中率</th>" +
       "<th>最近使用</th><th></th></tr>";
     var body = keys.map(function (k) {
       var u = k.usage || {};
       var last = u.last_used_at ? fmtTime(u.last_used_at) : "—";
+      var rate = u.prompt_tokens > 0 ? Math.round((u.cached_tokens || 0) / u.prompt_tokens * 100) + "%" : "—";
       var shown = skRevealed[k.id] ? k.key : k.masked;
       var keyCell = '<span class="mono">' + esc(shown) + "</span> " +
         '<button class="tiny" data-sk="reveal" data-id="' + esc(k.id) + '">' + (skRevealed[k.id] ? "隐藏" : "显示") + "</button> " +
@@ -984,7 +996,7 @@ function renderSubkeys(state) {
         '<td class="num">' + fmtInt(u.errors) + "</td>" +
         '<td class="num">' + fmtCtx(u.prompt_tokens) + "</td>" +
         '<td class="num">' + fmtCtx(u.completion_tokens) + "</td>" +
-        '<td class="num">' + fmtInt(u.cached_tokens) + "</td>" +
+        '<td class="num"' + (rate !== "—" ? ' title="缓存 ' + fmtInt(u.cached_tokens || 0) + " / 输入 " + fmtInt(u.prompt_tokens || 0) + '"' : "") + ">" + rate + "</td>" +
         "<td>" + esc(last) + "</td>" +
         '<td style="text-align:right;white-space:nowrap">' +
           '<button class="tiny" data-sk="rename" data-id="' + esc(k.id) + '" data-name="' + esc(k.name) + '">改名</button> ' +
@@ -1035,7 +1047,7 @@ function renderSubkeyHistory(data, bar, box) {
   var history = data.history || [];
   var pages = Math.max(1, Math.ceil(data.total / data.page_size));
   bar.innerHTML =
-    '<div class="row" style="margin-bottom:8px;align-items:center">' +
+    '<div class="row" style="margin-top:8px;align-items:center">' +
       '<button class="tiny" id="sk-page-prev"' + (data.page <= 1 ? " disabled" : "") + ">上一页</button>" +
       '<span class="muted" style="margin:0 10px">第 ' + data.page + " / " + pages + " 页 · 共 " + fmtInt(data.total) + " 条</span>" +
       '<button class="tiny" id="sk-page-next"' + (data.page >= pages ? " disabled" : "") + ">下一页</button>" +

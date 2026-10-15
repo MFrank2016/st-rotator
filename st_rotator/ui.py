@@ -233,6 +233,9 @@ class ConsoleState:
                 "max_qps": self.config.rate_control.max_qps,
                 "max_total_wait": self.config.max_total_wait,
                 "max_attempts": self.config.max_attempts,
+                "hidden_models": list(getattr(self.config, "model_filter", None).hidden)
+                if getattr(self.config, "model_filter", None) is not None
+                else [],
                 "strategies": list(STRATEGIES),
                 "rate_modes": list(RateControlConfig.MODES),
                 "flash_lite": {
@@ -547,6 +550,26 @@ class ConsoleState:
                 setattr(self.config, field_name, converted)
                 self.store.set_scalar(field_name, converted)
             changes.append(f"{label}={converted}")
+
+        hidden_models = payload.get("hidden_models")
+        if hidden_models is not None:
+            if not isinstance(hidden_models, (list, tuple)):
+                return UiResponse.error("屏蔽模型必须是模型名数组，例如 [\"deepseek-v4.1-flash\"]")
+            cleaned: list[str] = []
+            for item in hidden_models:
+                if not isinstance(item, str):
+                    return UiResponse.error(f"屏蔽模型只接受字符串，收到 {item!r}")
+                name = item.strip()
+                if name and name not in cleaned:
+                    cleaned.append(name)
+            flt = getattr(self.config, "model_filter", None)
+            current = list(flt.hidden) if flt is not None else []
+            if cleaned != current:
+                with self.lock:
+                    self.rotator.set_model_filter(cleaned)
+                    self.store.set_section("model_filter", {"hidden": cleaned})
+                    self.store.reload()
+                changes.append("屏蔽模型=" + ("无" if not cleaned else "、".join(cleaned)))
 
         fx_payload = payload.get("flash_lite")
         if fx_payload is not None:
