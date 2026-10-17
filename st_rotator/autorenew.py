@@ -30,7 +30,14 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .config import AccountConfig
 from .keypool import mask_key
-from .quota import USER_AGENT, QuotaAuthError, QuotaUnavailable, TokenBundle
+from .quota import (
+    USER_AGENT,
+    QuotaAuthError,
+    QuotaHTTPError,
+    QuotaUnavailable,
+    TokenBundle,
+    login_lock_seconds,
+)
 
 # ---------------------------------------------------------------- 常量
 KEYS_PATH = "/console/v1/metered/api-keys"
@@ -313,7 +320,8 @@ class AutoRenewWorker:
     * ``unavailable``    —— 缺 jwcrypto 等依赖，无法登录。
 
     ``password_error`` 只能由「登录成功」（含配置密码改变后重新登录成功）清除；
-    Key 探测不会清除它。
+    Key 探测不会清除它。登录被平台风控锁定时按锁定剩余时间退避，期间不重试，
+    状态记为 ``check_error``。
 
     平台操作顺序固定为「先 delete-all 后 create」：先把该账号平台侧的全部 key 注销，
     再新建唯一一把 key。若反过来（先 create 后 delete-all），list 会把刚建的 key 也算进去
@@ -357,6 +365,8 @@ class AutoRenewWorker:
         self._status_lock = threading.Lock()
         # 账号名 → (失败时的密码, 当时的错误文案)；密码未变则不再尝试登录
         self._bad_password: dict[str, tuple[str, str]] = {}
+        # 账号名 → 登录锁定截止时刻（time.monotonic()）
+        self._locked_until: dict[str, float] = {}
 
     # ------------------------------------------------------------ 线程生命周期
     def start(self) -> None:
@@ -406,14 +416,16 @@ class AutoRenewWorker:
         """删除平台侧多余 key（保留当前配置的）；无凭据/无 key 直接跳过，零网络。"""
         if not account.user or not account.password or not account.api_keys:
             return
-        if self._known_bad_password(account) is not None:
-            return  # 配置密码未改，不再登录（避免平台风控锁号）
+        if (
+            self._known_bad_password(account) is not None
+            or self._login_locked(account) > 0
+        ):
+            return  # 配置密码未改 / 平台锁定期内，不再登录（避免风控续锁）
         configured = set(account.api_keys)
         try:
             bundle = self._login(account.user, account.password)
         except QuotaAuthError as exc:
-            if getattr(exc, "wrong_password", False):
-                self._bad_password[account.name] = (account.password, str(exc))
+            self._note_login_failure(account, exc)
             self._set_status(
                 account.name,
                 self.STATUS_PASSWORD_ERROR,
@@ -424,6 +436,9 @@ class AutoRenewWorker:
         except QuotaUnavailable:
             return
         except Exception as exc:  # noqa: BLE001 - 清理是后台兜底，瞬时失败仅记日志
+            self._note_login_failure(account, exc)
+            if self._login_locked(account) > 0:
+                return  # 平台锁定：只留 _note_login_failure 那一行
             self._log(
                 f"账号 {account.name}：清理多余 Key 登录失败：{type(exc).__name__}: {exc}"[
                     :DETAIL_LIMIT
@@ -432,6 +447,7 @@ class AutoRenewWorker:
             self._log_failure_context(account.name, exc)
             return
         self._bad_password.pop(account.name, None)
+        self._locked_until.pop(account.name, None)
         try:
             extras = [
                 item
@@ -456,6 +472,25 @@ class AutoRenewWorker:
         if entry is not None and entry[0] == account.password:
             return entry[1]
         return None
+
+    def _login_locked(self, account: AccountConfig) -> float:
+        """登录被平台锁定的剩余秒数；未锁定（或已到期）返回 0。"""
+        until = self._locked_until.get(account.name)
+        if until is None:
+            return 0.0
+        return max(0.0, until - time.monotonic())
+
+    def _note_login_failure(self, account: AccountConfig, exc: Exception) -> None:
+        """登记登录失败：明确密码错长期跳过；平台锁定则退避到截止时刻（只记一次日志）。"""
+        if isinstance(exc, QuotaAuthError) and getattr(exc, "wrong_password", False):
+            self._bad_password[account.name] = (account.password, str(exc))
+        if isinstance(exc, QuotaHTTPError):
+            seconds = login_lock_seconds(exc)
+            if seconds is not None:
+                self._locked_until[account.name] = time.monotonic() + seconds
+                self._log(
+                    f"账号 {account.name}：登录被平台锁定，{int(seconds // 60)} 分钟内不再尝试"
+                )
 
     def _log_failure_context(self, account_name: str, exc: Exception) -> None:
         """失败时打印请求 / 响应报文，便于排查（请求只记端点，不含请求体）。"""
@@ -524,14 +559,24 @@ class AutoRenewWorker:
         if message is not None:
             self._set_status(account.name, self.STATUS_PASSWORD_ERROR, message)
             return RotationOutcome(False, self.STATUS_PASSWORD_ERROR, message)
+        if self._login_locked(account) > 0:
+            self._set_status(account.name, self.STATUS_CHECK_ERROR, "登录被平台锁定")
+            return RotationOutcome(False, self.STATUS_CHECK_ERROR, "登录被平台锁定")
 
         def _on_login() -> None:
             self._bad_password.pop(account.name, None)
             self._log(f"账号 {account.name}：{reason}，开始轮换")
 
+        def _login_guarded(user: str, password: str) -> TokenBundle:
+            try:
+                return self._login(user, password)
+            except Exception as exc:  # noqa: BLE001 - 先登记再原样抛出
+                self._note_login_failure(account, exc)
+                raise
+
         outcome = rotate_account(
             account,
-            login=self._login,
+            login=_login_guarded,
             keys=self._keys,
             persist=self._persist,
             key_name=self._key_name,
@@ -539,8 +584,6 @@ class AutoRenewWorker:
             on_login=_on_login,
         )
         if outcome.status == self.STATUS_PASSWORD_ERROR:
-            if outcome.wrong_password:
-                self._bad_password[account.name] = (account.password, outcome.message)
             self._set_status(
                 account.name,
                 self.STATUS_PASSWORD_ERROR,

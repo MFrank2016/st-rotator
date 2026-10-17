@@ -32,6 +32,18 @@ TOKEN = TokenBundle(
 )
 
 
+def _locked_error(minutes: int = 7) -> QuotaHTTPError:
+    """平台风控锁定登录的 403 响应（reason=forbidLoginForMoment）。"""
+    return QuotaHTTPError(
+        "HTTP 403 Forbidden [nova-login] http://x/nova/login",
+        request="POST /iam/authn/v1/authn/nova/login",
+        response=(
+            '{"code":7,"reason":"forbidLoginForMoment","message":'
+            f'"The account has been locked, please try again after {minutes} minutes"}}'
+        ),
+    )
+
+
 class _FakeLogin:
     """登录 Fake：记录 (user, password)；exc_for 按 user 抛错，exc 全量抛错。"""
 
@@ -483,6 +495,24 @@ class AutoRenewWorkerTest(unittest.TestCase):
         worker.run_once()
         self.assertEqual(len(login.calls), 2)  # 未被永久跳过
 
+    # ------------------------------------------------------------ 15. 平台锁定 → 轮换路径跳过
+    def test_rotate_skips_login_while_platform_locked(self):
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-bad"], user="u1", password="p1"
+        )
+        probe, _ = self._probe_stub({"sk-bad": ("invalid", "401")})
+        login = _FakeLogin(exc=_locked_error())
+        keys = _FakeKeys()
+        worker = self._worker(accounts=[account], probe=probe, login=login, keys=keys)
+        worker.run_once()
+        worker.run_once()  # 锁定期内不再登录
+        self.assertEqual(len(login.calls), 1)
+        self.assertEqual(keys.ops, [])
+        self.assertEqual(
+            worker.account_status()["账号1"]["status"],
+            AutoRenewWorker.STATUS_CHECK_ERROR,
+        )
+
 
 class _PlatformKeys(_FakeKeys):
     """模拟真实平台：list 返回平台当前全部 key（含刚 create 的），delete 从平台移除。"""
@@ -645,6 +675,55 @@ class CleanupTest(AutoRenewWorkerTest):
         worker.run_cleanup()
         self.assertEqual([call[1] for call in login.calls], ["old", "new"])
         self.assertEqual(keys.ops, ["list"])
+
+    def test_cleanup_skips_login_while_platform_locked(self):
+        """L2：平台锁定期内清理不再登录（零网络），只记一行锁定日志。"""
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-cur"], user="u1", password="p1"
+        )
+        keys = _FakeKeys()
+        login = _FakeLogin(exc=_locked_error(7))
+        worker = self._worker(accounts=[account], keys=keys, login=login)
+        worker.run_cleanup()
+        self.assertEqual(len(login.calls), 1)
+        worker.run_cleanup()
+        self.assertEqual(len(login.calls), 1)  # 未再登录
+        self.assertEqual(keys.ops, [])
+        self.assertTrue(
+            any(
+                "登录被平台锁定，7 分钟内不再尝试" in line for line in self.log_lines[0]
+            )
+        )
+
+    def test_cleanup_retries_after_lock_expires(self):
+        """L3：锁定到期后自动恢复登录尝试。"""
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-cur"], user="u1", password="p1"
+        )
+        keys = _FakeKeys()
+        login = _FakeLogin(exc=_locked_error())
+        worker = self._worker(accounts=[account], keys=keys, login=login)
+        worker.run_cleanup()
+        worker._locked_until["账号1"] = time.monotonic() - 1
+        login.exc = None
+        worker.run_cleanup()
+        self.assertEqual(len(login.calls), 2)
+        self.assertEqual(keys.ops, ["list"])
+
+    def test_platform_lock_logs_once_and_no_failure_spam(self):
+        """L4：进入锁定只打一行，之后不再出现「登录失败 + 失败请求 + 失败响应」。"""
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-cur"], user="u1", password="p1"
+        )
+        worker = self._worker(
+            accounts=[account], keys=_FakeKeys(), login=_FakeLogin(exc=_locked_error())
+        )
+        worker.run_cleanup()
+        worker.run_cleanup()
+        joined = "\n".join(self.log_lines[0])
+        self.assertEqual(joined.count("登录被平台锁定"), 1)
+        self.assertNotIn("清理多余 Key 登录失败", joined)
+        self.assertNotIn("失败请求", joined)
 
     def test_cleanup_transient_error_does_not_clobber_status(self):
         account = AccountConfig(

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import secrets
 import threading
 import time
@@ -82,6 +83,24 @@ _WRONG_CREDENTIALS_MARKERS = (
 def _is_wrong_credentials(exc: "QuotaHTTPError") -> bool:
     text = f"{exc.response or ''} {exc}".lower()
     return any(marker in text for marker in _WRONG_CREDENTIALS_MARKERS)
+
+
+# 平台风控锁定登录：403 响应体 ``reason=forbidLoginForMoment``
+_LOCK_MARKER = "forbidloginformoment"
+
+
+def login_lock_seconds(exc: "QuotaHTTPError") -> float | None:
+    """登录被平台风控锁定时返回需要等待的秒数；不是锁定则返回 None。
+
+    平台在 403 响应体里给 ``reason=forbidLoginForMoment`` 与
+    ``message=The account has been locked, please try again after N minutes``；
+    解析不到分钟数时按 15 分钟兜底。
+    """
+    if _LOCK_MARKER not in f"{exc.response or ''} {exc}".lower():
+        return None
+    match = re.search(r"after\s+(\d+)\s+minute", exc.response or "", re.I)
+    minutes = int(match.group(1)) if match else 15
+    return float(minutes * 60)
 
 
 @dataclass(frozen=True)
