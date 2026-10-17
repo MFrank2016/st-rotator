@@ -7,6 +7,7 @@ python -m st_rotator status -c config.json       # 看当前池状态
 python -m st_rotator chat  -c config.json "你好"
 python -m st_rotator serve -c config.json        # 只起网关，无界面
 python -m st_rotator bench -c config.json -n 200 -p 16
+python -m st_rotator subkey list -c config.json  # 查看/签发对外子 Key
 """
 
 from __future__ import annotations
@@ -402,11 +403,13 @@ def _check_token_length(token: str | None, sink: Callable[[str], None]) -> bool:
 def cmd_serve(args: argparse.Namespace) -> int:
     """起一个本地 OpenAI 兼容网关（无界面），供 WorkBuddy 等上层应用接入。"""
     from .proxy import serve
+    from .subkeys import SubKeyManager
 
     _store, config, sink, rotator, _buffer = _build_runtime(args)
     token = resolve_console_token(args.token, config.console_token)
     if not _check_token_length(token, sink):
         return 1
+    subkeys = SubKeyManager(Path(args.config).resolve().parent / "subkeys.json", logger=sink)
     sink(
         f"启动网关 host={args.host} port={args.port} keys={config.total_keys} "
         f"限速={config.rate_control.mode} 模型={config.default_model}"
@@ -419,6 +422,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             token=token,
             verbose=args.verbose,
             log_sink=sink,
+            subkeys=subkeys,
         )
     finally:
         rotator.close()
@@ -717,6 +721,7 @@ def cmd_ui(args: argparse.Namespace) -> int:
     """启动网关 + 图形控制台，并自动开一个无地址栏的应用窗口。"""
     from .proxy import serve
     from .ui import ConsoleState, open_console_window, open_in_default_browser
+    from .subkeys import SubKeyManager
 
     default_log = str(Path(args.config).resolve().parent / "rotator.log")
     store, config, sink, rotator, buffer = _build_runtime(
@@ -725,6 +730,7 @@ def cmd_ui(args: argparse.Namespace) -> int:
     token = resolve_console_token(args.token, config.console_token)
     if not _check_token_length(token, sink):
         return 1
+    subkeys = SubKeyManager(Path(args.config).resolve().parent / "subkeys.json", logger=sink)
     console = ConsoleState(
         store=store,
         rotator=rotator,
@@ -734,6 +740,7 @@ def cmd_ui(args: argparse.Namespace) -> int:
         buffer=buffer,
         log_file=args.log_file or default_log,
         quota=build_quota_service(config),
+        subkeys=subkeys,
     )
     registry = _load_registry_for(Path(args.config), sink=sink)
     console.auto_renew = build_auto_renew(
@@ -779,6 +786,7 @@ def cmd_ui(args: argparse.Namespace) -> int:
             token=token,
             verbose=args.verbose,
             log_sink=sink,
+            subkeys=subkeys,
             console=console,
             on_ready=on_ready,
         )
@@ -791,6 +799,87 @@ def cmd_ui(args: argparse.Namespace) -> int:
             console.leak_guard.stop()
         rotator.close()
     return 0
+
+
+def _fmt_epoch(value: Any) -> str:
+    """把时间戳格式化成可读时间；空值显示 -。"""
+    if not value:
+        return "-"
+    try:
+        return time.strftime("%m-%d %H:%M:%S", time.localtime(float(value)))
+    except (TypeError, ValueError, OSError):
+        return "-"
+
+
+def cmd_subkey(args: argparse.Namespace) -> int:
+    """管理对外子 Key：签发、查看用量、停用 / 启用、删除、清零统计。
+
+    子 Key 数据保存在配置目录下的 ``subkeys.json``，独立于 config.json 与管理 Token。
+    """
+    from .subkeys import SubKeyManager
+
+    manager = SubKeyManager(
+        Path(args.config).resolve().parent / "subkeys.json", autosave_interval=0
+    )
+    try:
+        if args.action == "list":
+            keys = manager.snapshot()
+            rows = []
+            for item in keys:
+                usage = item["usage"]
+                rows.append({
+                    "id": item["id"],
+                    "name": item["name"],
+                    "key": item["masked"],
+                    "enabled": "启用" if item["enabled"] else "停用",
+                    "requests": usage["requests"],
+                    "ok/fail": f"{usage['successes']}/{usage['errors']}",
+                    "in/out": f"{usage['prompt_tokens']}/{usage['completion_tokens']}",
+                    "cached": usage["cached_tokens"],
+                    "last": _fmt_epoch(usage.get("last_used_at")),
+                })
+            _print_table(rows, [
+                ("id", "ID"), ("name", "名称"), ("key", "Key"), ("enabled", "状态"),
+                ("requests", "请求"), ("ok/fail", "成功/失败"), ("in/out", "输入/输出"),
+                ("cached", "缓存命中"), ("last", "最近使用"),
+            ])
+            print(f"\n共 {len(keys)} 个子 Key")
+            return 0
+
+        if args.action == "create":
+            if not (args.name or "").strip():
+                print("create 需要 --name 指定子 Key 名称", file=sys.stderr)
+                return 2
+            sub = manager.create(args.name, note=args.note or "")
+            print(f"已创建子 Key：{sub.name}（{sub.masked}）")
+            print(f"  key: {sub.key}")
+            print("  （完整密钥只显示这一次，请立即保存；子 Key 只能调 API，不能访问控制台）")
+            manager.save()
+            return 0
+
+        if not args.id:
+            print(f"{args.action} 需要 --id（子 Key 标识，list 可查看）", file=sys.stderr)
+            return 2
+
+        if args.action == "revoke":
+            sub = manager.revoke(args.id)
+            print(f"已删除子 Key：{sub.name}（{sub.masked}），该 Key 立即失效")
+        elif args.action == "toggle":
+            if args.enabled is None:
+                print("toggle 需要 --enabled 或 --disable", file=sys.stderr)
+                return 2
+            sub = manager.set_enabled(args.id, args.enabled)
+            print(f"已{'启用' if sub.enabled else '停用'}子 Key：{sub.name}（{sub.masked}）")
+        elif args.action == "reset":
+            sub = manager.reset_usage(args.id)
+            print(f"已清零子 Key {sub.name} 的用量统计")
+        else:  # pragma: no cover - argparse choices 已约束
+            print(f"未知操作：{args.action}", file=sys.stderr)
+            return 2
+        manager.save()
+        return 0
+    finally:
+        manager.close()
 
 
 def _load_or_create_token(directory: Path) -> str:
@@ -822,6 +911,7 @@ def cmd_tray(args: argparse.Namespace) -> int:
     """
     from .proxy import create_server
     from .tray import TrayApp, acquire_single_instance
+    from .subkeys import SubKeyManager
     from .ui import ConsoleState, open_console_window, open_in_default_browser
 
     config_path = Path(args.config).resolve()
@@ -848,6 +938,7 @@ def cmd_tray(args: argparse.Namespace) -> int:
             open_in_default_browser(url_base)
         rotator.close()
         return 0
+    subkeys = SubKeyManager(config_path.parent / "subkeys.json", logger=sink)
 
     console = ConsoleState(
         store=store,
@@ -858,6 +949,7 @@ def cmd_tray(args: argparse.Namespace) -> int:
         buffer=buffer,
         log_file=args.log_file or default_log,
         quota=build_quota_service(config),
+        subkeys=subkeys,
     )
     registry = _load_registry_for(config_path, sink=sink)
     console.auto_renew = build_auto_renew(
@@ -878,6 +970,7 @@ def cmd_tray(args: argparse.Namespace) -> int:
             token=token,
             verbose=args.verbose,
             log_sink=sink,
+            subkeys=subkeys,
             console=console,
         )
     except OSError as exc:
@@ -1147,6 +1240,23 @@ def build_parser() -> argparse.ArgumentParser:
         "-v", "--verbose", action="store_true", help="打印每次轮换日志"
     )
     p_bench.set_defaults(func=cmd_bench)
+
+    p_subkey = sub.add_parser(
+        "subkey",
+        help="管理对外子 Key（签发 / 查看 / 停用 / 删除 / 清零用量）",
+    )
+    add_config(p_subkey)
+    p_subkey.add_argument(
+        "action",
+        choices=["list", "create", "revoke", "toggle", "reset"],
+        help="要执行的操作",
+    )
+    p_subkey.add_argument("--id", help="子 Key 标识（key_id / 名称），list 可查看")
+    p_subkey.add_argument("--name", help="create 时指定的名称")
+    p_subkey.add_argument("--note", help="备注说明")
+    p_subkey.add_argument("--enabled", action="store_true", default=None, help="toggle 时置为启用")
+    p_subkey.add_argument("--disable", dest="enabled", action="store_false", help="toggle 时置为停用")
+    p_subkey.set_defaults(func=cmd_subkey)
 
     return parser
 

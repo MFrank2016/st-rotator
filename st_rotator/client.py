@@ -22,7 +22,7 @@ from dataclasses import replace
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
-from .config import AccountConfig, Config, RateControlConfig, STRATEGIES, next_account_name
+from .config import AccountConfig, Config, ModelFilterConfig, RateControlConfig, STRATEGIES, next_account_name
 from .errors import (
     AllKeysInvalid,
     ApiError,
@@ -672,6 +672,23 @@ class StRotator:
         """该模型是否被配置为"从清单里藏掉"。"""
         flt = self.model_filter()
         return bool(flt is not None and flt.is_hidden(model_id))
+
+    def set_model_filter(self, hidden: Sequence[str]) -> None:
+        """更新模型屏蔽清单（控制台「屏蔽模型」配置）。
+
+        只影响 ``/v1/models`` 与控制台模型选择器的清单展示，不拦截显式请求；
+        老配置对象（无 ``model_filter`` 字段）直接补一个过滤对象挂上去。
+        """
+        cleaned: list[str] = []
+        for name in hidden:
+            name = (name or "").strip()
+            if name and name not in cleaned:
+                cleaned.append(name)
+        flt = self.model_filter()
+        if flt is None:
+            self.config.model_filter = ModelFilterConfig(hidden=cleaned)
+        else:
+            flt.hidden = cleaned
 
     def filter_models_payload(self, payload: Any) -> Any:
         """过滤 OpenAI 风格 ``{"data": [...]}`` 模型清单，其余字段原样保留。
