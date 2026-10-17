@@ -421,14 +421,14 @@ class AutoRenewWorkerTest(unittest.TestCase):
         self.assertGreaterEqual(counter["n"], 2)
         self.assertFalse(worker._thread.is_alive())  # stop() 的 join(timeout=5) 已返回
 
-    # ------------------------------------------------------------ 12. password_error 复清
-    def test_password_error_cleared_when_next_round_all_ok(self):
+    # ------------------------------------------------------------ 12. 探测不覆盖密码错误
+    def test_probe_ok_does_not_clear_password_error(self):
         account = AccountConfig(
             name="账号1", api_keys=["sk-bad"], user="u1", password="p1"
         )
         verdicts = {"sk-bad": ("invalid", "401 未授权")}
         probe, probe_calls = self._probe_stub(verdicts)
-        login = _FakeLogin(exc=QuotaAuthError("密码错"))
+        login = _FakeLogin(exc=QuotaAuthError("密码错", wrong_password=True))
         keys = _FakeKeys()
         worker = self._worker(accounts=[account], probe=probe, login=login, keys=keys)
         worker.run_once()
@@ -436,7 +436,7 @@ class AutoRenewWorkerTest(unittest.TestCase):
             worker.account_status()["账号1"]["status"],
             AutoRenewWorker.STATUS_PASSWORD_ERROR,
         )
-        # 下一轮 key 全部有效 → 不轮换、状态清回 ok
+        # 下一轮 key 全部有效 → 不轮换，但 password_error 保持（探测不清除它）
         verdicts["sk-bad"] = ("ok", "ok")
         worker.run_once()
         self.assertEqual(login.calls, [("u1", "p1")])  # 第二轮未再登录
@@ -444,8 +444,44 @@ class AutoRenewWorkerTest(unittest.TestCase):
         self.assertEqual(keys.ops, [])
         self.assertEqual(self.persist_calls, [])
         self.assertEqual(
-            worker.account_status()["账号1"]["status"], AutoRenewWorker.STATUS_OK
+            worker.account_status()["账号1"]["status"],
+            AutoRenewWorker.STATUS_PASSWORD_ERROR,
         )
+
+    # ------------------------------------------------------------ 13. 已知密码错 → 轮换路径跳过登录
+    def test_rotate_skips_login_when_password_known_bad(self):
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-bad"], user="u1", password="p1"
+        )
+        probe, _ = self._probe_stub({"sk-bad": ("invalid", "401")})
+        login = _FakeLogin(exc=QuotaAuthError("密码错", wrong_password=True))
+        keys = _FakeKeys()
+        worker = self._worker(accounts=[account], probe=probe, login=login, keys=keys)
+        worker.run_once()
+        worker.run_once()  # Key 仍失效，但密码未改 → 不再登录
+        self.assertEqual(len(login.calls), 1)
+        self.assertEqual(keys.ops, [])
+        entry = worker.account_status()["账号1"]
+        self.assertEqual(entry["status"], AutoRenewWorker.STATUS_PASSWORD_ERROR)
+        self.assertEqual(entry["message"], "密码错")
+
+    # ------------------------------------------------------------ 14. 非密码错的 AuthError 不 sticky
+    def test_non_password_auth_error_is_not_sticky(self):
+        """OIDC 流程异常也抛 QuotaAuthError，但不是密码错 → 下一轮仍会重试登录。"""
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-bad"], user="u1", password="p1"
+        )
+        probe, _ = self._probe_stub({"sk-bad": ("invalid", "401")})
+        login = _FakeLogin(exc=QuotaAuthError("未能获取 login_challenge"))
+        keys = _FakeKeys()
+        worker = self._worker(accounts=[account], probe=probe, login=login, keys=keys)
+        worker.run_once()
+        self.assertEqual(
+            worker.account_status()["账号1"]["status"],
+            AutoRenewWorker.STATUS_PASSWORD_ERROR,
+        )
+        worker.run_once()
+        self.assertEqual(len(login.calls), 2)  # 未被永久跳过
 
 
 class _PlatformKeys(_FakeKeys):
@@ -575,6 +611,40 @@ class CleanupTest(AutoRenewWorkerTest):
             AutoRenewWorker.STATUS_PASSWORD_ERROR,
         )
         self.assertEqual(keys.ops, [])
+
+    def test_cleanup_does_not_retry_login_while_password_unchanged(self):
+        """R1：登录被判密码错后，配置密码未改则下一轮清理零网络、不再登录。"""
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-cur"], user="u1", password="p1"
+        )
+        keys = _FakeKeys()
+        login = _FakeLogin(exc=QuotaAuthError("用户名或密码错误", wrong_password=True))
+        worker = self._worker(accounts=[account], keys=keys, login=login)
+        worker.run_cleanup()
+        self.assertEqual(
+            worker.account_status()["账号1"]["status"],
+            AutoRenewWorker.STATUS_PASSWORD_ERROR,
+        )
+        worker.run_cleanup()
+        self.assertEqual(len(login.calls), 1)
+        self.assertEqual(keys.ops, [])
+
+    def test_cleanup_retries_login_after_password_changed(self):
+        """R2：配置里的密码改掉后，下一轮清理自动恢复登录尝试。"""
+        accounts = [
+            AccountConfig(name="账号1", api_keys=["sk-cur"], user="u1", password="old")
+        ]
+        keys = _FakeKeys()
+        login = _FakeLogin(exc=QuotaAuthError("用户名或密码错误", wrong_password=True))
+        worker = self._worker(accounts=accounts, keys=keys, login=login)
+        worker.run_cleanup()
+        accounts[0] = AccountConfig(
+            name="账号1", api_keys=["sk-cur"], user="u1", password="new"
+        )
+        login.exc = None
+        worker.run_cleanup()
+        self.assertEqual([call[1] for call in login.calls], ["old", "new"])
+        self.assertEqual(keys.ops, ["list"])
 
     def test_cleanup_transient_error_does_not_clobber_status(self):
         account = AccountConfig(

@@ -45,7 +45,11 @@ class QuotaUnavailable(RuntimeError):
 
 
 class QuotaAuthError(RuntimeError):
-    """登录/凭据校验失败。"""
+    """登录/凭据校验失败。``wrong_password`` 为 True 表示平台明确判定密码错误。"""
+
+    def __init__(self, detail: str = "", *, wrong_password: bool = False) -> None:
+        super().__init__(detail)
+        self.wrong_password = wrong_password
 
 
 class QuotaHTTPError(RuntimeError):
@@ -382,7 +386,7 @@ class HttpQuotaTransport:
             resp = self._open(opener, req, step="nova-login")
         except QuotaHTTPError as exc:
             if _is_wrong_credentials(exc):
-                raise QuotaAuthError("用户名或密码错误") from exc
+                raise QuotaAuthError("用户名或密码错误", wrong_password=True) from exc
             raise
         payload = json.loads(resp.read().decode("utf-8"))
         redirect = payload.get("redirect")

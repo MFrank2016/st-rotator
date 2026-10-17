@@ -235,6 +235,7 @@ class RotationOutcome:
     ok: bool
     status: str
     message: str = ""
+    wrong_password: bool = False
 
 
 def rotate_account(
@@ -260,7 +261,12 @@ def rotate_account(
         bundle = login(account.user, account.password)
     except QuotaAuthError as exc:
         # 凭据/密码问题：不调用任何平台操作
-        return RotationOutcome(False, "password_error", str(exc))
+        return RotationOutcome(
+            False,
+            "password_error",
+            str(exc),
+            wrong_password=getattr(exc, "wrong_password", False),
+        )
     except QuotaUnavailable:
         # 缺依赖：静默返回固定文案
         return RotationOutcome(False, "unavailable", "缺 jwcrypto 等依赖，无法登录")
@@ -306,6 +312,9 @@ class AutoRenewWorker:
     * ``check_error``    —— 登录或平台操作瞬时失败（网络 / 风控），下次再试。
     * ``unavailable``    —— 缺 jwcrypto 等依赖，无法登录。
 
+    ``password_error`` 只能由「登录成功」（含配置密码改变后重新登录成功）清除；
+    Key 探测不会清除它。
+
     平台操作顺序固定为「先 delete-all 后 create」：先把该账号平台侧的全部 key 注销，
     再新建唯一一把 key。若反过来（先 create 后 delete-all），list 会把刚建的 key 也算进去
     并把它一并删掉，导致账号零 key、新 key 立即失效、无限轮换（历史 bug）。
@@ -346,6 +355,8 @@ class AutoRenewWorker:
         self._thread: threading.Thread | None = None
         self._status: dict[str, dict[str, str]] = {}
         self._status_lock = threading.Lock()
+        # 账号名 → (失败时的密码, 当时的错误文案)；密码未变则不再尝试登录
+        self._bad_password: dict[str, tuple[str, str]] = {}
 
     # ------------------------------------------------------------ 线程生命周期
     def start(self) -> None:
@@ -395,10 +406,14 @@ class AutoRenewWorker:
         """删除平台侧多余 key（保留当前配置的）；无凭据/无 key 直接跳过，零网络。"""
         if not account.user or not account.password or not account.api_keys:
             return
+        if self._known_bad_password(account) is not None:
+            return  # 配置密码未改，不再登录（避免平台风控锁号）
         configured = set(account.api_keys)
         try:
             bundle = self._login(account.user, account.password)
         except QuotaAuthError as exc:
+            if getattr(exc, "wrong_password", False):
+                self._bad_password[account.name] = (account.password, str(exc))
             self._set_status(
                 account.name,
                 self.STATUS_PASSWORD_ERROR,
@@ -416,6 +431,7 @@ class AutoRenewWorker:
             )
             self._log_failure_context(account.name, exc)
             return
+        self._bad_password.pop(account.name, None)
         try:
             extras = [
                 item
@@ -433,6 +449,13 @@ class AutoRenewWorker:
             return
         if extras:
             self._log(f"账号 {account.name}：已清理 {len(extras)} 把多余 Key")
+
+    def _known_bad_password(self, account: AccountConfig) -> str | None:
+        """配置里的密码此前已被判错时返回当时的错误文案；密码改过则视为未知。"""
+        entry = self._bad_password.get(account.name)
+        if entry is not None and entry[0] == account.password:
+            return entry[1]
+        return None
 
     def _log_failure_context(self, account_name: str, exc: Exception) -> None:
         """失败时打印请求 / 响应报文，便于排查（请求只记端点，不含请求体）。"""
@@ -480,7 +503,10 @@ class AutoRenewWorker:
                 needs_rotate = True
                 break
         if not needs_rotate:
-            # 全部有效（或暂不可判）→ 恢复 ok，顺带清除此前的 password_error
+            if self._known_bad_password(account) is not None:
+                # 密码错但 Key 有效：保留 password_error，探测不清除它
+                return
+            # 全部有效（或暂不可判）→ 恢复 ok
             self._set_status(
                 account.name,
                 self.STATUS_OK,
@@ -494,6 +520,15 @@ class AutoRenewWorker:
         self, account: AccountConfig, *, reason: str = "key 失效"
     ) -> RotationOutcome:
         """登录 → 先 delete-all 后 create → persist；异常分类到对应状态。"""
+        message = self._known_bad_password(account)
+        if message is not None:
+            self._set_status(account.name, self.STATUS_PASSWORD_ERROR, message)
+            return RotationOutcome(False, self.STATUS_PASSWORD_ERROR, message)
+
+        def _on_login() -> None:
+            self._bad_password.pop(account.name, None)
+            self._log(f"账号 {account.name}：{reason}，开始轮换")
+
         outcome = rotate_account(
             account,
             login=self._login,
@@ -501,9 +536,11 @@ class AutoRenewWorker:
             persist=self._persist,
             key_name=self._key_name,
             key_type=self._key_type,
-            on_login=lambda: self._log(f"账号 {account.name}：{reason}，开始轮换"),
+            on_login=_on_login,
         )
         if outcome.status == self.STATUS_PASSWORD_ERROR:
+            if outcome.wrong_password:
+                self._bad_password[account.name] = (account.password, outcome.message)
             self._set_status(
                 account.name,
                 self.STATUS_PASSWORD_ERROR,
