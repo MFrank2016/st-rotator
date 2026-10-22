@@ -15,6 +15,10 @@ services:
       SENSENOVA_KEY_3: "${SENSENOVA_KEY_3:-}"
       # 容器时区：决定日志时间、补号「今日」边界与泄漏守卫 02:00 轮换的本地时间
       TZ: "${TZ:-Asia/Shanghai}"
+      # 出口代理（留空=直连）。生产用 resin 平台 st-rotator；凭据只放服务器 .env
+      HTTPS_PROXY: "${OUTBOUND_PROXY:-}"
+      # 短信平台不走代理
+      NO_PROXY: "${NO_PROXY:-127.0.0.1,localhost,api.ejiema.com}"
     volumes:
       # 挂载目录需包含 config.json（其中 console_token 写 "${CONSOLE_TOKEN}"），且对 uid 10001 可写
       - ./data:/data

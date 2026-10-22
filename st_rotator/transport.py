@@ -8,18 +8,52 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import http.client
 import json
+import os
 import ssl
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 
 class NetworkError(Exception):
     """网络层错误（连接失败、超时、对端断开）——可以换个 Key 重试。"""
+
+
+def _resolve_proxy(
+    proxy: str | None,
+) -> tuple[str, int, str | None, str | None] | None:
+    """解析出口代理配置，返回 ``(host, port, user, password)``；未配置返回 ``None``。
+
+    - ``proxy is None``：依次读环境变量 ``HTTPS_PROXY`` / ``https_proxy``，strip 后为空视为未配置；
+    - ``proxy == ""``：显式禁用（不读环境变量）；
+    - 其余非空值：使用它，仅支持 ``http://[user:pass@]host[:port]``。
+    """
+    if proxy is None:
+        value = (
+            os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+        ).strip()
+        if not value:
+            return None
+        proxy = value
+    else:
+        proxy = proxy.strip()
+        if not proxy:
+            return None
+
+    parsed = urlsplit(proxy)
+    if parsed.scheme != "http" or not parsed.hostname:
+        raise ValueError(
+            "代理地址格式非法，期望 http://[user:pass@]host[:port]（scheme 必须是 http，端口默认 80）"
+        )
+    port = parsed.port or 80
+    user = unquote(parsed.username) if parsed.username else None
+    password = unquote(parsed.password) if parsed.password else None
+    return (parsed.hostname, port, user, password)
 
 
 @dataclass
@@ -149,6 +183,14 @@ class HttpClient:
         max_keepalive: 空闲连接池上限。
         verify: 是否校验 TLS 证书。
         handler: 测试钩子；提供后所有请求走它，不发起真实网络调用。
+        proxy: 出口代理。
+            ``None``（默认）→ 依次读环境变量 ``HTTPS_PROXY`` / ``https_proxy``，未配置则直连；
+            ``""`` → 显式禁用代理（不读环境变量）；
+            非空 → 使用该代理，仅支持 ``http://[user:pass@]host[:port]``。上游为 ``https`` 时
+            通过 HTTPS CONNECT 隧道转发（支持流式与非流式）。无论代理通过参数还是环境变量
+            配置，上游为 ``http`` 时都不支持走代理：首次真正建连时报 ``ValueError``
+            （仅用 ``handler=`` 测试、不建连则不受影响）。代理不可用时按现有网络错误
+            处理（``NetworkError``）。
     """
 
     def __init__(
@@ -162,6 +204,7 @@ class HttpClient:
         max_keepalive: int = 20,
         verify: bool = True,
         handler: Callable[[Request], Response] | None = None,
+        proxy: str | None = None,
     ) -> None:
         parsed = urlsplit(base_url)
         if parsed.scheme not in ("http", "https"):
@@ -190,9 +233,29 @@ class HttpClient:
                 self._context.check_hostname = False
                 self._context.verify_mode = ssl.CERT_NONE
 
+        resolved_proxy = _resolve_proxy(proxy)
+        self._proxy_host: str | None = None
+        self._proxy_port = 0
+        self._proxy_auth: str | None = None
+        if resolved_proxy is not None:
+            # 无论上游是 https 还是 http，只要配置了代理就先存下来；http 上游
+            # 是否真报错延迟到首次建连时（见 _new_connection）
+            self._proxy_host = resolved_proxy[0]
+            self._proxy_port = resolved_proxy[1]
+            user, password = resolved_proxy[2], resolved_proxy[3]
+            if user is not None:
+                raw = f"{user}:{password or ''}".encode("utf-8")
+                self._proxy_auth = "Basic " + base64.b64encode(raw).decode("ascii")
+
     # ------------------------------------------------------------ 便捷方法
 
-    def get(self, path: str, *, headers: Mapping[str, str] | None = None, stream: bool = False):
+    def get(
+        self,
+        path: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        stream: bool = False,
+    ):
         return self.request("GET", path, headers=headers, stream=stream)
 
     def post(
@@ -203,7 +266,9 @@ class HttpClient:
         headers: Mapping[str, str] | None = None,
         stream: bool = False,
     ):
-        return self.request("POST", path, json_body=json_body, headers=headers, stream=stream)
+        return self.request(
+            "POST", path, json_body=json_body, headers=headers, stream=stream
+        )
 
     # ------------------------------------------------------------ 主流程
 
@@ -229,21 +294,52 @@ class HttpClient:
         if self._handler is not None:
             result = self._handler(request)
             if not isinstance(result, Response):
-                raise TypeError(f"handler 必须返回 Response，实际为 {type(result).__name__}")
+                raise TypeError(
+                    f"handler 必须返回 Response，实际为 {type(result).__name__}"
+                )
             return result
 
         return self._send(request, stream=stream)
 
     def _url(self, path: str) -> str:
-        return f"{self._base_path}/{path.lstrip('/')}" if path else self._base_path or "/"
+        return (
+            f"{self._base_path}/{path.lstrip('/')}" if path else self._base_path or "/"
+        )
 
     def _new_connection(self) -> http.client.HTTPConnection:
-        if self._scheme == "https":
+        if self._proxy_host is not None and self._scheme != "https":
+            # 延迟到首次建连才报错：用 handler= 的离线测试（不建连）不受影响；
+            # 真实运行一旦去连明文 http 上游且配了代理，立即失败，不让流量静默绕过代理
+            raise ValueError(
+                "明文 http 上游不支持走出口代理（仅 https 上游支持 CONNECT 隧道）"
+            )
+        if self._proxy_host is not None and self._scheme == "https":
+            # 经代理出口：先连代理，CONNECT 隧道到上游，之后请求仍按上游 host/port 发
             conn: http.client.HTTPConnection = http.client.HTTPSConnection(
-                self._host, self._port, timeout=self._connect_timeout, context=self._context
+                self._proxy_host,
+                self._proxy_port,
+                timeout=self._connect_timeout,
+                context=self._context,
+            )
+            if self._proxy_auth is not None:
+                conn.set_tunnel(
+                    self._host,
+                    self._port,
+                    headers={"Proxy-Authorization": self._proxy_auth},
+                )
+            else:
+                conn.set_tunnel(self._host, self._port)
+        elif self._scheme == "https":
+            conn = http.client.HTTPSConnection(
+                self._host,
+                self._port,
+                timeout=self._connect_timeout,
+                context=self._context,
             )
         else:
-            conn = http.client.HTTPConnection(self._host, self._port, timeout=self._connect_timeout)
+            conn = http.client.HTTPConnection(
+                self._host, self._port, timeout=self._connect_timeout
+            )
         conn.connect()
         if conn.sock is not None:
             conn.sock.settimeout(self._timeout)  # 建连后切到读超时
@@ -255,7 +351,9 @@ class HttpClient:
                 return self._idle.pop(), True
         return self._new_connection(), False
 
-    def _checkin(self, conn: http.client.HTTPConnection, *, healthy: bool = True) -> None:
+    def _checkin(
+        self, conn: http.client.HTTPConnection, *, healthy: bool = True
+    ) -> None:
         if healthy and conn.sock is not None:
             with self._lock:
                 if len(self._idle) < self._max_keepalive:
@@ -264,7 +362,9 @@ class HttpClient:
         with contextlib.suppress(Exception):
             conn.close()
 
-    def _finish(self, conn: http.client.HTTPConnection, *, healthy: bool = True) -> None:
+    def _finish(
+        self, conn: http.client.HTTPConnection, *, healthy: bool = True
+    ) -> None:
         """流式响应读完后调用：归还连接并释放并发额度。"""
         self._checkin(conn, healthy=healthy)
         self._sem.release()
@@ -279,7 +379,12 @@ class HttpClient:
         try:
             conn, reused = self._checkout()
             try:
-                conn.request(request.method, self._url(request.path), body=request.body, headers=request.headers)
+                conn.request(
+                    request.method,
+                    self._url(request.path),
+                    body=request.body,
+                    headers=request.headers,
+                )
                 raw = conn.getresponse()
             except (http.client.HTTPException, OSError) as exc:
                 # 连接池里的连接可能已被对端关闭，换一条新连接重试一次
@@ -289,7 +394,12 @@ class HttpClient:
                 if not reused:
                     raise NetworkError(f"{type(exc).__name__}: {exc}") from exc
                 conn = self._new_connection()
-                conn.request(request.method, self._url(request.path), body=request.body, headers=request.headers)
+                conn.request(
+                    request.method,
+                    self._url(request.path),
+                    body=request.body,
+                    headers=request.headers,
+                )
                 raw = conn.getresponse()
 
             status = raw.status
@@ -301,7 +411,9 @@ class HttpClient:
                 return response
 
             payload = raw.read()
-            healthy = status < 500 and raw.getheader("Connection", "").lower() != "close"
+            healthy = (
+                status < 500 and raw.getheader("Connection", "").lower() != "close"
+            )
             self._checkin(conn, healthy=healthy)
             conn = None
             return Response(status, headers, payload)
