@@ -270,6 +270,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
     _sent_status: int | None = None
     _sent_bytes: int = 0
     _access_err: str | None = None
+    _access_complete: bool = True
 
     # ------------------------------------------------------------ 基础设施
 
@@ -413,6 +414,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             self._sent_bytes += len(body)
         except (BrokenPipeError, ConnectionResetError, OSError):
+            self._access_complete = False
             pass
 
     def _send_raw(self, status: int, text: str, content_type: str) -> None:
@@ -604,6 +606,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         self._sent_status = None
         self._sent_bytes = 0
         self._access_err = None
+        self._access_complete = True
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         # 登录 / 登出必须在任何鉴权之前处理
@@ -730,6 +733,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 # 未预期的异常：记下类型名再原样抛出，行为不变
                 self._access_err = type(exc).__name__
+                self._access_complete = False
                 raise
             finally:
                 note_serve_end()
@@ -762,6 +766,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
                 f" upstream={upstream if upstream is not None else '-'}"
                 f" err={self._access_err or '-'}"
                 f" bytes={self._sent_bytes}"
+                f" complete={1 if self._access_complete else 0}"
             )
         except Exception:  # pragma: no cover - 访问日志失败不影响请求
             pass
@@ -902,6 +907,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
                 self._write_chunk(b"data: [DONE]\n\n")
                 self._end_stream()
             except (BrokenPipeError, ConnectionResetError, OSError):
+                self._access_complete = False
                 pass
             return
         except ApiError as exc:
@@ -952,6 +958,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         except RotatorError as exc:
             # 已经发出 200 了，改不了状态码，只能补一条 error 事件收尾
             self._access_err = type(exc).__name__
+            self._access_complete = False
             try:
                 self._write_chunk(
                     self._sse(error_payload(str(exc), "upstream_error", "502"))
@@ -959,12 +966,14 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, OSError):
                 return
         except (BrokenPipeError, ConnectionResetError, OSError):
+            self._access_complete = False
             return  # 客户端主动断开，正常情况
         finally:
             try:
                 self._write_chunk(b"data: [DONE]\n\n")
                 self._end_stream()
             except (BrokenPipeError, ConnectionResetError, OSError):
+                self._access_complete = False
                 pass
 
     def _handle_model_test(self, raw: bytes) -> None:
