@@ -46,6 +46,7 @@ from .client import (
 from .errors import (
     AllKeysInvalid,
     ApiError,
+    DeadlineExceeded,
     NoAvailableKey,
     RotationExhausted,
     RotatorError,
@@ -727,7 +728,9 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
                 return
             # 告诉烧点模块"有用户在等"，让它主动让路（小内存设备上这一步直接决定 TTFT）
             note_serve_begin()
-            trace = begin_access_trace()
+            trace = begin_access_trace(
+                self.rotator.config.deadline_seconds, started
+            )
             try:
                 self._handle_chat_inner(raw, info)
             except Exception as exc:
@@ -874,6 +877,11 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             self._access_err = type(exc).__name__
             self._send_json(503, error_payload(str(exc), "all_keys_invalid", "503"))
             return
+        except DeadlineExceeded as exc:
+            self._access_err = type(exc).__name__
+            self._access_complete = False  # 到点超时算一次失败，不是完整响应
+            self._send_json(502, error_payload(str(exc), "upstream_error", "502"))
+            return
         except RotatorError as exc:
             self._access_err = type(exc).__name__
             self._send_json(502, error_payload(str(exc), "upstream_error", "502"))
@@ -938,6 +946,11 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         except AllKeysInvalid as exc:
             self._access_err = type(exc).__name__
             self._send_json(503, error_payload(str(exc), "all_keys_invalid", "503"))
+            return
+        except DeadlineExceeded as exc:
+            self._access_err = type(exc).__name__
+            self._access_complete = False  # 到点超时算一次失败，不是完整响应
+            self._send_json(502, error_payload(str(exc), "upstream_error", "502"))
             return
         except RotatorError as exc:
             self._access_err = type(exc).__name__

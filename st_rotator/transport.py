@@ -13,8 +13,10 @@ import contextlib
 import http.client
 import json
 import os
+import socket
 import ssl
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Mapping
 from urllib.parse import unquote, urlsplit
@@ -72,6 +74,32 @@ def _split_lines(payload: bytes) -> Iterator[str]:
         yield line
 
 
+def _arm_abort(
+    deadline: float | None, conn: http.client.HTTPConnection
+) -> threading.Timer | None:
+    """到点主动 shutdown 上游连接，让阻塞中的 recv 立刻返回。
+
+    只靠 ``sock.settimeout`` 挡不住「上游每隔几十秒滴一个字节」：那是单次
+    recv 超时，不是总时限。``deadline`` 为 None（不启用）时直接返回 None，
+    代码路径与之前完全一致。
+    """
+    if deadline is None:
+        return None
+
+    def _abort() -> None:
+        sock = getattr(conn, "sock", None)
+        with contextlib.suppress(Exception):
+            if sock is not None:
+                sock.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(Exception):
+            conn.close()
+
+    timer = threading.Timer(max(0.0, deadline - time.monotonic()), _abort)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
 class Response:
     """已完整读入内存的响应。"""
 
@@ -109,6 +137,7 @@ class StreamResponse:
         conn: http.client.HTTPConnection,
         status: int,
         headers: Mapping[str, str],
+        abort: threading.Timer | None = None,
     ) -> None:
         self.status = int(status)
         self.headers = {k.lower(): v for k, v in headers.items()}
@@ -119,6 +148,7 @@ class StreamResponse:
         self._done = False
         self._consumed_eof = False
         self._healthy = True
+        self._abort = abort
 
     # ------------------------------------------------------------ 读取
 
@@ -157,6 +187,8 @@ class StreamResponse:
         if self._done:
             return
         self._done = True
+        if self._abort is not None:
+            self._abort.cancel()
         with contextlib.suppress(Exception):
             self._raw.close()
         reusable = (
@@ -280,6 +312,7 @@ class HttpClient:
         json_body: Any = None,
         headers: Mapping[str, str] | None = None,
         stream: bool = False,
+        deadline: float | None = None,
     ) -> Response | StreamResponse:
         merged = dict(self._headers)
         if headers:
@@ -299,7 +332,7 @@ class HttpClient:
                 )
             return result
 
-        return self._send(request, stream=stream)
+        return self._send(request, stream=stream, deadline=deadline)
 
     def _url(self, path: str) -> str:
         return (
@@ -369,15 +402,19 @@ class HttpClient:
         self._checkin(conn, healthy=healthy)
         self._sem.release()
 
-    def _send(self, request: Request, *, stream: bool) -> Response | StreamResponse:
+    def _send(
+        self, request: Request, *, stream: bool, deadline: float | None = None
+    ) -> Response | StreamResponse:
         if self._closed:
             raise NetworkError("HttpClient 已关闭")
 
         self._sem.acquire()
         handed_off = False
         conn: http.client.HTTPConnection | None = None
+        abort: threading.Timer | None = None
         try:
             conn, reused = self._checkout()
+            abort = _arm_abort(deadline, conn)
             try:
                 conn.request(
                     request.method,
@@ -393,7 +430,10 @@ class HttpClient:
                 conn = None
                 if not reused:
                     raise NetworkError(f"{type(exc).__name__}: {exc}") from exc
+                if abort is not None:
+                    abort.cancel()
                 conn = self._new_connection()
+                abort = _arm_abort(deadline, conn)
                 conn.request(
                     request.method,
                     self._url(request.path),
@@ -406,11 +446,15 @@ class HttpClient:
             headers = {k.lower(): v for k, v in raw.getheaders()}
 
             if stream:
-                response = StreamResponse(raw, self, conn, status, headers)
+                response = StreamResponse(
+                    raw, self, conn, status, headers, abort=abort
+                )
                 handed_off = True
                 return response
 
             payload = raw.read()
+            if abort is not None:
+                abort.cancel()
             healthy = (
                 status < 500 and raw.getheader("Connection", "").lower() != "close"
             )
@@ -423,6 +467,8 @@ class HttpClient:
             raise NetworkError(f"{type(exc).__name__}: {exc}") from exc
         finally:
             if not handed_off:
+                if abort is not None:
+                    abort.cancel()
                 if conn is not None:
                     self._checkin(conn, healthy=False)
                 self._sem.release()

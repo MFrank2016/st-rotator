@@ -720,6 +720,9 @@ class Config:
     # 额度耗尽时所有 Key 会冷却数分钟，干等会把首字延迟拖到分钟级。
     acquire_fail_fast: float = 15.0
     max_total_wait: float = 90.0
+    # 单条客户端请求的墙钟总预算（秒）。0 = 不启用（保持旧行为）；
+    # 到点主动断开上游并按超时失败，用于兜住「上游慢速滴字节」这种长尾。
+    deadline_seconds: float = 0.0
     retry_backoff: float = 0.5
     max_retry_backoff: float = 8.0
 
@@ -773,6 +776,8 @@ class Config:
             raise ConfigError("timeout / connect_timeout 必须 > 0")
         if self.max_total_wait < 0:
             raise ConfigError("max_total_wait 不能为负")
+        if self.deadline_seconds < 0:
+            raise ConfigError("deadline_seconds 不能为负")
         if self.min_max_tokens < 0:
             raise ConfigError("min_max_tokens 不能为负")
         if self.acquire_fail_fast < 0:

@@ -62,3 +62,7 @@ class ApiError(RotatorError):
 
 class StreamInterrupted(RotatorError):
     """流式响应已经开始吐字后中断，无法安全重试（避免重复输出）。"""
+
+
+class DeadlineExceeded(RotatorError):
+    """整条客户端请求超出 deadline_seconds 墙钟预算（已主动断开上游）。"""

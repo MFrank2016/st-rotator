@@ -27,6 +27,7 @@ from .errors import (
     AllKeysInvalid,
     ApiError,
     ConfigError,
+    DeadlineExceeded,
     NoAvailableKey,
     RotationExhausted,
     RotatorError,
@@ -162,20 +163,30 @@ def serve_inflight() -> int:
 class AccessTrace:
     """单次客户端请求的上游轨迹。"""
 
-    __slots__ = ("attempts", "hits", "status")
+    __slots__ = ("attempts", "hits", "status", "deadline_at")
 
     def __init__(self) -> None:
         self.attempts = 0
         self.hits: list[tuple[str, str]] = []  # (账号名, 脱敏 Key)
         self.status: int | None = None  # 最后一次上游尝试的状态码
+        self.deadline_at: float | None = None  # 整条请求的墙钟截止时刻
 
 
 _TRACE_LOCAL = threading.local()
 
 
-def begin_access_trace() -> AccessTrace:
-    """开始记录当前线程的访问轨迹（网关每个请求调一次）。"""
+def begin_access_trace(
+    deadline_seconds: float = 0.0, started: float | None = None
+) -> AccessTrace:
+    """开始记录当前线程的访问轨迹（网关每个请求调一次）。
+
+    ``deadline_seconds`` > 0 时给这条请求挂一个墙钟截止时刻（``started`` 是
+    收到请求的时刻，默认现在）；为 0 表示不启用，行为与之前完全一致。
+    """
     trace = AccessTrace()
+    if deadline_seconds and deadline_seconds > 0:
+        base = time.monotonic() if started is None else started
+        trace.deadline_at = base + deadline_seconds
     _TRACE_LOCAL.trace = trace
     return trace
 
@@ -187,6 +198,11 @@ def end_access_trace() -> None:
 
 def _current_trace() -> AccessTrace | None:
     return getattr(_TRACE_LOCAL, "trace", None)
+
+
+def _current_deadline() -> float | None:
+    trace = _current_trace()
+    return trace.deadline_at if trace is not None else None
 
 
 def available_mb() -> float | None:
@@ -1038,6 +1054,24 @@ class StRotator:
             return None
         return budget - (self._clock() - started_at)
 
+    def _deadline_text(self) -> str:
+        return f"超出单请求时限 {self.config.deadline_seconds:g}s"
+
+    def _check_deadline(self, deadline_at: float | None) -> None:
+        """到点就抛 DeadlineExceeded；不启用时是空操作。"""
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            raise DeadlineExceeded(self._deadline_text())
+
+    @staticmethod
+    def _clamp_deadline(
+        remaining: float | None, deadline_at: float | None
+    ) -> float | None:
+        """把等待时间压到 deadline 剩余量以内；不启用时原样返回。"""
+        if deadline_at is None:
+            return remaining
+        left = max(0.0, deadline_at - time.monotonic())
+        return left if remaining is None else min(remaining, left)
+
     def _acquire_timeout(self, remaining: float | None) -> float:
         """等 Key 的超时不能超过剩余预算，否则会白白挂死。"""
         if remaining is None:
@@ -1046,7 +1080,9 @@ class StRotator:
 
     def _sleep_between(self, attempt: int, started_at: float, budget: float | None) -> None:
         delay = self._backoff(attempt)
-        remaining = self._remaining(started_at, budget)
+        remaining = self._clamp_deadline(
+            self._remaining(started_at, budget), _current_deadline()
+        )
         if remaining is not None:
             if remaining <= 0:
                 return
@@ -1097,8 +1133,10 @@ class StRotator:
         last_exc: Exception | None = None
         started_at = self._clock()
         budget = self.config.max_total_wait or None
+        deadline_at = _current_deadline()
 
         for attempt in range(1, max_attempts + 1):
+            self._check_deadline(deadline_at)
             remaining = self._remaining(started_at, budget)
             if remaining is not None and remaining <= 0:
                 last_exc = last_exc or TimeoutError(f"超出单请求等待预算 {budget:g}s")
@@ -1113,7 +1151,9 @@ class StRotator:
                 self._log(f"[放弃] 限速等待超时: {exc}")
                 break
 
-            remaining = self._remaining(started_at, budget)
+            remaining = self._clamp_deadline(
+                self._remaining(started_at, budget), deadline_at
+            )
             try:
                 key = self.pool.acquire(
                     exclude=excluded,
@@ -1136,9 +1176,14 @@ class StRotator:
                 req_headers = dict(headers) if headers else {}
                 req_headers.update(self._auth(key))
                 response = self._client.request(
-                    method, path, json_body=payload, headers=req_headers
+                    method,
+                    path,
+                    json_body=payload,
+                    headers=req_headers,
+                    deadline=deadline_at,
                 )
                 self._note_upstream_status(response.status)
+                self._check_deadline(deadline_at)
                 body = safe_text(response) if response.status >= 400 else ""
                 action, retry_after = classify(response, body)
 
@@ -1193,6 +1238,7 @@ class StRotator:
                     self.pool.report_client_error(key, extract_error(body))
                     raise ApiError(response.status, body)
             except NetworkError as exc:
+                self._check_deadline(deadline_at)
                 delay = self.pool.report_server_error(key, f"{type(exc).__name__}")
                 last_exc = exc
                 self._log(f"[网络] {key.masked}({key.account}) {exc}，冷却 {delay:.1f}s")
@@ -1223,8 +1269,10 @@ class StRotator:
         last_exc: Exception | None = None
         started_at = self._clock()
         budget = self.config.max_total_wait or None
+        deadline_at = _current_deadline()
 
         for attempt in range(1, max_attempts + 1):
+            self._check_deadline(deadline_at)
             remaining = self._remaining(started_at, budget)
             if remaining is not None and remaining <= 0:
                 last_exc = last_exc or TimeoutError(f"超出单请求等待预算 {budget:g}s")
@@ -1238,7 +1286,9 @@ class StRotator:
                 self._log(f"[放弃] 限速等待超时: {exc}")
                 break
 
-            remaining = self._remaining(started_at, budget)
+            remaining = self._clamp_deadline(
+                self._remaining(started_at, budget), deadline_at
+            )
             try:
                 key = self.pool.acquire(
                     exclude=excluded,
@@ -1260,9 +1310,17 @@ class StRotator:
                 req_headers = dict(headers) if headers else {}
                 req_headers.update(self._auth(key))
                 response = self._client.request(
-                    "POST", path, json_body=payload, headers=req_headers, stream=True
+                    "POST",
+                    path,
+                    json_body=payload,
+                    headers=req_headers,
+                    stream=True,
+                    deadline=deadline_at,
                 )
                 self._note_upstream_status(response.status)
+                if deadline_at is not None and time.monotonic() >= deadline_at:
+                    response.close()
+                    raise DeadlineExceeded(self._deadline_text())
                 body = safe_text(response) if response.status >= 400 else ""
                 action, retry_after = classify(response, body)
 
@@ -1280,12 +1338,17 @@ class StRotator:
                             emitted = True
                             yield piece
                     except NetworkError as exc:
+                        self._check_deadline(deadline_at)
                         last_exc = exc
                         if emitted:
                             # 已经吐字了，重试会导致内容重复
                             raise StreamInterrupted(f"流式响应中途断开: {exc}") from exc
                         self.pool.report_server_error(key, str(exc))
                         retryable = True
+                    except Exception:
+                        # 到点主动 shutdown 上游时，读操作抛的是 OSError 等非 NetworkError
+                        self._check_deadline(deadline_at)
+                        raise
                     else:
                         self.pool.report_success(key, latency=self._clock() - started)
                         self.limiter.on_success()
