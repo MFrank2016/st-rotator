@@ -137,6 +137,39 @@ class _QueuedSms:
         return self._responses.pop(0) if self._responses else "[尚未收到]"
 
 
+class _FlakySms:
+    """get_msg 前 ``failures`` 次抛 SmsError（默认平台 500 抖动），之后返回罐头正文。"""
+
+    calls: int
+
+    def __init__(
+        self,
+        *,
+        failures: int,
+        text: str,
+        detail: str = "getMsg HTTP 500: <html>Tomcat error</html>",
+        retryable: bool = True,
+    ) -> None:
+        self._failures = failures
+        self._text = text
+        self._detail = detail
+        self._retryable = retryable
+        self.calls = 0
+
+    def left_amount(self) -> float:
+        return 0.0
+
+    def get_phone(self, *, keyword: str) -> str:
+        return "13800138000"
+
+    def get_msg(self, phone: str, *, keyword: str) -> str:
+        del phone, keyword  # 与 SmsTransport 签名一致；本 fake 只计数
+        self.calls += 1
+        if self.calls <= self._failures:
+            raise sms.SmsError(self._detail, retryable=self._retryable)
+        return self._text
+
+
 # ---------------------------------------------------------------- 测试
 
 
@@ -202,6 +235,29 @@ class EjiemaSmsTest(unittest.TestCase):
         with self.assertRaises(sms.SmsError) as cm:
             client.get_phone(keyword="商汤")
         self.assertEqual(cm.exception.detail, "balance ERROR: 余额不足")
+
+    # HTTP 层错误消息以动作名开头（状态码与响应体原样保留）
+    def test_http_error_message_prefixed_with_action(self):
+        def responder(path: str) -> tuple[int, bytes | None]:
+            return 500, b"<html>Tomcat error</html>"
+
+        client = self._sms(responder)
+        with self.assertRaises(sms.SmsError) as cm:
+            client.left_amount()
+        self.assertTrue(cm.exception.detail.startswith("leftAmount HTTP 500: "))
+        self.assertIn("<html>Tomcat error</html>", cm.exception.detail)
+        self.assertTrue(cm.exception.retryable)  # 5xx 属平台抖动，可重试
+
+    # retryable 分类：业务 ERROR 不可重试（detail 保持原文）
+    def test_business_error_not_retryable(self):
+        def responder(path: str) -> tuple[int, bytes | None]:
+            return 200, "ERROR:token错误，请重新通过API登录".encode()
+
+        client = self._sms(responder)
+        with self.assertRaises(sms.SmsError) as cm:
+            client.left_amount()
+        self.assertFalse(cm.exception.retryable)
+        self.assertEqual(cm.exception.detail, "ERROR:token错误，请重新通过API登录")
 
     # 4. getPhone：keyWord 必须百分号编码后进 query（服务端看到 %E5%95%86%E6%B1%A4）
     def test_get_phone_urlencodes_keyword(self):
@@ -291,6 +347,50 @@ class WaitSmsCodeTest(unittest.TestCase):
         self.assertEqual(sleeper.calls, [5.0, 5.0, 5.0])  # 每次 sleep 用 interval
         self.assertEqual(clock.calls[-1], 15.0)  # 超时判断用 clock 增量
         self.assertGreater(len(clock.calls), 2)
+
+    # 9. 轮询期间单次 SmsError（平台 500 / 读超时）不再冒泡：按「本次没拿到」继续
+    def test_wait_sms_code_ignores_transient_errors(self):
+        flaky = _FlakySms(failures=2, text="【商汤】验证码 246810，请勿泄露。")
+        clock = _FakeClock()
+        sleeper = _RecordingSleep(clock)
+        got = sms.wait_sms_code(
+            flaky,
+            "13800138000",
+            keyword="商汤",
+            interval=5.0,
+            timeout=60.0,
+            clock=clock,
+            sleep=sleeper,
+        )
+        self.assertEqual(got, "246810")  # 前两次失败被吞掉，第三次拿到验证码
+        self.assertEqual(flaky.calls, 3)
+        self.assertEqual(sleeper.calls, [5.0, 5.0])
+        self.assertEqual(clock.t, 10.0)
+
+    # 10. 业务错误（不可重试）在轮询内立刻抛出：只调一次 get_msg、不 sleep
+    def test_wait_sms_code_raises_non_retryable_error(self):
+        fatal = _FlakySms(
+            failures=1,
+            text="【商汤】验证码 246810",
+            detail="ERROR:token错误，请重新通过API登录",
+            retryable=False,
+        )
+        clock = _FakeClock()
+        sleeper = _RecordingSleep(clock)
+        with self.assertRaises(sms.SmsError) as cm:
+            sms.wait_sms_code(
+                fatal,
+                "13800138000",
+                keyword="商汤",
+                interval=5.0,
+                timeout=60.0,
+                clock=clock,
+                sleep=sleeper,
+            )
+        self.assertFalse(cm.exception.retryable)
+        self.assertEqual(cm.exception.detail, "ERROR:token错误，请重新通过API登录")
+        self.assertEqual(fatal.calls, 1)
+        self.assertEqual(sleeper.calls, [])
 
 
 if __name__ == "__main__":

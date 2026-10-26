@@ -47,10 +47,14 @@ from .authn import (
 from .autorenew import KeyTransport
 from .config import AccountConfig
 from .registry import Registry
-from .sms import SmsTransport, wait_sms_code
+from .sms import SmsError, SmsTransport, wait_sms_code
 
 # 错误摘要最长字符数（脱敏上限，同 autorenew.DETAIL_LIMIT）
 DETAIL_LIMIT = 200
+# 查余额重试：平台抖动（HTTP 500 / 读超时）最多试 3 次（首次 + 2 次重试），
+# 每次失败间隔 2 秒；3 次都失败才把 SmsError 抛给上层按号码失败处理。
+BALANCE_RETRY_MAX = 3
+BALANCE_RETRY_DELAY = 2.0
 # 取号去重循环上限：连续拿到已用号码超过此数即放弃本轮
 DEDUPE_MAX = 20
 # 软重试上限：短信持续超时（need 不递减）时，连续超过此数即放弃本轮，避免死循环
@@ -442,7 +446,7 @@ class ReplenishWorker:
         # a. spend gate：余额差口径，超当日上限即停。先记入本次读数再判定，
         #    使闸门用的是「刚读到的余额」而不是上一次的读数（避免差一拍超冲）。
         today = today_str(self._clock)
-        balance = self._sms.left_amount()
+        balance = self._read_balance()
         self._registry.note_balance(today, balance)
         allowed, consumed = spend_ok(
             self._daily_spend_cap, self._registry.spend_state(), today
@@ -581,6 +585,23 @@ class ReplenishWorker:
             always_log=True,
         )
         return True
+
+    def _read_balance(self) -> float:
+        """读余额；只对可重试的平台抖动（HTTP 5xx / 读超时）重试。
+
+        最多试 ``BALANCE_RETRY_MAX`` 次、间隔 ``BALANCE_RETRY_DELAY`` 秒；业务错误
+        （不可重试）立即抛出，3 次抖动都失败也照旧抛出，由 ``_cycle`` 按号码失败处理。
+        """
+        for attempt in range(BALANCE_RETRY_MAX):
+            try:
+                return self._sms.left_amount()
+            except SmsError as exc:
+                if not exc.retryable:
+                    raise
+                if attempt + 1 >= BALANCE_RETRY_MAX:
+                    raise
+                time.sleep(BALANCE_RETRY_DELAY)
+        raise AssertionError("unreachable")  # pragma: no cover - 循环内必返回或抛出
 
     def _fetch_fresh_phone(self) -> str:
         """连续取号直到拿到一个未用过的号码；去重耗尽 -> check_error。"""

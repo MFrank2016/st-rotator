@@ -26,13 +26,19 @@ CODE_RUN = re.compile(r"(?<!\d)\d{6,8}(?!\d)")  # 两端均非数字的 6-8 位�
 
 
 class SmsError(RuntimeError):
-    """ejiema API 失败：业务 ERROR 响应或网络/HTTP 层错误。"""
+    """ejiema API 失败：业务 ERROR 响应或网络/HTTP 层错误。
+
+    仅 HTTP 5xx 与网络层/超时错误可重试（``retryable=True``）；业务 ERROR 与
+    解析失败不可重试，调用方须立即按失败处理。
+    """
 
     detail: str
+    retryable: bool
 
-    def __init__(self, detail: str) -> None:
+    def __init__(self, detail: str, *, retryable: bool = False) -> None:
         super().__init__(detail)
         self.detail = detail
+        self.retryable = retryable
 
 
 class SmsTransport(Protocol):
@@ -81,10 +87,14 @@ class EjiemaSms:
                 text = ""
             finally:
                 exc.close()
-            raise SmsError(f"HTTP {exc.code}: {text}") from exc
+            raise SmsError(
+                f"{action} HTTP {exc.code}: {text}", retryable=exc.code >= 500
+            ) from exc
         except (urllib.error.URLError, OSError) as exc:
             # socket.timeout / TimeoutError 均为 OSError 子类，一并归为网络层
-            raise SmsError(f"{type(exc).__name__}: {exc}") from exc
+            raise SmsError(
+                f"{action} {type(exc).__name__}: {exc}", retryable=True
+            ) from exc
         if ERROR_MARKER in raw:
             raise SmsError(raw)
         return raw
@@ -129,13 +139,20 @@ def wait_sms_code(
 ) -> str | None:
     """轮询短信直到提取到验证码或超时。
 
-    每 ``interval`` 秒调一次 ``sms.get_msg``；提取到验证码立即返回；
+    每 ``interval`` 秒调一次 ``sms.get_msg``；提取到验证码立即返回。
+    平台抖动（HTTP 5xx / 读超时，``SmsError.retryable``）视为「本次没拿到」继续
+    下一轮，不作废整个号码尝试；业务错误（token 错、号码已释放等）立即抛出。
     注入时钟显示的已用时间 >= ``timeout`` 时返回 None。测试注入假 clock /
     sleep，绝不真实阻塞。
     """
     start = clock()
     while True:
-        code = extract_code(sms.get_msg(phone, keyword=keyword))
+        try:
+            code = extract_code(sms.get_msg(phone, keyword=keyword))
+        except SmsError as exc:
+            if not exc.retryable:
+                raise  # 业务错误立刻失败，保留原始原因
+            code = None  # 抖动按「尚未收到」处理，仍受 timeout 总时长约束
         if code is not None:
             return code
         if clock() - start >= timeout:

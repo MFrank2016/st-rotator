@@ -43,6 +43,7 @@ from st_rotator.replenish import (
     spend_ok,
     today_str,
 )
+from st_rotator.sms import SmsError
 
 # 生成器参数校验用的字符集正则（与 replenish.py 一致，排除 $ { }）
 # 用户名固定为 8 位 ASCII 字母 + 4 位数字
@@ -137,6 +138,25 @@ class _FakeSms:
         if self.msg_queue:
             return self.msg_queue.pop(0)
         return self.msg
+
+
+class _FlakyBalanceSms(_FakeSms):
+    """left_amount 前 ``failures`` 次抛 SmsError（默认平台抖动 500，可改为业务错误）。"""
+
+    def __init__(self, *, failures: int, retryable: bool = True, **kwargs):
+        super().__init__(**kwargs)
+        self._balance_failures = failures
+        self._retryable = retryable
+
+    def left_amount(self) -> float:
+        self.left_calls.append(1)
+        if self._balance_failures > 0:
+            self._balance_failures -= 1
+            raise SmsError(
+                "leftAmount HTTP 500: <html>Tomcat error</html>",
+                retryable=self._retryable,
+            )
+        return self.balance
 
 
 class _FakeAuthn:
@@ -740,6 +760,63 @@ class ReplenishWorkerTest(unittest.TestCase):
 
         self.assertEqual(self._status(worker), ReplenishWorker.STATUS_BLOCKED_CAP)
         self.assertEqual(sms.phone_calls, [])  # 未取号
+
+    # 8b. 查余额短暂失败：前 2 次 SmsError、第 3 次成功 -> 仍能取号注册
+    def test_balance_read_retries_transient_errors(self):
+        registry = self._registry()
+        sms = _FlakyBalanceSms(failures=2, phones=["13800000015"])
+        worker = self._worker(
+            sms=sms, authn=_FakeAuthn(), keys=_FakeKeys(), registry=registry, target=1
+        )
+        with mock.patch("st_rotator.replenish.time.sleep") as sleep:
+            worker.run_once()
+
+        self.assertEqual(len(sms.left_calls), 3)
+        self.assertEqual([c.args for c in sleep.call_args_list], [(2.0,), (2.0,)])
+        self.assertEqual(len(self.persist_calls), 1)
+        self.assertEqual(self.persist_calls[0][1], "13800000015")
+        self.assertEqual(self._status(worker), ReplenishWorker.STATUS_OK)
+
+    # 8c. 查余额连续 3 次失败 -> 仍按原逻辑计为号码失败，整轮收敛为 check_error
+    def test_balance_read_failure_after_retries_fails_number(self):
+        registry = self._registry()
+        sms = _FlakyBalanceSms(failures=99, phones=["13800000016"])
+        worker = self._worker(
+            sms=sms, authn=_FakeAuthn(), keys=_FakeKeys(), registry=registry, target=1
+        )
+        with mock.patch("st_rotator.replenish.time.sleep"):
+            worker.run_once()
+
+        # 每个号码失败前都试满 3 次，且从未取号 / 落账
+        self.assertEqual(
+            len(sms.left_calls), NUMBER_FAILURE_MAX * replenish.BALANCE_RETRY_MAX
+        )
+        self.assertEqual(sms.phone_calls, [])
+        self.assertEqual(self.persist_calls, [])
+        self.assertEqual(self._status(worker), ReplenishWorker.STATUS_CHECK_ERROR)
+        entries = registry.registrations()
+        self.assertEqual(len(entries), NUMBER_FAILURE_MAX)
+        self.assertFalse(entries[0]["success"])
+
+    # 8d. 查余额遇业务错误（不可重试）不重试：该号码按原逻辑计为失败
+    def test_balance_read_non_retryable_error_fails_fast(self):
+        registry = self._registry()
+        sms = _FlakyBalanceSms(failures=99, retryable=False, phones=["13800000017"])
+        worker = self._worker(
+            sms=sms, authn=_FakeAuthn(), keys=_FakeKeys(), registry=registry, target=1
+        )
+        with mock.patch("st_rotator.replenish.time.sleep") as sleep:
+            worker.run_once()
+
+        # 每个号码只读一次余额、全程不 sleep；连续失败仍按号码失败计数到本轮放弃
+        self.assertEqual(len(sms.left_calls), NUMBER_FAILURE_MAX)
+        self.assertEqual(sleep.call_count, 0)
+        self.assertEqual(sms.phone_calls, [])
+        self.assertEqual(self.persist_calls, [])
+        self.assertEqual(self._status(worker), ReplenishWorker.STATUS_CHECK_ERROR)
+        entries = registry.registrations()
+        self.assertEqual(len(entries), NUMBER_FAILURE_MAX)
+        self.assertFalse(entries[0]["success"])
 
     # ------------------------------------------------------------ 9. S6 需要滑块
     def test_captcha_required_aborts_cycle_no_spend(self):
