@@ -31,11 +31,18 @@ import json
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .client import StRotator, note_serve_begin, note_serve_end
+from .client import (
+    StRotator,
+    begin_access_trace,
+    end_access_trace,
+    note_serve_begin,
+    note_serve_end,
+)
 from .errors import (
     AllKeysInvalid,
     ApiError,
@@ -110,6 +117,23 @@ def _estimate_messages_tokens(messages: Any) -> int:
 
 def _elapsed_ms(start: float) -> float:
     return (time.monotonic() - start) * 1000.0
+
+
+def _format_hits(hits: list[tuple[str, str]]) -> tuple[str, str]:
+    """把本次请求命中的账号 / Key 压成最多 2 个（保留最后一次），其余记 +N。"""
+    unique: dict[tuple[str, str], None] = {}
+    for pair in hits:  # 重复命中只留最后一次出现的位置
+        unique.pop(pair, None)
+        unique[pair] = None
+    pairs = list(unique)[-2:]
+    extra = len(unique) - len(pairs)
+    acct = ",".join(account or "-" for account, _ in pairs) or "-"
+    key = ",".join(masked for _, masked in pairs) or "-"
+    if extra:
+        acct = f"{acct}+{extra}"
+        key = f"{key}+{extra}"
+    return acct, key
+
 
 MAX_BODY_BYTES = 32 * 1024 * 1024
 
@@ -241,7 +265,18 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
     subkeys: "SubKeyManager | None" = None
     _auth_subkey: "SubKey | None" = None
 
+    # 请求级访问日志的采集点（do_POST 每条请求开头重置）
+    _req_started: float | None = None
+    _sent_status: int | None = None
+    _sent_bytes: int = 0
+    _access_err: str | None = None
+
     # ------------------------------------------------------------ 基础设施
+
+    def send_response(self, code: int, message: str | None = None) -> None:
+        # 记下真正发出去的状态码，访问日志用它（含流式的 200 与错误分支）
+        self._sent_status = code
+        super().send_response(code, message)
 
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
         if not self.verbose:
@@ -376,6 +411,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
                 self.send_header("Retry-After", str(int(retry_after) + 1))
             self.end_headers()
             self.wfile.write(body)
+            self._sent_bytes += len(body)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
@@ -484,6 +520,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         """按 HTTP/1.1 chunked 编码写一段数据（SSE 必须边算边发，不能缓冲）。"""
         self.wfile.write(b"%X\r\n" % len(data) + data + b"\r\n")
         self.wfile.flush()
+        self._sent_bytes += len(data)
 
     def _end_stream(self) -> None:
         self.wfile.write(b"0\r\n\r\n")
@@ -563,6 +600,10 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self) -> None:  # noqa: N802
+        self._req_started = time.monotonic()
+        self._sent_status = None
+        self._sent_bytes = 0
+        self._access_err = None
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         # 登录 / 登出必须在任何鉴权之前处理
@@ -668,25 +709,68 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         self._send_redirect(303, "/login", {"Set-Cookie": cookie})
 
     def _handle_chat(self, raw: bytes) -> None:
-        if self._paused:
-            self._send_json(
-                503,
-                error_payload(
-                    "gateway paused from console", "service_unavailable", "503"
-                ),
-            )
-            return
-        # 告诉烧点模块"有用户在等"，让它主动让路（小内存设备上这一步直接决定 TTFT）
-        note_serve_begin()
+        started = self._req_started or time.monotonic()
+        rid = uuid.uuid4().hex[:8]
+        info: dict[str, Any] = {"model": None, "stream": False}
+        trace = None
         try:
-            self._handle_chat_inner(raw)
+            if self._paused:
+                self._send_json(
+                    503,
+                    error_payload(
+                        "gateway paused from console", "service_unavailable", "503"
+                    ),
+                )
+                return
+            # 告诉烧点模块"有用户在等"，让它主动让路（小内存设备上这一步直接决定 TTFT）
+            note_serve_begin()
+            trace = begin_access_trace()
+            try:
+                self._handle_chat_inner(raw, info)
+            except Exception as exc:
+                # 未预期的异常：记下类型名再原样抛出，行为不变
+                self._access_err = type(exc).__name__
+                raise
+            finally:
+                note_serve_end()
         finally:
-            note_serve_end()
+            end_access_trace()
+            self._log_access(rid, started, info, trace)
 
-    def _handle_chat_inner(self, raw: bytes) -> None:
+    def _log_access(
+        self,
+        rid: str,
+        started: float,
+        info: Mapping[str, Any],
+        trace: Any,
+    ) -> None:
+        """每个 chat 请求结束写一行访问日志；日志本身出错绝不能影响请求。"""
+        try:
+            sink = type(self).log_sink
+            if sink is None:
+                return
+            acct, key = _format_hits(trace.hits if trace is not None else [])
+            upstream = trace.status if trace is not None else None
+            sink(
+                f"access rid={rid} path={CHAT_PATH}"
+                f" model={info.get('model') or '-'}"
+                f" stream={1 if info.get('stream') else 0}"
+                f" status={self._sent_status or 0}"
+                f" dur_ms={int((time.monotonic() - started) * 1000)}"
+                f" attempts={trace.attempts if trace is not None else 0}"
+                f" acct={acct} key={key}"
+                f" upstream={upstream if upstream is not None else '-'}"
+                f" err={self._access_err or '-'}"
+                f" bytes={self._sent_bytes}"
+            )
+        except Exception:  # pragma: no cover - 访问日志失败不影响请求
+            pass
+
+    def _handle_chat_inner(self, raw: bytes, info: dict[str, Any]) -> None:
         try:
             payload = json.loads(raw or b"{}")
         except json.JSONDecodeError as exc:
+            self._access_err = type(exc).__name__
             self._send_json(
                 400, error_payload(f"invalid JSON body: {exc}", "invalid_request_error")
             )
@@ -702,6 +786,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         stream = bool(params.pop("stream", False))
         model = params.pop("model", None)
         messages = params.pop("messages", None)
+        info["model"], info["stream"] = model, stream
         if not messages:
             self._send_json(
                 400, error_payload("'messages' is required", "invalid_request_error")
@@ -756,9 +841,11 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         try:
             result = self.rotator.chat(messages, model=model, headers=headers, **params)
         except ApiError as exc:
+            self._access_err = type(exc).__name__
             self._send_json(exc.status, _passthrough_error(exc.status, exc.body))
             return
         except RotationExhausted as exc:
+            self._access_err = type(exc).__name__
             status = exc.last_status if (exc.last_status or 0) >= 400 else 502
             self._send_json(
                 status, error_payload(str(exc), "upstream_exhausted", str(status))
@@ -768,6 +855,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             )
             return
         except NoAvailableKey as exc:
+            self._access_err = type(exc).__name__
             self._send_json(
                 429,
                 error_payload(str(exc), "rate_limit_exceeded", "429"),
@@ -778,9 +866,11 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             )
             return
         except AllKeysInvalid as exc:
+            self._access_err = type(exc).__name__
             self._send_json(503, error_payload(str(exc), "all_keys_invalid", "503"))
             return
         except RotatorError as exc:
+            self._access_err = type(exc).__name__
             self._send_json(502, error_payload(str(exc), "upstream_error", "502"))
             return
         self._note_usage(result.get("usage"))
@@ -815,9 +905,11 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
                 pass
             return
         except ApiError as exc:
+            self._access_err = type(exc).__name__
             self._send_json(exc.status, _passthrough_error(exc.status, exc.body))
             return
         except RotationExhausted as exc:
+            self._access_err = type(exc).__name__
             status = exc.last_status if (exc.last_status or 0) >= 400 else 502
             self._send_json(
                 status, error_payload(str(exc), "upstream_exhausted", str(status))
@@ -827,6 +919,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             )
             return
         except NoAvailableKey as exc:
+            self._access_err = type(exc).__name__
             self._send_json(
                 429,
                 error_payload(str(exc), "rate_limit_exceeded", "429"),
@@ -837,9 +930,11 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             )
             return
         except AllKeysInvalid as exc:
+            self._access_err = type(exc).__name__
             self._send_json(503, error_payload(str(exc), "all_keys_invalid", "503"))
             return
         except RotatorError as exc:
+            self._access_err = type(exc).__name__
             self._send_json(502, error_payload(str(exc), "upstream_error", "502"))
             return
 
@@ -856,6 +951,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             )
         except RotatorError as exc:
             # 已经发出 200 了，改不了状态码，只能补一条 error 事件收尾
+            self._access_err = type(exc).__name__
             try:
                 self._write_chunk(
                     self._sse(error_payload(str(exc), "upstream_error", "502"))

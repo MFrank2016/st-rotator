@@ -3,6 +3,26 @@
 版本号规则与发版标准流程见 [AGENTS.md](AGENTS.md)。
 一句话规则：**小版本 `+0.0.1`**（如 `1.3.0 → 1.3.1`），**大版本 `+0.1`**（如 `1.3.0 → 1.4.0`）。
 
+## [1.6.0] - 2026-10-26
+
+### 新增
+
+- **请求级访问日志**。每个 `/v1/chat/completions` 请求（流式与非流式）结束时在
+  `rotator.log` 追加一行 INFO 级日志，key=value 空格分隔，便于 grep / awk 定位
+  「某条请求为什么慢」：
+
+  ```
+  access rid=<8位> path=/v1/chat/completions model=<model> stream=<0|1> status=<HTTP状态码> dur_ms=<整数> attempts=<上游尝试次数> acct=<命中账号名或-> key=<Key前6位...后4位或-> upstream=<上游状态码或-> err=<错误类型或-> bytes=<返回字节数>
+  ```
+
+  `dur_ms` 从收到请求算到响应写完（流式算到流结束）；`attempts` 是本次请求实际
+  打到上游的次数（含重试）；`acct` / `key` 取最后一次尝试（成功即最后成功那次），
+  多个用逗号拼接、最多 2 个，超出记 `+N`；`upstream` 取最后一次上游状态码；
+  失败时 `err` 记异常类型名（如 `RotationExhausted`、`StreamInterrupted`）。
+  不记录 prompt、请求体、完整 Key 与 Authorization；日志逻辑整体包在 try/except 里，
+  写日志失败只吞掉异常，不影响请求本身，也不改动重试 / 冷却 / 选路 / 状态码与
+  现有日志格式。
+
 ## [1.5.1] - 2026-10-26
 
 ### 修复

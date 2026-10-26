@@ -155,6 +155,40 @@ def serve_inflight() -> int:
         return _SERVE_INFLIGHT
 
 
+# ------------------------------------------------------------ 请求级访问轨迹
+# 网关要写一行「这个客户端请求打了几次上游、命中哪个账号」的访问日志。
+# ThreadingHTTPServer 一个请求一个线程，流式生成器也在同一线程里消费，
+# 所以 thread-local 足够，不必给 chat()/chat_stream_raw() 加返回值（那会改接口）。
+class AccessTrace:
+    """单次客户端请求的上游轨迹。"""
+
+    __slots__ = ("attempts", "hits", "status")
+
+    def __init__(self) -> None:
+        self.attempts = 0
+        self.hits: list[tuple[str, str]] = []  # (账号名, 脱敏 Key)
+        self.status: int | None = None  # 最后一次上游尝试的状态码
+
+
+_TRACE_LOCAL = threading.local()
+
+
+def begin_access_trace() -> AccessTrace:
+    """开始记录当前线程的访问轨迹（网关每个请求调一次）。"""
+    trace = AccessTrace()
+    _TRACE_LOCAL.trace = trace
+    return trace
+
+
+def end_access_trace() -> None:
+    """结束记录，避免 keep-alive 复用线程时残留上一条请求的轨迹。"""
+    _TRACE_LOCAL.trace = None
+
+
+def _current_trace() -> AccessTrace | None:
+    return getattr(_TRACE_LOCAL, "trace", None)
+
+
 def available_mb() -> float | None:
     """Linux 下返回 /proc/meminfo 的 MemAvailable（MB）；其他平台返回 None。"""
     try:
@@ -550,9 +584,20 @@ class StRotator:
         with self._attempts_lock:
             return self._upstream_attempts
 
-    def _note_upstream_attempt(self) -> None:
+    def _note_upstream_attempt(self, key: ApiKey | None = None) -> None:
         with self._attempts_lock:
             self._upstream_attempts += 1
+        trace = _current_trace()
+        if trace is not None:
+            trace.attempts += 1
+            trace.status = None  # 只看最后一次尝试的状态码
+            if key is not None:
+                trace.hits.append((key.account, key.masked))
+
+    def _note_upstream_status(self, status: int) -> None:
+        trace = _current_trace()
+        if trace is not None:
+            trace.status = status
 
     # ------------------------------------------------------------ 运行时控制
     #
@@ -1087,12 +1132,13 @@ class StRotator:
             retryable = False
             try:
                 started = self._clock()
-                self._note_upstream_attempt()
+                self._note_upstream_attempt(key)
                 req_headers = dict(headers) if headers else {}
                 req_headers.update(self._auth(key))
                 response = self._client.request(
                     method, path, json_body=payload, headers=req_headers
                 )
+                self._note_upstream_status(response.status)
                 body = safe_text(response) if response.status >= 400 else ""
                 action, retry_after = classify(response, body)
 
@@ -1210,12 +1256,13 @@ class StRotator:
             retryable = False
             try:
                 started = self._clock()
-                self._note_upstream_attempt()
+                self._note_upstream_attempt(key)
                 req_headers = dict(headers) if headers else {}
                 req_headers.update(self._auth(key))
                 response = self._client.request(
                     "POST", path, json_body=payload, headers=req_headers, stream=True
                 )
+                self._note_upstream_status(response.status)
                 body = safe_text(response) if response.status >= 400 else ""
                 action, retry_after = classify(response, body)
 
