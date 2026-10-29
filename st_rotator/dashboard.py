@@ -420,6 +420,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <span>当前生效模型</span>
         <select id="model-select"></select>
       </label>
+      <div style="position:relative;margin-bottom:9px">
+        <span style="display:block;font-size:11.5px;color:var(--muted);margin-bottom:4px">可用模型</span>
+        <button type="button" id="avail-btn" style="width:100%;box-sizing:border-box;height:33px;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:var(--card);color:var(--text);border:1px solid var(--border-strong);border-radius:7px;padding:0 10px;font-size:13px;cursor:pointer">可用模型：全部</button>
+        <div id="avail-menu" style="display:none;position:absolute;top:100%;left:0;right:0;z-index:30;margin-top:4px;background:var(--card);border:1px solid var(--border-strong);border-radius:8px;padding:8px;box-shadow:0 8px 24px rgba(0,0,0,.18)">
+          <input id="avail-search" type="text" placeholder="搜索模型…" autocomplete="off" style="margin-bottom:6px">
+          <div id="avail-list" style="max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:6px;padding:2px"></div>
+          <div class="row" style="margin-top:8px;gap:6px">
+            <button type="button" class="tiny" id="avail-all">全选</button>
+            <button type="button" class="tiny" id="avail-none">清空</button>
+            <button type="button" class="primary tiny" id="avail-apply" style="margin-left:auto">应用</button>
+          </div>
+        </div>
+        <div id="avail-note" class="muted" style="font-size:11.5px;margin-top:5px"></div>
+      </div>
       <div id="model-meta" style="font-size:12px;margin-bottom:6px"></div>
       <div id="model-count" class="muted" style="font-size:11.5px;margin-bottom:11px"></div>
       <div class="row">
@@ -1346,11 +1360,66 @@ function renderModels(state) {
   } else if (!S.models.length) {
     count.textContent = "暂无清单，点「刷新清单」从上游拉取。";
   } else {
-    var hidden = catalog.hidden || [];
-    count.textContent = "共 " + S.models.length + " 个模型" + (catalog.cached ? "（缓存）" : "（刚拉取）")
-      + (hidden.length ? "，已按配置隐藏 " + hidden.length + " 个：" + hidden.join("、") : "");
+    var blocked = state.blocked || [];
+    var avail = state.available_models || [];
+    count.textContent = "共 " + (S.models.length + blocked.length) + " 个模型" + (catalog.cached ? "（缓存）" : "（刚拉取）")
+      + (avail.length ? "，已限制：" + blocked.length + " 个模型不在可用范围" : "，未限制");
   }
+  renderAvailableModels(state);
   updateModelMeta();
+}
+
+/* -------------------------------------------------------------- 可用模型白名单 */
+/* 2s 轮询会重绘整页：availDirty 为真时保留用户未提交的勾选，不被服务端状态覆盖。 */
+var availSelected = [];
+var availDirty = false;
+var availCands = [];
+
+/* 候选集 = 上游清单 ∪ 被拦下的 ∪ 已保存的（已保存但已不在上游的也要能取消）。 */
+function availCandidateIds(state) {
+  var ids = ((state.models || {}).models || []).map(function (m) { return m.id; })
+    .concat(state.blocked || []).concat(state.available_models || []);
+  var seen = {}, out = [];
+  ids.forEach(function (id) { if (id && !seen[id]) { seen[id] = 1; out.push(id); } });
+  out.sort();
+  return out;
+}
+
+function availVisibleIds() {
+  var query = ($("avail-search").value || "").trim().toLowerCase();
+  return availCands.filter(function (id) { return !query || id.toLowerCase().indexOf(query) !== -1; });
+}
+
+function updateAvailLabel(state) {
+  var saved = (state && state.available_models) || [];
+  var label = (!availDirty && !saved.length)
+    ? "可用模型：全部 " + availCands.length + " 个"
+    : "可用模型 " + availSelected.length + " 个";
+  if (availDirty) label += " · 未应用";
+  $("avail-btn").textContent = label;
+  $("avail-note").textContent = saved.length
+    ? "已限制：仅勾选的 " + saved.length + " 个模型可用。"
+    : "未限制：全部模型可用。";
+}
+
+function renderAvailableModels(state) {
+  availCands = availCandidateIds(state);
+  if (!availDirty) {
+    var saved = state.available_models || [];
+    // 白名单为空 = 全部可用，界面按「全部勾选」展示。
+    availSelected = saved.length ? saved.slice() : availCands.slice();
+  }
+  var list = $("avail-list");
+  var key = availCands.join("\u0000") + "\u0001" + availSelected.join("\u0000") + "\u0001" + $("avail-search").value;
+  if (list.dataset.key !== key) {
+    list.dataset.key = key;
+    list.innerHTML = availVisibleIds().map(function (id) {
+      return '<label style="display:flex;align-items:center;gap:6px;padding:5px 8px;border-radius:6px;cursor:pointer">' +
+        '<input type="checkbox" value="' + esc(id) + '"' + (availSelected.indexOf(id) !== -1 ? " checked" : "") +
+        ' style="width:auto;margin:0;flex:0 0 auto"><span class="mono" style="font-size:12px;overflow-wrap:anywhere">' + esc(id) + '</span></label>';
+    }).join("") || '<div class="muted" style="padding:6px 8px">（无匹配模型）</div>';
+  }
+  updateAvailLabel(state);
 }
 
 function updateModelMeta() {
@@ -1955,6 +2024,22 @@ async function onImportKeys() {
   finally { btn.disabled = false; btn.textContent = "导入"; }
 }
 
+async function onApplyAvailable() {
+  var models = availSelected.slice().sort();
+  var btn = $("avail-apply");
+  btn.disabled = true;
+  try {
+    var result = await api("/api/model/available", { method: "POST", body: JSON.stringify({ models: models }) });
+    availDirty = false;
+    var saved = result.available_models || [];
+    availSelected = saved.length ? saved.slice() : availCandidateIds(lastState).slice();
+    $("avail-menu").style.display = "none";
+    toast(saved.length ? "已应用，可用模型 " + saved.length + " 个" : "已应用：未限制，全部模型可用", "ok");
+    await refreshState();
+  } catch (err) { toast(err.message, "err"); }
+  finally { btn.disabled = false; }
+}
+
 async function onApplyModel() {
   var model = $("model-select").value;
   if (!model) return;
@@ -2368,6 +2453,41 @@ function bind() {
   };
   $("btn-copy-base").onclick = function () { copyText((lastGateway.base_url || ""), "网关地址"); };
   $("model-select").onchange = updateModelMeta;
+  $("avail-btn").onclick = function (event) {
+    event.stopPropagation();
+    var menu = $("avail-menu");
+    menu.style.display = menu.style.display === "block" ? "none" : "block";
+    if (menu.style.display === "block") renderAvailableModels(lastState);
+  };
+  $("avail-menu").onclick = function (event) { event.stopPropagation(); };
+  $("avail-search").oninput = function () { renderAvailableModels(lastState); };
+  $("avail-list").onchange = function (event) {
+    var box = event.target;
+    if (!box || box.type !== "checkbox") return;
+    var at = availSelected.indexOf(box.value);
+    if (box.checked && at === -1) availSelected.push(box.value);
+    if (!box.checked && at !== -1) availSelected.splice(at, 1);
+    availDirty = true;
+    updateAvailLabel(lastState);
+  };
+  $("avail-all").onclick = function () {
+    availVisibleIds().forEach(function (id) {
+      if (availSelected.indexOf(id) === -1) availSelected.push(id);
+    });
+    availDirty = true;
+    renderAvailableModels(lastState);
+  };
+  $("avail-none").onclick = function () {
+    var visible = availVisibleIds();
+    availSelected = availSelected.filter(function (id) { return visible.indexOf(id) === -1; });
+    availDirty = true;
+    renderAvailableModels(lastState);
+  };
+  $("avail-apply").onclick = onApplyAvailable;
+  document.addEventListener("click", function () { $("avail-menu").style.display = "none"; });
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") $("avail-menu").style.display = "none";
+  });
   $("new-key").addEventListener("keydown", function (event) { if (event.key === "Enter") onAddKeys(); });
   $("btn-clearlog").onclick = function () { $("logbox").innerHTML = ""; };
   $("btn-clear-replenish-log").onclick = function () { $("replenish-logbox").innerHTML = ""; };

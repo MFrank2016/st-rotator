@@ -391,6 +391,17 @@ class ConsoleState:
         rate = self.rotator.limiter.stats()
         metrics = self.metrics.snapshot()
         metrics["upstream_attempts"] = self.rotator.upstream_attempts
+        catalog = self.rotator.available_models()
+        flt = (
+            self.rotator.model_filter()
+            if hasattr(self.rotator, "model_filter")
+            else None
+        )
+        blocked = (
+            list(catalog.get("blocked") or [])
+            if isinstance(catalog, Mapping)
+            else []
+        )
         return {
             "version": __version__,
             "account_names": [a.name for a in self.config.accounts],
@@ -401,7 +412,9 @@ class ConsoleState:
             "keys": self._pool_snapshot(),
             "rate_control": rate,
             "metrics": metrics,
-            "models": self.rotator.available_models(),
+            "models": catalog,
+            "available_models": list(flt.available) if flt is not None else [],
+            "blocked": blocked,
             "default_model": self.config.default_model,
             "log_file": self.log_file,
             "subkeys": self._subkeys_snapshot(),
@@ -1057,6 +1070,29 @@ class ConsoleState:
             {"ok": True, "model": model, "message": f"默认模型已切换为 {model}{note}"}
         )
 
+    def set_available_models(self, models: Any) -> UiResponse:
+        """更新可用模型白名单：空数组 = 全部放行。"""
+        if not isinstance(models, list) or not all(
+            isinstance(name, str) for name in models
+        ):
+            return UiResponse.error("models 必须是字符串数组")
+        with self.lock:
+            self.rotator.set_model_filter(models)
+            available = self.store.set_model_filter(models)
+        self._save_and_log(
+            "可用模型白名单更新为 "
+            + ("（空，全部放行）" if not available else "、".join(available))
+        )
+        catalog = self.rotator.available_models()
+        blocked = (
+            list(catalog.get("blocked") or [])
+            if isinstance(catalog, Mapping)
+            else []
+        )
+        return UiResponse.json(
+            {"ok": True, "available_models": available, "blocked": blocked}
+        )
+
     def set_options(self, payload: Mapping[str, Any]) -> UiResponse:
         """改运行参数：调度策略 / 限速 / 重试预算。改动立即生效并落盘。"""
         changes: list[str] = []
@@ -1485,6 +1521,8 @@ class ConsoleState:
                     return self.rotate_account_key(str(payload.get("account") or ""))
                 if path == "/api/model":
                     return self.set_model(str(payload.get("model") or ""))
+                if path == "/api/model/available":
+                    return self.set_available_models(payload.get("models"))
                 if path == "/api/models/refresh":
                     return self.refresh_models()
                 if path == "/api/options":

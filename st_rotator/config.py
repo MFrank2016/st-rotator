@@ -6,7 +6,6 @@ Key 支持 ``${ENV_VAR}`` / ``${ENV_VAR:-默认值}`` 占位符，避免把密�
 
 from __future__ import annotations
 
-import fnmatch
 import json
 import os
 import re
@@ -569,20 +568,17 @@ class LeakGuardConfig:
 
 @dataclass
 class ModelFilterConfig:
-    """模型清单过滤：把"几乎不可用"的模型从清单里藏掉。
+    """模型白名单：只有名单内的模型能通过网关。
 
-    有些上游会在 ``/v1/models`` 里列出实际几乎跑不通的模型（实测商汤的
-    ``deepseek-v4.1-flash`` 就经常不可用）。把它们配进 ``hidden`` 后，
-    **控制台的选择器和网关透传的 ``/v1/models`` 都不会再列出它们**，
-    省得自己或上层 agent 误选。
+    ``available`` 为空（或未配置）表示**不限制**，全部模型放行；非空时它同时
+    决定两件事：``/v1/models`` 只返回名单内的模型，请求里点名名单外的模型会被
+    网关以 400 拦下（见 ``client.model_block_reason``）。
 
     Attributes:
-        hidden: 要隐藏的模型名列表，支持 ``*`` 通配（如 ``deepseek-v4.1-*``）。
-            只影响"清单展示"，**不拦截显式请求**——上层点名要这个模型时，
-            网关照常转发给上游（该报什么错就报什么错），不做额外限制。
+        available: 允许使用的模型名列表；为空 = 全部放行。
     """
 
-    hidden: list[str] = field(default_factory=list)
+    available: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any] | None) -> "ModelFilterConfig":
@@ -590,31 +586,31 @@ class ModelFilterConfig:
             return cls()
         if not isinstance(data, Mapping):
             raise ConfigError("model_filter 必须是对象")
-        unknown = set(data) - set(cls.__dataclass_fields__)
+        # hidden 是已废弃的旧黑名单字段：允许它存在但忽略取值，保证老配置还能启动。
+        unknown = set(data) - set(cls.__dataclass_fields__) - {"hidden"}
         if unknown:
             raise ConfigError(f"model_filter 存在未知字段: {sorted(unknown)}")
-        raw = data.get("hidden") or []
+        raw = data.get("available") or []
         if isinstance(raw, str):
             raise ConfigError(
-                'model_filter.hidden 必须是数组，例如 ["deepseek-v4.1-flash"]'
+                'model_filter.available 必须是数组，例如 ["deepseek-v4.1-flash"]'
             )
         if not isinstance(raw, (list, tuple)):
-            raise ConfigError("model_filter.hidden 必须是数组")
-        hidden: list[str] = []
+            raise ConfigError("model_filter.available 必须是数组")
+        available: list[str] = []
         for item in raw:
             if not isinstance(item, str):
-                raise ConfigError(f"model_filter.hidden 只接受字符串，收到 {item!r}")
+                raise ConfigError(f"model_filter.available 只接受字符串，收到 {item!r}")
             name = item.strip()
-            if name and name not in hidden:  # 去重但保持书写顺序
-                hidden.append(name)
-        return cls(hidden=hidden)
+            if name and name not in available:  # 去重但保持书写顺序
+                available.append(name)
+        return cls(available=available)
 
-    def is_hidden(self, model_id: str) -> bool:
-        """模型是否命中隐藏规则（精确匹配或 ``*`` 通配）。"""
-        name = (model_id or "").strip()
-        if not name:
-            return False
-        return any(fnmatch.fnmatchcase(name, pattern) for pattern in self.hidden)
+    def is_available(self, model_id: str) -> bool:
+        """模型是否在白名单内；白名单为空表示全部放行。"""
+        if not self.available:
+            return True
+        return (model_id or "").strip() in self.available
 
 
 @dataclass
@@ -1124,6 +1120,24 @@ class ConfigStore:
             raise ConfigError("模型名不能为空")
         self._raw["default_model"] = model
         return model
+
+    def set_model_filter(self, available: list[str]) -> list[str]:
+        """把可用模型白名单写回文件（空列表 = 全部放行）。
+
+        顺手删掉旧的 ``hidden`` 键，免得重启时又被当成未知/旧配置读一遍。
+        """
+        cleaned: list[str] = []
+        for name in available:
+            name = (name or "").strip()
+            if name and name not in cleaned:
+                cleaned.append(name)
+        section = self._raw.get("model_filter")
+        if not isinstance(section, dict):
+            section = {}
+            self._raw["model_filter"] = section
+        section.pop("hidden", None)
+        section["available"] = cleaned
+        return list(cleaned)
 
     def set_strategy(self, strategy: str) -> str:
         if strategy not in STRATEGIES:

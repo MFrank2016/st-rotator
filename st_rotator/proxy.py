@@ -793,6 +793,16 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         params = dict(payload)
         stream = bool(params.pop("stream", False))
         model = params.pop("model", None)
+        # 白名单外的模型直接拦在网关，别浪费一次上游调用（默认模型始终放行）。
+        block_reason = getattr(self.rotator, "model_block_reason", None)
+        reason = block_reason(model) if block_reason else ""
+        if reason:
+            self._record_subkey_usage(ok=False, model=model)
+            self._send_json(
+                400,
+                error_payload(reason, "invalid_request_error", "model_not_available"),
+            )
+            return
         messages = params.pop("messages", None)
         info["model"], info["stream"] = model, stream
         if not messages:
@@ -1104,6 +1114,21 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
                     error_payload(f"invalid JSON body: {exc}", "invalid_request_error"),
                 )
                 return
+        # 透传端点只在请求体显式带 model 时做白名单拦截（未带就交给上游默认）。
+        if isinstance(body, Mapping) and body.get("model") is not None:
+            block_reason = getattr(self.rotator, "model_block_reason", None)
+            model = body.get("model")
+            # 传原始值：类型守卫（如非字符串）在 model_block_reason 里判定。
+            reason = block_reason(model) if block_reason else ""
+            if reason:
+                self._record_subkey_usage(ok=False, model=str(model))
+                self._send_json(
+                    400,
+                    error_payload(
+                        reason, "invalid_request_error", "model_not_available"
+                    ),
+                )
+                return
         if self.console is not None:
             self.console.metrics.note_activity()
         headers = self._forwardable_headers()
@@ -1135,8 +1160,8 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         except RotatorError as exc:
             self._send_json(502, error_payload(str(exc), "upstream_error", "502"))
             return
-        # 模型清单按配置过滤：上层应用看到的清单与控制台保持一致，
-        # 避免 agent 自动挑中那些"几乎不可用"的模型（见 model_filter 配置）。
+        # 模型清单按白名单过滤：上层应用看到的清单与控制台保持一致，
+        # 避免 agent 自动挑中名单外的模型（见 model_filter 配置）。
         if method == "GET" and upstream_path.split("?", 1)[0].rstrip("/") == "models":
             result = self.rotator.filter_models_payload(result)
         if isinstance(result, Mapping):
