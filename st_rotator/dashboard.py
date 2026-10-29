@@ -447,7 +447,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="card" style="margin-bottom:14px">
-    <h2>Key 池 <span class="spacer"></span><span class="muted" id="pool-note" style="text-transform:none;letter-spacing:0"></span><button class="tiny" id="btn-export-accounts">复制全部账号</button><button class="primary" id="btn-import">批量新增</button></h2>
+    <h2>Key 池 <span class="spacer"></span><span class="muted" id="pool-note" style="text-transform:none;letter-spacing:0;min-width:0;overflow-wrap:anywhere"></span><button class="tiny" id="btn-export-accounts">复制全部账号</button><button class="primary" id="btn-import">批量新增</button></h2>
     <div class="row" style="margin-bottom:10px;align-items:flex-end;flex-wrap:wrap">
       <label class="field" style="width:150px;margin-bottom:0"><span>用户名</span>
         <input id="pool-f-user" type="text" placeholder="筛选用户名" autocomplete="off"></label>
@@ -492,7 +492,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </label>
         <label class="field" style="width:104px;margin-bottom:0">
           <span>并发上限</span>
-          <input id="new-concurrency" type="number" min="1" max="64" value="4">
+          <input id="new-concurrency" type="number" min="1" max="64" value="6">
         </label>
         <button class="primary" id="btn-add" style="height:33px">添加</button>
       </div>
@@ -1709,6 +1709,14 @@ function poolFilteredKeys(keys) {
   });
 }
 
+// Key 归属：只列在途用户（空 label 不显示），超过 2 人时只留首个 + 总数
+function ownerSuffix(users) {
+  var list = (users || []).filter(function (u) { return u; });
+  if (!list.length) return "";
+  var text = list.length > 2 ? list[0] + " 等 " + list.length + " 人" : list.join("、");
+  return ' <span class="muted">（' + esc(text) + "）</span>";
+}
+
 function renderPool(state) {
   var keys = state.keys || [];
   var as = (state.account_status) || {};
@@ -1757,7 +1765,8 @@ function renderPool(state) {
             : "") +
         "</td>" +
         '<td class="mono" data-label="Key">' + esc(k.key) + "</td>" +
-        '<td data-label="状态"><span class="pill ' + esc(k.status) + '">' + esc(statusText) + "</span></td>" +
+        '<td data-label="状态"><span style="overflow-wrap:anywhere"><span class="pill ' + esc(k.status) + '">' +
+          esc(statusText) + "</span>" + ownerSuffix(k.inflight_users) + "</span></td>" +
         '<td class="num" data-label="冷却">' + esc(cooldown) + "</td>" +
         '<td class="mono" data-label="RPM">' + esc(k.rpm_window) + "</td>" +
         '<td class="num" data-label="成功 / 失败">' + fmtInt(st.successes) + " / " + fmtInt(st.failures) + "</td>" +
@@ -1794,7 +1803,13 @@ function renderPool(state) {
     if ($("pool-next")) $("pool-next").disabled = S.poolPage >= lastPage;
   }
   var s = state.summary || {};
-  $("pool-note").textContent = s.total ? ("在途 " + s.inflight + " / 共 " + s.total + " 把") : "";
+  var note = s.total ? ("在途 " + s.inflight + " / 共 " + s.total + " 把") : "";
+  var trying = state.trying_users || [];
+  if (trying.length) {
+    note += (note ? " · " : "") + "正在尝试：" + trying.slice(0, 3).join("、") +
+      (trying.length > 3 ? " 等 " + trying.length + " 人" : "");
+  }
+  $("pool-note").textContent = note;
 }
 
 function renderOptions(state) {
@@ -1973,7 +1988,7 @@ async function onAddKeys() {
       body: JSON.stringify({
         keys: raw,
         account: $("new-account").value.trim(),
-        max_concurrency: parseInt($("new-concurrency").value, 10) || 4
+        max_concurrency: parseInt($("new-concurrency").value, 10) || 6
       })
     });
     var msg = "已添加 " + result.added.length + " 把 Key";
@@ -2011,7 +2026,7 @@ async function onImportKeys() {
   var btn = $("btn-import-run"); btn.disabled = true; btn.innerHTML = '<span class="spin">◌</span> 校验中…';
   try {
     var result = await api("/api/keys/import", { method: "POST", body: JSON.stringify({
-      lines: lines, account: $("import-account").value.trim(), max_concurrency: 4 }) });
+      lines: lines, account: $("import-account").value.trim(), max_concurrency: 6 }) });
     var s = result.summary || {};
     $("import-result").innerHTML = "<table><tr><th>行</th><th>输入</th><th>判定</th><th>原因</th></tr>" +
       (result.results || []).map(function (r) {

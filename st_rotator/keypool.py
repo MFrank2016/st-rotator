@@ -26,6 +26,51 @@ from typing import Callable, Iterable, Iterator, Sequence
 from .config import AccountConfig, CooldownConfig
 from .errors import AllKeysInvalid, ConfigError, NoAvailableKey
 
+# ---------------------------------------------------------------- 用户上下文
+#
+# 进程级的「谁在占用 Key / 谁正在尝试」登记表。调度逻辑完全不感知用户，这里只是把
+# 请求线程的标签透传出来给控制台看：``threading.local`` 保证线程之间不串号，注册表
+# 用一把小锁保护（同一用户可能同时有多个请求在别的线程里跑）。
+_USER_CTX = threading.local()
+_TRYING_LOCK = threading.Lock()
+_TRYING: dict[str, int] = {}  # 用户 -> 在途请求数；dict 保持插入顺序，归零即删
+
+
+@contextlib.contextmanager
+def user_context(label: str) -> Iterator[None]:
+    """标记当前线程正在为 ``label`` 这个用户干活（空串表示未知，不登记）。"""
+    label = (label or "").strip()
+    stack = getattr(_USER_CTX, "stack", None)
+    if stack is None:
+        stack = _USER_CTX.stack = []
+    stack.append(label)
+    if label:
+        with _TRYING_LOCK:
+            _TRYING[label] = _TRYING.get(label, 0) + 1
+    try:
+        yield
+    finally:
+        stack.pop()
+        if label:
+            with _TRYING_LOCK:
+                remain = _TRYING.get(label, 0) - 1
+                if remain > 0:
+                    _TRYING[label] = remain
+                else:
+                    _TRYING.pop(label, None)
+
+
+def current_user() -> str:
+    """当前线程的用户标签；不在任何上下文里时返回空串。"""
+    stack = getattr(_USER_CTX, "stack", None)
+    return stack[-1] if stack else ""
+
+
+def trying_users() -> list[str]:
+    """正在尝试（已进入上下文、还没退出）的用户，按首次进入顺序。"""
+    with _TRYING_LOCK:
+        return list(_TRYING)
+
 
 class KeyStatus(str, Enum):
     """Key 的可用性状态。"""
@@ -104,7 +149,7 @@ class AccountState:
         name: str,
         *,
         rpm_limit: int | None = None,
-        max_concurrency: int = 4,
+        max_concurrency: int = 6,
         weight: float = 1.0,
     ) -> None:
         self.name = name
@@ -147,6 +192,7 @@ class ApiKey:
     __slots__ = (
         "id", "key", "account", "rpm_limit", "max_concurrency", "weight", "tags",
         "status", "cooldown_until", "cooldown_set_at", "consecutive_failures", "inflight",
+        "inflight_users", "last_user",
         "last_used", "last_error", "stats", "_window", "account_state",
     )
 
@@ -157,7 +203,7 @@ class ApiKey:
         *,
         id: int = 0,
         rpm_limit: int | None = None,
-        max_concurrency: int = 4,
+        max_concurrency: int = 6,
         weight: float = 1.0,
         tags: Sequence[str] = (),
         account_state: AccountState | None = None,
@@ -174,6 +220,8 @@ class ApiKey:
         self.cooldown_set_at = 0.0
         self.consecutive_failures = 0
         self.inflight = 0
+        self.inflight_users: list[str] = []  # 与 inflight 一一对应（空串=未知用户）
+        self.last_user = ""                  # 最近一次非空用户
         self.last_used = 0.0
         self.last_error = ""
         self.stats = KeyStats()
@@ -226,7 +274,10 @@ class ApiKey:
             return False
         return self.available_at(now) <= now
 
-    def to_dict(self, now: float) -> dict[str, object]:
+    def to_dict(
+        self, now: float, *, include_users: bool = False
+    ) -> dict[str, object]:
+        """``include_users`` 只在需鉴权的控制台打开；``/stats`` 是公开端点，不能带用户名。"""
         self._prune(now)
         cooldown = max(0.0, self.cooldown_until - now)
         if self.account_state is not None:
@@ -236,7 +287,7 @@ class ApiKey:
         else:
             window_len = len(self._window)
             rpm_limit = self.rpm_limit
-        return {
+        data: dict[str, object] = {
             "id": self.id,
             "account": self.account,
             "key": self.masked,
@@ -248,6 +299,10 @@ class ApiKey:
             "last_error": self.last_error,
             "stats": self.stats.to_dict(),
         }
+        if include_users:
+            data["inflight_users"] = list(self.inflight_users)
+            data["last_user"] = self.last_user
+        return data
 
 
 class KeyPool:
@@ -300,6 +355,12 @@ class KeyPool:
         self._cond = threading.Condition(self._lock)
         self._cursor = 0
 
+    # ------------------------------------------------------------ 用户上下文
+
+    def user_context(self, label: str) -> contextlib.AbstractContextManager[None]:
+        """标记本次请求的用户，见模块级 :func:`user_context`。"""
+        return user_context(label)
+
     # ------------------------------------------------------------ 只读访问
 
     @property
@@ -342,7 +403,7 @@ class KeyPool:
         account: str = "default",
         *,
         rpm_limit: int | None = None,
-        max_concurrency: int = 4,
+        max_concurrency: int = 6,
         weight: float = 1.0,
         tags: Sequence[str] = (),
     ) -> ApiKey:
@@ -490,12 +551,28 @@ class KeyPool:
         with self._cond:
             if key.inflight > 0:
                 key.inflight -= 1
+                # 归属记录与 inflight 一一对应：优先摘掉当前用户，找不到就摘最早的兜底
+                users = key.inflight_users
+                if users:
+                    user = current_user()
+                    if user and user in users:
+                        users.remove(user)
+                    elif "" in users:
+                        # 无上下文的取用（后台线程 / 控制台快照）只摘自己的空标签，
+                        # 不能 pop(0)，否则会抹掉别人正在途中的归属记录。
+                        users.remove("")
+                    else:
+                        users.pop(0)
             if key.account_state is not None and key.account_state.inflight > 0:
                 key.account_state.inflight -= 1
             self._cond.notify_all()
 
     def _reserve(self, key: ApiKey, now: float) -> ApiKey:
         key.inflight += 1
+        user = current_user()
+        key.inflight_users.append(user)
+        if user:
+            key.last_user = user
         key.last_used = now
         key._window.append(now)
         key.stats.requests += 1
@@ -753,11 +830,11 @@ class KeyPool:
 
     # ------------------------------------------------------------ 快照
 
-    def snapshot(self) -> list[dict[str, object]]:
+    def snapshot(self, *, include_users: bool = False) -> list[dict[str, object]]:
         now = self._clock()
         with self._cond:
             self._refresh(now)
-            return [k.to_dict(now) for k in self._keys]
+            return [k.to_dict(now, include_users=include_users) for k in self._keys]
 
     def summary(self) -> dict[str, int]:
         now = self._clock()
@@ -773,4 +850,9 @@ class KeyPool:
                 "cooldown": cooling,
                 "invalid": invalid,
                 "inflight": sum(k.inflight for k in self._keys),
+                # 只暴露数量：/healthz 无鉴权，用户名绝不能出现在这里
+                "active_users": len(
+                    {u for k in self._keys for u in k.inflight_users if u}
+                ),
+                "trying_users": len(trying_users()),
             }

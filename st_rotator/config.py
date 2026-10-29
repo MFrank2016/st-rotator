@@ -632,7 +632,9 @@ class AccountConfig:
     phone: str = ""
     password: str = ""
     rpm_limit: int | None = None
-    max_concurrency: int = 4
+    # 单账号并发上限（同账号多把 Key 共享这几个在途名额）。调高提高吞吐，
+    # 但也可能放大上游 429，需按实际限流窗口压测后再抬。
+    max_concurrency: int = 6
     weight: float = 1.0
     tags: list[str] = field(default_factory=list)
     # Key 最近一次被写入的时间（epoch 秒）；None = 未知（老配置）。
@@ -977,7 +979,7 @@ class ConfigStore:
         account: str | None = None,
         *,
         rpm_limit: int | None = None,
-        max_concurrency: int = 4,
+        max_concurrency: int = 6,
         weight: float = 1.0,
     ) -> dict[str, Any]:
         """把一把 Key 写进配置文件；同名账号则追加，否则新建账号。"""
@@ -1035,7 +1037,7 @@ class ConfigStore:
             "phone": phone,
             "password": password,
             "rpm_limit": None,
-            "max_concurrency": 4,
+            "max_concurrency": 6,
             "weight": 1.0,
             "updated_at": time.time(),
         }

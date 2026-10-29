@@ -148,7 +148,7 @@ class AddAccountTest(unittest.TestCase):
             self.assertEqual(entry["phone"], "13900000000")
             self.assertEqual(entry["password"], "p2")
             self.assertEqual(entry["rpm_limit"], None)
-            self.assertEqual(entry["max_concurrency"], 4)
+            self.assertEqual(entry["max_concurrency"], 6)
             self.assertEqual(entry["weight"], 1.0)
             self.assertEqual(len(store.config.accounts), 2)  # reload 已生效
             self.assertEqual(store.config.accounts[1].user, "u2")
@@ -212,7 +212,7 @@ def test_add_account_survives_save_and_reload(tmp_path):
     assert acct.password == "p2"
     assert acct.api_keys == ["sk-new"]
     assert acct.rpm_limit is None
-    assert acct.max_concurrency == 4
+    assert acct.max_concurrency == 6
     assert acct.weight == 1.0
 
     raw = json.loads(path.read_text(encoding="utf-8"))

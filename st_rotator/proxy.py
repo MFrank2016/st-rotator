@@ -53,6 +53,7 @@ from .errors import (
 )
 from . import modeltest
 from . import ui
+from .keypool import user_context
 from .subkeys import SubKey, SubKeyManager
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -364,6 +365,11 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
     def _authorized(self, *, allow_cookie: bool = False) -> bool:
         return self._auth_kind(allow_cookie=allow_cookie) is not None
 
+    def _request_user(self) -> str:
+        """本次请求归属的用户标签：命中子 Key 用子 Key 名，否则为空串（账号要到调度时才知道）。"""
+        sub = getattr(self, "_auth_subkey", None)
+        return sub.name if sub is not None else ""
+
     def _record_subkey_usage(
         self,
         *,
@@ -593,10 +599,12 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             return
         query_suffix = f"?{parsed.query}" if parsed.query else ""
         if path == MODELS_PATH:
-            self._forward_simple("GET", f"models{query_suffix}")
+            with self.rotator.pool.user_context(self._request_user()):
+                self._forward_simple("GET", f"models{query_suffix}")
             return
         if path.startswith("/v1/"):
-            self._forward_simple("GET", f"{path[4:]}{query_suffix}")
+            with self.rotator.pool.user_context(self._request_user()):
+                self._forward_simple("GET", f"{path[4:]}{query_suffix}")
             return
         self._send_json(
             404, error_payload(f"unknown path {path}", "invalid_request_error")
@@ -655,10 +663,12 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
 
         query_suffix = f"?{parsed.query}" if parsed.query else ""
         if path == CHAT_PATH:
-            self._handle_chat(raw)
+            with self.rotator.pool.user_context(self._request_user()):
+                self._handle_chat(raw)
             return
         if path.startswith("/v1/"):
-            self._forward_simple("POST", f"{path[4:]}{query_suffix}", raw)
+            with self.rotator.pool.user_context(self._request_user()):
+                self._forward_simple("POST", f"{path[4:]}{query_suffix}", raw)
             return
         self._send_json(
             404, error_payload(f"unknown path {path}", "invalid_request_error")

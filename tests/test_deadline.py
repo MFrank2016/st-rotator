@@ -12,6 +12,7 @@ import json
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 
 from st_rotator.client import (
     HttpClient,
@@ -21,6 +22,7 @@ from st_rotator.client import (
 )
 from st_rotator.config import AccountConfig, Config, RateControlConfig
 from st_rotator.errors import DeadlineExceeded
+from st_rotator.keypool import user_context
 from st_rotator.proxy import create_server
 from st_rotator.transport import Response
 
@@ -76,6 +78,8 @@ class _DeadlineRotator:
 
     def __init__(self, config: Config) -> None:
         self.config = config
+        # 网关只从池上取用户上下文，鸭子类型替身给个最小实现即可
+        self.pool = SimpleNamespace(user_context=user_context)
 
     def chat(self, messages, model=None, **kwargs):
         raise DeadlineExceeded("超出单请求时限 0.05s")

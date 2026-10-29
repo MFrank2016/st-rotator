@@ -56,6 +56,7 @@ from .config import (
 )
 from .dashboard import DASHBOARD_HTML, LOGIN_HTML, LOGIN_HTML_INVALID
 from .errors import ConfigError, RotatorError
+from .keypool import trying_users
 from .logs import LogBuffer
 from .subkeys import SubKeyManager
 from .autorenew import AutoRenewWorker
@@ -409,6 +410,8 @@ class ConsoleState:
                 reveal_token=reveal_token, request_base=request_base
             ),
             "summary": self.rotator.pool.summary(),
+            # 右上角「正在尝试」：进程级注册表，只有用户名、没有 Key 信息
+            "trying_users": trying_users(),
             "keys": self._pool_snapshot(),
             "rate_control": rate,
             "metrics": metrics,
@@ -467,7 +470,7 @@ class ConsoleState:
 
     def _pool_snapshot(self) -> list[dict[str, Any]]:
         """Key 池快照，并补上账号的用户名 / 手机号 / Key 最近写入时间，供控制台展示。"""
-        keys = self.rotator.pool.snapshot()
+        keys = self.rotator.pool.snapshot(include_users=True)
         meta = {a.name: a for a in self.config.accounts}
         for item in keys:
             acct = meta.get(str(item.get("account")))
@@ -668,7 +671,7 @@ class ConsoleState:
         raw: str,
         *,
         account: str | None = None,
-        max_concurrency: int = 4,
+        max_concurrency: int = 6,
         rpm_limit: int | None = None,
         verify: bool = True,
     ) -> UiResponse:
@@ -1491,7 +1494,7 @@ class ConsoleState:
                         if payload.get("account")
                         else None,
                         max_concurrency=_clamp_int(
-                            payload.get("max_concurrency"), 4, 1, 64
+                            payload.get("max_concurrency"), 6, 1, 64
                         ),
                         rpm_limit=rpm_limit,
                     )
@@ -1502,7 +1505,7 @@ class ConsoleState:
                         if payload.get("account")
                         else None,
                         max_concurrency=_clamp_int(
-                            payload.get("max_concurrency"), 4, 1, 64
+                            payload.get("max_concurrency"), 6, 1, 64
                         ),
                     )
                 if path == "/api/keys/verify":

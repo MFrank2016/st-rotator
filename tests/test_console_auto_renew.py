@@ -62,7 +62,7 @@ class _FakePool:
     def summary(self) -> dict[str, int]:
         return {"total": 0, "healthy": 0, "cooldown": 0, "invalid": 0, "inflight": 0}
 
-    def snapshot(self) -> list[dict[str, int]]:
+    def snapshot(self, *, include_users: bool = False) -> list[dict[str, int]]:
         return []
 
 

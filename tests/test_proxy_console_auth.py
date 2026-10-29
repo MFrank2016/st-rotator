@@ -48,8 +48,13 @@ class _FakePool:
     def summary(self) -> dict:
         return {"total": 1, "available": 1}
 
-    def snapshot(self) -> list:
+    def snapshot(self, *, include_users: bool = False) -> list:
         return []
+
+    def user_context(self, label: str):
+        from st_rotator.keypool import user_context
+
+        return user_context(label)
 
 
 class FakeRotator:
