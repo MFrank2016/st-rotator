@@ -95,7 +95,7 @@ class AccountState:
 
     __slots__ = (
         "name", "rpm_limit", "max_concurrency", "weight",
-        "inflight", "cooldown_until", "consecutive_failures",
+        "inflight", "cooldown_until", "cooldown_set_at", "consecutive_failures",
         "last_error", "_window",
     )
 
@@ -113,6 +113,7 @@ class AccountState:
         self.weight = weight
         self.inflight = 0
         self.cooldown_until = 0.0
+        self.cooldown_set_at = 0.0
         self.consecutive_failures = 0
         self.last_error = ""
         self._window: deque[float] = deque()
@@ -145,7 +146,7 @@ class ApiKey:
 
     __slots__ = (
         "id", "key", "account", "rpm_limit", "max_concurrency", "weight", "tags",
-        "status", "cooldown_until", "consecutive_failures", "inflight",
+        "status", "cooldown_until", "cooldown_set_at", "consecutive_failures", "inflight",
         "last_used", "last_error", "stats", "_window", "account_state",
     )
 
@@ -170,6 +171,7 @@ class ApiKey:
         self.tags = list(tags)
         self.status = KeyStatus.HEALTHY
         self.cooldown_until = 0.0
+        self.cooldown_set_at = 0.0
         self.consecutive_failures = 0
         self.inflight = 0
         self.last_used = 0.0
@@ -575,30 +577,49 @@ class KeyPool:
         for acct in self._accounts.values():
             if acct.cooldown_until and acct.cooldown_until <= now:
                 acct.cooldown_until = 0.0
+                acct.cooldown_set_at = 0.0
                 acct.consecutive_failures = 0
                 acct.last_error = ""
         for key in self._keys:
             if key.cooldown_until and key.cooldown_until <= now:
                 key.cooldown_until = 0.0
+                key.cooldown_set_at = 0.0
                 key.status = KeyStatus.HEALTHY
                 key.consecutive_failures = 0
                 key.last_error = ""
 
     # ------------------------------------------------------------ 结果上报
 
-    def report_success(self, key: ApiKey, latency: float | None = None) -> None:
+    def report_success(
+        self, key: ApiKey, latency: float | None = None, *, force: bool = False
+    ) -> None:
+        """``force=True`` 表示调用方确知 Key 已恢复（如烧点回补后），跳过晚到成功的冷却守卫。"""
         with self._cond:
             key.stats.successes += 1
             if latency is not None:
                 key.stats.total_latency += latency
-            key.consecutive_failures = 0
-            key.cooldown_until = 0.0
-            key.status = KeyStatus.HEALTHY
-            key.last_error = ""
-            if key.account_state is not None:
-                key.account_state.consecutive_failures = 0
-                key.account_state.cooldown_until = 0.0
-                key.account_state.last_error = ""
+            # 晚到的成功（请求在冷却判定之前就已开始）不能抹掉刚判下的冷却，
+            # 否则同账号其它 Key 会被立刻放出去撞墙。
+            if force or not (
+                key.status is KeyStatus.COOLDOWN
+                and key.cooldown_set_at > 0
+                and key.last_used <= key.cooldown_set_at
+            ):
+                key.consecutive_failures = 0
+                key.cooldown_until = 0.0
+                key.cooldown_set_at = 0.0
+                key.status = KeyStatus.HEALTHY
+                key.last_error = ""
+            acct = key.account_state
+            if acct is not None and (force or not (
+                acct.cooldown_until > 0
+                and acct.cooldown_set_at > 0
+                and key.last_used <= acct.cooldown_set_at
+            )):
+                acct.consecutive_failures = 0
+                acct.cooldown_until = 0.0
+                acct.cooldown_set_at = 0.0
+                acct.last_error = ""
             self._cond.notify_all()
 
     def report_rate_limit(self, key: ApiKey, retry_after: float | None = None) -> float:
@@ -610,19 +631,23 @@ class KeyPool:
             delay = self.cooldown.for_attempt(key.consecutive_failures, self._rng)
             if retry_after and retry_after > delay:
                 delay = min(retry_after, self.cooldown.max * 4)  # 尊重服务端建议，但别被拖死
+            now = self._clock()
             key.status = KeyStatus.COOLDOWN
-            key.cooldown_until = self._clock() + delay
+            key.cooldown_until = now + delay
+            key.cooldown_set_at = now
             key.last_error = f"429 rate limited (#{key.consecutive_failures})"
 
             # 同步冷却同一账号下的所有 Key，防止连环送死！
             if key.account_state is not None:
                 key.account_state.consecutive_failures += 1
-                key.account_state.cooldown_until = max(key.account_state.cooldown_until, self._clock() + delay)
+                key.account_state.cooldown_until = max(key.account_state.cooldown_until, now + delay)
+                key.account_state.cooldown_set_at = now
                 key.account_state.last_error = key.last_error
                 for sibling in self._keys:
                     if sibling.account_state is key.account_state and sibling.status is not KeyStatus.INVALID:
                         sibling.status = KeyStatus.COOLDOWN
                         sibling.cooldown_until = max(sibling.cooldown_until, key.account_state.cooldown_until)
+                        sibling.cooldown_set_at = now
                         sibling.last_error = key.last_error
 
             self._cond.notify_all()
@@ -634,8 +659,10 @@ class KeyPool:
             key.stats.server_errors += 1
             key.stats.failures += 1
             delay = self.cooldown.server_error
+            now = self._clock()
             key.status = KeyStatus.COOLDOWN
-            key.cooldown_until = max(key.cooldown_until, self._clock() + delay)
+            key.cooldown_until = max(key.cooldown_until, now + delay)
+            key.cooldown_set_at = now
             key.last_error = detail or "server/network error"
             self._cond.notify_all()
             return delay
@@ -646,7 +673,9 @@ class KeyPool:
             key.stats.failures += 1
             key.status = KeyStatus.INVALID
             ttl = self.cooldown.invalid_ttl
-            key.cooldown_until = self._clock() + ttl if ttl > 0 else float("inf")
+            now = self._clock()
+            key.cooldown_until = now + ttl if ttl > 0 else float("inf")
+            key.cooldown_set_at = now
             key.last_error = detail or "invalid credential"
             self._cond.notify_all()
 
@@ -672,16 +701,20 @@ class KeyPool:
             delay = max(0.0, self.cooldown.model_unavailable)
             if delay <= 0:
                 return 0.0
-            until = self._clock() + delay
+            now = self._clock()
+            until = now + delay
             key.status = KeyStatus.COOLDOWN
             key.cooldown_until = max(key.cooldown_until, until)
+            key.cooldown_set_at = now
             if key.account_state is not None:
                 key.account_state.cooldown_until = max(key.account_state.cooldown_until, until)
+                key.account_state.cooldown_set_at = now
                 key.account_state.last_error = key.last_error
                 for sibling in self._keys:
                     if sibling.account_state is key.account_state and sibling.status is not KeyStatus.INVALID:
                         sibling.status = KeyStatus.COOLDOWN
                         sibling.cooldown_until = max(sibling.cooldown_until, until)
+                        sibling.cooldown_set_at = now
                         sibling.last_error = key.last_error
             self._cond.notify_all()
             return delay
@@ -710,6 +743,7 @@ class KeyPool:
                     continue
                 key.status = KeyStatus.HEALTHY
                 key.cooldown_until = 0.0
+                key.cooldown_set_at = 0.0
                 key.consecutive_failures = 0
                 key.last_error = ""
                 revived += 1

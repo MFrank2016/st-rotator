@@ -795,7 +795,12 @@ class StRotator:
             "error": str, "hidden": [被隐藏的模型名...]}``
         """
         with self._models_lock:
-            fresh = self._models_cache and (time.monotonic() - self._models_fetched_at) < ttl
+            # 不能用 _models_cache 的真值判断新鲜度：拉取失败时缓存恒为空，
+            # 用真值会让每次轮询都重拉重记，「拉取模型清单失败」警告刷屏。
+            fresh = (
+                self._models_fetched_at > 0.0
+                and (time.monotonic() - self._models_fetched_at) < ttl
+            )
             if fresh and not refresh:
                 return self._models_result(cached=True)
             try:
@@ -1030,7 +1035,7 @@ class StRotator:
                 if probe_recovered():
                     self._log(f"[一换一] {key.account} 通用池已回补，提前结束烧点 ✅")
                     try:
-                        self.pool.report_success(key, latency=0.0)  # 顺带清掉冷却，立刻可用
+                        self.pool.report_success(key, latency=0.0, force=True)  # 顺带清掉冷却，立刻可用
                     except Exception:
                         pass
                     recovered = True
