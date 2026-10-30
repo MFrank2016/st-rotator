@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -189,6 +191,20 @@ class CooldownConfig:
         if unknown:
             raise ConfigError(f"cooldown 存在未知字段: {sorted(unknown)}")
         cfg = cls(**data)
+        for field_name in (
+            "base",
+            "factor",
+            "max",
+            "jitter",
+            "invalid_ttl",
+            "server_error",
+            "model_unavailable",
+        ):
+            value = getattr(cfg, field_name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ConfigError(
+                    f"cooldown.{field_name} 必须是数字，当前为 {value!r}"
+                )
         if cfg.base <= 0:
             raise ConfigError("cooldown.base 必须 > 0")
         if cfg.factor < 1:
@@ -676,7 +692,14 @@ class AccountConfig:
         unknown = set(data) - known
         if unknown:
             raise ConfigError(f"账号 {name} 存在未知字段: {sorted(unknown)}")
-        keys = [expand_env(str(k)).strip() for k in (keys or []) if str(k).strip()]
+        raw_keys = keys or []
+        if not isinstance(raw_keys, list):
+            raise ConfigError(f"账号 {name} 的 api_keys 必须是字符串列表")
+        for item in raw_keys:
+            if not isinstance(item, str):
+                # 手写 JSON 里的 null / 数字不能靠 str() 变成 "None" 混进来
+                raise ConfigError(f"账号 {name} 的 api_keys 必须是字符串列表")
+        keys = [expand_env(item).strip() for item in raw_keys if item.strip()]
         return cls(name=name, api_keys=keys, **data)
 
     def to_dict(self) -> dict[str, Any]:
@@ -923,6 +946,8 @@ class ConfigStore:
         self.path = Path(path)
         self._raw = raw
         self.config = config
+        # UI 线程与各后台 worker 会并发落盘，串行化写入（实例级）
+        self._save_lock = threading.Lock()
 
     # ------------------------------------------------------------ 读写
 
@@ -940,12 +965,37 @@ class ConfigStore:
         return cls(p, loaded, Config.from_dict(loaded))
 
     def save(self) -> None:
-        """原子落盘（先写临时文件再替换，避免写坏原文件）。"""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        text = json.dumps(self._raw, ensure_ascii=False, indent=2) + "\n"
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, self.path)
+        """原子落盘：实例锁串行化 + 唯一临时文件 + fsync 后替换。
+
+        临时文件名唯一（mkstemp）——多个写入者共用一个 ``.tmp`` 会互相写坏；
+        fsync 保证掉电时要么是旧的完整文件、要么是新的完整文件。
+        """
+        with self._save_lock:
+            text = json.dumps(self._raw, ensure_ascii=False, indent=2) + "\n"
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                mode = os.stat(self.path).st_mode & 0o777
+            except OSError:
+                mode = 0o644
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{self.path.name}-",
+                suffix=".tmp",
+                dir=str(self.path.parent),
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                # mkstemp 默认 0600：沿用原文件权限，别让一次保存改变可读范围
+                os.chmod(tmp_name, mode)
+                os.replace(tmp_name, self.path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
 
     def _accounts_raw(self) -> list[dict[str, Any]]:
         accounts = self._raw.get("accounts")

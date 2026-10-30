@@ -102,7 +102,10 @@ def _failure(
     """构造错误结果：消息截断到 DETAIL_LIMIT，并发出 error 事件。"""
     latency_ms = round((time.monotonic() - started) * 1000)
     message = (message or "")[:DETAIL_LIMIT]
-    emit({"type": "error", "account": name, "code": code, "message": message})
+    try:
+        emit({"type": "error", "account": name, "code": code, "message": message})
+    except Exception:  # noqa: BLE001 - 事件通道断开（SSE 客户端走了）不能影响结果
+        pass
     return ModelTestResult(
         account=name,
         status="error",
@@ -226,14 +229,17 @@ def _run_one(
         return _failure(name, started, "fatal", f"{name} 无可用 Key", emit)
     key = account.api_keys[0]
     try:
-        client = factory()
-        payload = payload_for(req.model, req.prompt, req.reasoning_effort)
-        headers = {"Authorization": f"Bearer {key}"}
-        if req.stream:
-            payload["stream"] = True
-            payload["stream_options"] = {"include_usage": True}
-            return _run_stream(req, client, payload, headers, name, started, emit)
-        return _run_non_stream(client, payload, headers, name, started, emit)
+        # 每个账号独立连接（保持账号隔离），用完必须关闭：HttpClient 持有连接池
+        with factory() as client:
+            payload = payload_for(req.model, req.prompt, req.reasoning_effort)
+            headers = {"Authorization": f"Bearer {key}"}
+            if req.stream:
+                payload["stream"] = True
+                payload["stream_options"] = {"include_usage": True}
+                return _run_stream(
+                    req, client, payload, headers, name, started, emit
+                )
+            return _run_non_stream(client, payload, headers, name, started, emit)
     except NetworkError as exc:
         return _failure(name, started, "network", str(exc), emit)
     except OSError as exc:

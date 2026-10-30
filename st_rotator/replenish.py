@@ -61,6 +61,8 @@ DEDUPE_MAX = 20
 SOFT_RETRY_MAX = 10
 # 号码级硬失败上限：号码失败只跳过、继续下一个；连续失败达此数才放弃本轮（防烧短信费）
 NUMBER_FAILURE_MAX = 5
+# 软失败（换号重试）原因的展示文案：归因用，不影响重试策略
+_SOFT_FAIL_TEXT = {"sms_timeout": "短信超时", "sms_code_wrong": "验证码校验失败"}
 
 # 用户名 / 密码字符集：**刻意排除 $ { }** —— 避免 ConfigStore 的 ${ENV}
 # 占位符展开误伤生成的凭据。
@@ -383,12 +385,18 @@ class ReplenishWorker:
         hard_failures = 0
         while need > 0:
             try:
-                if self._replenish_one():
+                result = self._replenish_one()
+                if result == "ok":
                     need -= 1
                     soft_retries = 0
+                    hard_failures = 0  # 连续失败计数：成功后清零（语义见 NUMBER_FAILURE_MAX）
                     continue
                 soft_retries += 1
                 if soft_retries >= SOFT_RETRY_MAX:
+                    # 归因用最后一次软失败的真实原因（超时 / 验证码错），不再一律记成超时
+                    reason = result
+                    text = _SOFT_FAIL_TEXT.get(reason, reason)
+                    detail = f"连续 {SOFT_RETRY_MAX} 次{text}，本轮放弃"
                     self._record_registration(
                         phone=self._active_phone,
                         username="",
@@ -396,13 +404,13 @@ class ReplenishWorker:
                         is_new=False,
                         password_reset=False,
                         success=False,
-                        reason="sms_timeout",
-                        detail=f"连续 {SOFT_RETRY_MAX} 次短信超时，本轮放弃",
+                        reason=reason,
+                        detail=detail,
                     )
                     self._set_status(
                         self.STATUS_CHECK_ERROR,
-                        f"连续 {SOFT_RETRY_MAX} 次短信超时，本轮放弃",
-                        log_line=f"[补号] 连续 {SOFT_RETRY_MAX} 次短信超时，本轮放弃",
+                        detail,
+                        log_line=f"[补号] {detail}",
                     )
                     return
             except _StopCycle as stop:
@@ -436,10 +444,11 @@ class ReplenishWorker:
                 self._log(f"[补号] 号码 {self._active_phone} 失败，跳过继续：{detail}")
 
     # ------------------------------------------------------------ 单次补齐
-    def _replenish_one(self) -> bool:
+    def _replenish_one(self) -> str:
         """尝试补齐一个账号。
 
-        返回 True = 成功建号（need 减一）；False = 软重试（短信超时，换新号）。
+        返回 ``"ok"`` = 成功建号（need 减一）；
+        ``"sms_timeout"`` / ``"sms_code_wrong"`` = 软重试（换新号），供上层归因。
         硬性终止（blocked_cap / captcha / check_error / 去重耗尽）先写状态再抛
         ``_StopCycle`` 结束本轮。
         """
@@ -522,7 +531,7 @@ class ReplenishWorker:
             self._log(
                 f"[补号] 号码 {phone} 短信超时（{self._sms_poll_timeout:g}s），换号重试"
             )
-            return False
+            return "sms_timeout"
 
         # e. mint login challenge（challenge_expired 重 mint 一次）
         challenge, verifier = self._mint_challenge()
@@ -540,14 +549,16 @@ class ReplenishWorker:
                     token_code=token_code, verify_code=code, challenge=challenge
                 )
             elif exc.reason == "incorrect_sms_code":
-                return False
+                self._log(f"[补号] 号码 {phone} 验证码校验失败，换号重试")
+                return "sms_code_wrong"
             else:
                 raise
 
         # 手机号已被注册（tenant_list 非空）-> S2 接管
         if sms_login_tenants(login_data):
             self._log(f"[补号] 号码 {phone} 已注册，走接管流程")
-            return self._takeover(login_data, challenge, verifier, phone)
+            self._takeover(login_data, challenge, verifier, phone)
+            return "ok"
 
         # g. S1 新注册；username_taken -> 重试一次
         self._log(f"[补号] 号码 {phone} 未注册，走注册流程")
@@ -584,7 +595,7 @@ class ReplenishWorker:
             log_line=f"[补号] 已注册新账号 {user}（{phone}）",
             always_log=True,
         )
-        return True
+        return "ok"
 
     def _read_balance(self) -> float:
         """读余额；只对可重试的平台抖动（HTTP 5xx / 读超时）重试。
@@ -780,9 +791,7 @@ class ReplenishWorker:
             # 2) 密码落空串 —— new_pw 从未被服务端接受，写进去只会让余量面板误报「登录失败」，
             #    空密码则如实记为「未配置凭据」，等人工重发改密短信补录即可恢复。
             username = self._recover_username(bundle.access_token, user_id)
-            self._persist(
-                username, phone, "", created.api_key, outcome="takeover_password_unset"
-            )
+            self._persist(username, phone, "", created.api_key)
             self._set_status(
                 self.STATUS_CHECK_ERROR,
                 "改密短信超时，账号已接管但未改密",
@@ -792,11 +801,12 @@ class ReplenishWorker:
                 ),
                 always_log=True,
             )
+            # 审计必须反映**实际写入配置**的内容：username 已取回，password 落的是空串
             raise _StopCycle(
                 record=dict(
                     phone=phone,
-                    username="",
-                    password=new_pw,
+                    username=username,
+                    password="",
                     is_new=False,
                     password_reset=False,
                     success=True,

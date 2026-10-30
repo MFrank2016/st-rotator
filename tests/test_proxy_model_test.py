@@ -31,6 +31,16 @@ class _RecordingClient:
     def __init__(self, by_auth: dict[str, Response]) -> None:
         self.by_auth = by_auth
         self.calls: list[dict[str, Any]] = []
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+    def __enter__(self) -> "_RecordingClient":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
     def request(
         self,

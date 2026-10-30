@@ -1,5 +1,6 @@
 import base64
 import http.server
+import io
 import json
 import threading
 import time
@@ -272,13 +273,21 @@ class _NearExpiryTransport(_FakeTransport):
 
 
 class _Retry401Transport(_FakeTransport):
-    """首次 fetch 抛 HTTP 401，重新登录后第二次成功。"""
+    """首次 fetch 抛 401（真实传输层的 QuotaHTTPError），重新登录后第二次成功。"""
 
     def fetch_pools(self, access_token):
         self.calls["fetch"] += 1
         if self.calls["fetch"] == 1:
-            raise urllib.error.HTTPError("http://x", 401, "Unauthorized", {}, None)
+            raise quota.QuotaHTTPError("HTTP 401 Unauthorized", status=401)
         return quota.normalize_pools(SAMPLE)
+
+
+class _Non401Transport(_FakeTransport):
+    """非 401 的 HTTP 错误不能被当成 token 失效重试。"""
+
+    def fetch_pools(self, access_token):
+        self.calls["fetch"] += 1
+        raise quota.QuotaHTTPError("HTTP 500 boom", status=500)
 
 
 def _config_with(accounts):
@@ -352,6 +361,76 @@ class QuotaServiceTest(unittest.TestCase):
         self.assertEqual(aq.status, "ok")
         self.assertEqual(t.calls["login"], 2)
         self.assertEqual(t.calls["fetch"], 2)
+
+    def test_open_maps_http_error_status(self):
+        """_open 必须把 HTTPError.code 带进 QuotaHTTPError.status（否则 401 分支不可达）。"""
+        class _Opener:
+            def open(self, req, timeout=None):
+                raise urllib.error.HTTPError(
+                    "http://x/y", 401, "Unauthorized", {}, io.BytesIO(b"body")
+                )
+
+        transport = quota.HttpQuotaTransport()
+        with self.assertRaises(quota.QuotaHTTPError) as ctx:
+            transport._open(
+                _Opener(), urllib.request.Request("http://x/y"), step="pools"
+            )
+        self.assertEqual(ctx.exception.status, 401)
+
+    def test_quota_http_error_status_defaults_to_none(self):
+        self.assertIsNone(quota.QuotaHTTPError("x").status)
+
+    def test_non_401_http_error_is_not_retried(self):
+        t = _Non401Transport()
+        out = self._svc(t).snapshot()
+        aq = next(a for a in out if a.account == "账号1")
+        self.assertEqual(aq.status, "error")
+        self.assertEqual(t.calls, {"login": 1, "fetch": 1})
+
+    def test_snapshot_does_not_hold_lock_during_fetch(self):
+        """网络往返必须在锁外：fetch 期间其它线程要能读写缓存。"""
+        holder = {}
+
+        class _ProbeTransport(_FakeTransport):
+            def fetch_pools(self, access_token):
+                # 同线程再取同一把锁：被持有则阻塞在这里（用非阻塞探测避免挂死）
+                locked = not holder["svc"]._lock.acquire(blocking=False)
+                if not locked:
+                    holder["svc"]._lock.release()
+                holder["lock_held_during_fetch"] = locked
+                return super().fetch_pools(access_token)
+
+        svc = self._svc(_ProbeTransport())
+        holder["svc"] = svc
+        svc.snapshot()
+        self.assertFalse(holder["lock_held_during_fetch"])
+
+    def test_close_joins_sampler_and_clears_cache(self):
+        svc = quota.QuotaService(
+            _config_with(
+                [{"name": "账号1", "api_keys": ["k1"], "user": "u1", "password": "p1"}]
+            ),
+            ttl=300.0,
+            transport=_FakeTransport(),
+            clock=lambda: 0.0,
+            sampler_interval=0.01,
+        )
+        svc.snapshot()
+        sampler = svc._sampler
+        self.assertIsNotNone(sampler)
+        svc.close()
+        self.assertFalse(sampler.is_alive())  # 已 join，不会残留线程
+        self.assertEqual(svc._cache, {})
+        self.assertEqual(svc._tokens, {})
+
+    def test_close_blocks_post_close_cache_write(self):
+        """关闭后即使有在途抓取回来，也不能再写回缓存。"""
+        t = _FakeTransport()
+        svc = self._svc(t)
+        svc.close()  # 先关闭（模拟采样线程还在 HTTP 里）
+        out = svc.snapshot()
+        self.assertEqual(len(out), 2)
+        self.assertEqual(svc._cache, {})
 
     def test_verify_credentials(self):
         svc = self._svc(_FakeTransport())

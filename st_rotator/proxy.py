@@ -303,11 +303,15 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             while True:
                 size_line = self.rfile.readline().strip()
                 if not size_line:
-                    break
+                    # 分块编码意外结束：帧边界已不可信，必须关连接
+                    self.close_connection = True
+                    raise ValueError("分块编码非法")
                 try:
                     size = int(size_line.split(b";")[0], 16)
-                except ValueError:
-                    break
+                except ValueError as exc:
+                    # 畸形 chunk-size：无法重新对齐帧边界，抛错并关连接，绝不静默截断
+                    self.close_connection = True
+                    raise ValueError("分块编码非法") from exc
                 if size == 0:
                     self.rfile.readline()  # 吃掉结尾的 CRLF
                     break
@@ -417,6 +421,10 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             if retry_after:
                 self.send_header("Retry-After", str(int(retry_after) + 1))
+            if self.close_connection:
+                # 已决定关连接（401 未读 body / 分块帧错等）：显式告知客户端，
+                # 避免它把下一条请求继续管线化到即将关闭的 socket 上。
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
             self._sent_bytes += len(body)
@@ -585,6 +593,9 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             )
             return
         if not self._authorized():
+            # 401 前没有读请求体：残留字节会被当成下一条 keep-alive 请求解析，
+            # 因此强制关闭连接，而不是尝试 drain 不可信的 body。
+            self.close_connection = True
             self._send_json(
                 401, error_payload("invalid proxy token", "authentication_error")
             )
@@ -629,6 +640,8 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
         if not self._authorized(allow_cookie=console_api) or (
             console_api and self._auth_subkey is not None
         ):
+            # 同 do_GET：401 时请求体还没读，必须关闭连接以免残留字节被当成下一条请求。
+            self.close_connection = True
             self._send_json(
                 401,
                 error_payload(

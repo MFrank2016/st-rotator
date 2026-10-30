@@ -68,7 +68,9 @@ class FakeUpstream:
 
         try:
             payload = json.loads(request.body or b"{}")
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError, AttributeError):
+            payload = {}
+        if not isinstance(payload, dict):
             payload = {}
         reply = "你好，我是模拟上游返回的回复。"
 

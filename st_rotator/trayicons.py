@@ -14,6 +14,7 @@ Windows 托盘需要一个 ``HICON``。本机没有 Pillow，也不想让用户�
 from __future__ import annotations
 
 import hashlib
+import re
 import struct
 from pathlib import Path
 
@@ -140,6 +141,11 @@ STATE_COLORS: dict[str, tuple[int, int, int]] = {
     "starting": COLOR_STARTING,
 }
 
+#: 本模块生成的图标文件名：tray-<状态>-<8 位哈希>.ico
+_GENERATED_ICON = re.compile(
+    r"^tray-(?:" + "|".join(STATE_COLORS) + r")-[0-9a-f]{8}\.ico$"
+)
+
 
 def ensure_icons(directory: Path) -> dict[str, Path]:
     """确保每个状态都有一份 .ico 文件，返回 ``{状态: 路径}``。
@@ -158,10 +164,11 @@ def ensure_icons(directory: Path) -> dict[str, Path]:
             path.write_bytes(build_ico(ICON_SIZES, color))
         paths[state] = path
 
-    # 清掉历史版本的图标，别让目录越积越多
+    # 清掉历史版本的图标，别让目录越积越多。只删本函数生成的名字
+    # （tray-<状态>-<8 位哈希>.ico），调用方自己放在该目录的文件一律不碰。
     keep = {p.name for p in paths.values()}
     for stale in directory.glob("tray-*.ico"):
-        if stale.name not in keep:
+        if _GENERATED_ICON.match(stale.name) and stale.name not in keep:
             try:
                 stale.unlink()
             except OSError:  # pragma: no cover - 清不掉就算了，不该影响启动

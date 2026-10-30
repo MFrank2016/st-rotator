@@ -25,6 +25,17 @@ class _FakeClient:
     def __init__(self, responses: Sequence[Response]) -> None:
         self.responses = list(responses)
         self.calls: list[dict[str, Any]] = []
+        self.closed = False
+
+    # 与真实 HttpClient 一致：支持 with，退出时关闭
+    def close(self) -> None:
+        self.closed = True
+
+    def __enter__(self) -> "_FakeClient":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
     def request(
         self,
@@ -641,6 +652,66 @@ class NonStreamReasoningTest(unittest.TestCase):
         results = _run_test(config, req, clients, _single_factory(clients, [resp]))
         self.assertEqual(results[0].text, "答")
         self.assertEqual(results[0].reasoning, "想")
+
+
+class ClientLifecycleTest(unittest.TestCase):
+    """每个账号的 HttpClient 用完必须关闭（否则长跑网关累积连接池/FD）。"""
+
+    def test_each_client_is_closed(self):
+        config = _config([AccountConfig(name="账号1", api_keys=["sk-1"])])
+        clients: list[_FakeClient] = []
+
+        def make_factory(_config: Config):
+            def factory() -> Any:
+                client = _FakeClient([_ok_response()])
+                clients.append(client)
+                return client
+
+            return factory
+
+        req = modeltest.ModelTestRequest(model="m", accounts=["账号1"], prompt="hi")
+        results = _run_test(config, req, clients, make_factory)
+        self.assertEqual(results[0].status, "ok")
+        self.assertTrue(clients)
+        self.assertTrue(all(c.closed for c in clients))
+
+    def test_client_closed_even_when_request_fails(self):
+        config = _config([AccountConfig(name="账号1", api_keys=["sk-1"])])
+        clients: list[_FakeClient] = []
+
+        class _BoomClient(_FakeClient):
+            def request(self, *args: Any, **kwargs: Any) -> Response:
+                raise NetworkError("boom")
+
+        def make_factory(_config: Config):
+            def factory() -> Any:
+                client = _BoomClient([])
+                clients.append(client)
+                return client
+
+            return factory
+
+        req = modeltest.ModelTestRequest(model="m", accounts=["账号1"], prompt="hi")
+        results = _run_test(config, req, clients, make_factory)
+        self.assertEqual(results[0].error["code"], "network")
+        self.assertTrue(clients[0].closed)
+
+    def test_emit_failure_does_not_escape_failure(self):
+        """SSE 客户端断开导致 emit 抛错时，错误结果仍要正常返回。"""
+        config = _config([AccountConfig(name="账号1", api_keys=["sk-1"])])
+        clients: list[_FakeClient] = []
+
+        def boom_emit(event: dict[str, Any]) -> None:
+            if event["type"] == "error":  # 只有错误事件通道断开
+                raise BrokenPipeError("client gone")
+
+        req = modeltest.ModelTestRequest(model="m", accounts=["账号1"], prompt="hi")
+        results = _run_test(
+            config, req, clients, _single_factory(clients, [_error_response(401, '{"error":{"message":"invalid"}}')]), emit=boom_emit
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "error")
+        self.assertEqual(results[0].error["code"], "invalid")
 
 
 class DedupeAccountsTest(unittest.TestCase):

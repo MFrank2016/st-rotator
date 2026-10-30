@@ -270,6 +270,18 @@ def copy_to_clipboard(text: str) -> bool:
         user32.CloseClipboard()
 
 
+#: NOTIFYICONDATA 的固定长度字段（WCHAR 个数）；超长赋值 ctypes 会抛 ValueError
+_TIP_CHARS = 128
+_INFO_TITLE_CHARS = 64
+_INFO_CHARS = 256
+
+
+def _fit(text: str, limit: int) -> str:
+    """截断到 NOTIFYICONDATA 字段能容纳的长度（超长赋值会抛 ValueError）。"""
+    text = text or ""
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 class TrayApp:
     """托盘应用：承载网关的运行、状态展示与退出。
 
@@ -365,6 +377,9 @@ class TrayApp:
             handle = user32.LoadImageW(
                 None, str(path), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
             )
+            if not handle:
+                # 加载失败（0/NULL）不缓存：下次状态变化还能再试一次
+                return 0
             self._hicons[state] = handle
         return self._hicons[state]
 
@@ -379,7 +394,7 @@ class TrayApp:
             return
         nid.uFlags = NIF_ICON | NIF_TIP
         nid.hIcon = self._hicon(state)
-        nid.szTip = tip
+        nid.szTip = _fit(tip, _TIP_CHARS)
         shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
         self._log(f"[托盘] 状态变为 {state}：{tip}")
 
@@ -388,8 +403,8 @@ class TrayApp:
         if nid is None:
             return
         nid.uFlags = NIF_INFO
-        nid.szInfoTitle = title
-        nid.szInfo = text
+        nid.szInfoTitle = _fit(title, _INFO_TITLE_CHARS)
+        nid.szInfo = _fit(text, _INFO_CHARS)
         nid.dwInfoFlags = flags
         shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
 
@@ -569,7 +584,7 @@ class TrayApp:
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP
         nid.uCallbackMessage = _TRAY_CALLBACK_MESSAGE
         nid.hIcon = self._hicon(state)
-        nid.szTip = tip
+        nid.szTip = _fit(tip, _TIP_CHARS)
         if shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
             # V4 让鼠标事件带上坐标，菜单定位更准
             nid.uVersion = NOTIFYICON_VERSION_4

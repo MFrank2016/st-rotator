@@ -26,6 +26,10 @@ class NetworkError(Exception):
     """网络层错误（连接失败、超时、对端断开）——可以换个 Key 重试。"""
 
 
+#: 复用连接失效时可以安全重发的方法（其余方法可能已被服务端处理，重发会重复副作用）
+_IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
 def _resolve_proxy(
     proxy: str | None,
 ) -> tuple[str, int, str | None, str | None] | None:
@@ -428,7 +432,9 @@ class HttpClient:
                 with contextlib.suppress(Exception):
                     conn.close()
                 conn = None
-                if not reused:
+                # 只对幂等方法重试：POST 可能已被服务端处理，重发会造成重复创建/计费。
+                # 新建连接失败（reused=False）照旧不重试。
+                if not reused or request.method.upper() not in _IDEMPOTENT_METHODS:
                     raise NetworkError(f"{type(exc).__name__}: {exc}") from exc
                 if abort is not None:
                     abort.cancel()
@@ -455,9 +461,12 @@ class HttpClient:
             payload = raw.read()
             if abort is not None:
                 abort.cancel()
-            healthy = (
-                status < 500 and raw.getheader("Connection", "").lower() != "close"
-            )
+            # Connection 是逗号分隔的 token 列表（如 "keep-alive, close"），不能整值比较
+            connection_tokens = {
+                token.strip().lower()
+                for token in (raw.getheader("Connection", "") or "").split(",")
+            }
+            healthy = status < 500 and "close" not in connection_tokens
             self._checkin(conn, healthy=healthy)
             conn = None
             return Response(status, headers, payload)

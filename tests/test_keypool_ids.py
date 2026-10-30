@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import threading
+import time
 import unittest
 
 from st_rotator.config import AccountConfig
+from st_rotator.errors import NoAvailableKey
 from st_rotator.keypool import KeyPool, KeyStatus
 
 
@@ -55,6 +58,105 @@ class KeyPoolNumericIdTest(unittest.TestCase):
         self.assertIsNotNone(removed)
         self.assertEqual(removed.id, 3)
         self.assertEqual([k["id"] for k in pool.snapshot()], [1, 2])
+
+
+class KeyPoolAcquireNoCandidateTest(unittest.TestCase):
+    """全被排除（没有可等的 Key）要立即报错，而不是死循环；并发打满仍要等。"""
+
+    def test_all_excluded_raises_immediately(self) -> None:
+        pool = KeyPool(
+            [AccountConfig(name="a", api_keys=["sk-a1", "sk-a2"])]
+        )
+        started = time.monotonic()
+        with self.assertRaises(NoAvailableKey) as ctx:
+            pool.acquire(
+                exclude=["sk-a1", "sk-a2"], timeout=1.0
+            )
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertIn("没有可用", str(ctx.exception))
+
+    def test_concurrency_full_waits_then_times_out(self) -> None:
+        pool = KeyPool(
+            [AccountConfig(name="a", api_keys=["sk-a"], max_concurrency=1)]
+        )
+        pool.acquire(timeout=1.0)  # 占满并发
+        with self.assertRaises(NoAvailableKey) as ctx:
+            pool.acquire(timeout=0.2)
+        self.assertIn("超时", str(ctx.exception))
+
+    def test_acquire_succeeds_after_release(self) -> None:
+        pool = KeyPool(
+            [AccountConfig(name="a", api_keys=["sk-a"], max_concurrency=1)]
+        )
+        held = pool.acquire(timeout=1.0)
+        got: list[object] = []
+        errors: list[BaseException] = []
+
+        def waiter() -> None:
+            try:
+                got.append(pool.acquire(timeout=2.0))
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        pool.release(held)
+        thread.join(timeout=5)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(got), 1)
+        self.assertIs(got[0], held)
+
+
+class KeyPoolStatusMonotonicTest(unittest.TestCase):
+    """状态只升不降：INVALID 不能被 429 / 5xx / 模型不可用降级成 COOLDOWN。"""
+
+    def _pool(self) -> tuple[KeyPool, _Clock]:
+        clock = _Clock(100.0)
+        pool = KeyPool(
+            [AccountConfig(name="a", api_keys=["sk-a1", "sk-a2"])], clock=clock
+        )
+        return pool, clock
+
+    def _invalid(self, pool: KeyPool):
+        key = pool.find_key("sk-a1")
+        pool.report_invalid(key, "401")
+        self.assertIs(key.status, KeyStatus.INVALID)
+        return key, key.cooldown_until
+
+    def test_rate_limit_does_not_downgrade_invalid(self) -> None:
+        pool, clock = self._pool()
+        key, until = self._invalid(pool)
+        clock.t = 101.0
+        pool.report_rate_limit(key)
+        self.assertIs(key.status, KeyStatus.INVALID)
+        self.assertEqual(key.cooldown_until, until)
+        # 同账号的兄弟 Key 也不该因为一把失效 Key 的 429 被冷却
+        self.assertIs(pool.find_key("sk-a2").status, KeyStatus.HEALTHY)
+
+    def test_server_error_does_not_downgrade_invalid(self) -> None:
+        pool, clock = self._pool()
+        key, until = self._invalid(pool)
+        clock.t = 101.0
+        pool.report_server_error(key)
+        self.assertIs(key.status, KeyStatus.INVALID)
+        self.assertEqual(key.cooldown_until, until)
+
+    def test_model_unavailable_does_not_downgrade_invalid(self) -> None:
+        pool, clock = self._pool()
+        key, until = self._invalid(pool)
+        clock.t = 101.0
+        pool.report_model_unavailable(key)
+        self.assertIs(key.status, KeyStatus.INVALID)
+        self.assertEqual(key.cooldown_until, until)
+
+    def test_cooldown_key_can_still_be_marked_invalid(self) -> None:
+        pool, clock = self._pool()
+        key = pool.find_key("sk-a1")
+        clock.t = 101.0
+        pool.report_rate_limit(key)
+        self.assertIs(key.status, KeyStatus.COOLDOWN)
+        pool.report_invalid(key, "403")
+        self.assertIs(key.status, KeyStatus.INVALID)
 
 
 class _Clock:

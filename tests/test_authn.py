@@ -164,6 +164,7 @@ class MintLoginChallengeTest(unittest.TestCase):
 class ExchangeCodeTest(unittest.TestCase):
     def test_exchange_code_posts_token_form_with_verifier(self):
         token_stats = {}
+        holder = {}
 
         def do_token(rec):
             token_stats["form"] = urllib.parse.parse_qs(rec["body"].decode("utf-8"))
@@ -173,13 +174,21 @@ class ExchangeCodeTest(unittest.TestCase):
 
         server, thread, base = serve(
             {
-                ("GET", "/start"): lambda rec: _redirect("/cb?code=SECRET_CODE"),
+                ("GET", "/oauth2/auth"): lambda rec: _redirect(
+                    "/login?login_challenge=CHAL"
+                ),
+                ("GET", "/login"): lambda rec: (200, {}, b"ok"),
+                ("GET", "/start"): lambda rec: _redirect(
+                    "/cb?code=SECRET_CODE&state=" + holder["state"]
+                ),
                 ("GET", "/cb"): lambda rec: (200, {}, b"ok"),
                 ("POST", "/oauth2/token"): do_token,
             }
         )
         try:
             auth = authn.HttpAuthn(timeout=5.0, iam_base=base, oidc_base=base)
+            auth.mint_login_challenge()
+            holder["state"] = _FakeAuthn.requests[0]["query"]["state"][0]
             bundle = auth.exchange_code(base + "/start", "VERIFIER-X")
             self.assertEqual(bundle.access_token, "AT-1")
             self.assertEqual(bundle.refresh_token, "RT-1")
@@ -196,6 +205,62 @@ class ExchangeCodeTest(unittest.TestCase):
             self.assertEqual(
                 tok_req["headers"]["Content-Type"], "application/x-www-form-urlencoded"
             )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+
+class OidcStateTest(unittest.TestCase):
+    """回调 state 必须与发起授权时的 state 一致，否则拒绝换码（CSRF 防护）。"""
+
+    def _serve(self, callback: str):
+        return serve(
+            {
+                ("GET", "/oauth2/auth"): lambda rec: _redirect(
+                    "/login?login_challenge=CHAL"
+                ),
+                ("GET", "/login"): lambda rec: (200, {}, b"ok"),
+                ("GET", "/start"): lambda rec: _redirect(callback),
+                ("GET", "/cb"): lambda rec: (200, {}, b"ok"),
+                ("POST", "/oauth2/token"): lambda rec: _json({"access_token": "AT"}),
+            }
+        )
+
+    def test_mismatched_state_is_rejected_before_token_request(self):
+        server, thread, base = self._serve("/cb?code=CODE&state=attacker")
+        try:
+            auth = authn.HttpAuthn(timeout=5.0, iam_base=base, oidc_base=base)
+            auth.mint_login_challenge()
+            with self.assertRaises(authn.AuthnError) as ctx:
+                auth.exchange_code(base + "/start", "VERIFIER")
+            self.assertEqual(ctx.exception.reason, "invalid")
+            self.assertFalse(
+                [rec for rec in _FakeAuthn.requests if rec["path"] == "/oauth2/token"]
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_missing_state_is_rejected(self):
+        server, thread, base = self._serve("/cb?code=CODE")
+        try:
+            auth = authn.HttpAuthn(timeout=5.0, iam_base=base, oidc_base=base)
+            auth.mint_login_challenge()
+            with self.assertRaises(authn.AuthnError):
+                auth.exchange_code(base + "/start", "VERIFIER")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_exchange_without_mint_is_rejected(self):
+        server, thread, base = self._serve("/cb?code=CODE&state=whatever")
+        try:
+            auth = authn.HttpAuthn(timeout=5.0, iam_base=base, oidc_base=base)
+            with self.assertRaises(authn.AuthnError):
+                auth.exchange_code(base + "/start", "VERIFIER")
         finally:
             server.shutdown()
             server.server_close()
@@ -229,11 +294,16 @@ class ExchangeSessionCookieTest(unittest.TestCase):
 
         def do_consent(rec):
             if "sid=abc" in rec["headers"].get("Cookie", ""):
-                return _redirect(holder["base"] + "/cb?code=CODE123")
+                return _redirect(
+                    holder["base"] + "/cb?code=CODE123&state=" + holder["state"]
+                )
             return _redirect(holder["base"] + "/login")
 
         server, thread, base = serve(
             {
+                ("GET", "/oauth2/auth"): lambda rec: _redirect(
+                    "/login?login_challenge=CHAL"
+                ),
                 ("POST", "/iam/authn/v1/auth/nova/register"): do_register,
                 ("GET", "/oauth2/consent"): do_consent,
                 ("GET", "/cb"): lambda rec: (200, {}, b"ok"),
@@ -248,6 +318,8 @@ class ExchangeSessionCookieTest(unittest.TestCase):
             auth = authn.HttpAuthn(timeout=5.0, iam_base=base, oidc_base=base)
             if force_urllib:
                 auth._curl = None
+            auth.mint_login_challenge()
+            holder["state"] = _FakeAuthn.requests[0]["query"]["state"][0]
             redirect = auth.register(
                 token_code="TK", user_name="u", password="P", challenge="CHAL"
             )
@@ -694,6 +766,44 @@ class MatchSliderTest(unittest.TestCase):
 
     def test_returns_none_on_bad_input(self) -> None:
         self.assertIsNone(authn._match_slider("not-base64!!", "also-bad!!"))
+
+
+class RedactBodyTest(unittest.TestCase):
+    """请求体摘要：手机号 / 用户名 / challenge / code_key 等都不许明文进日志。"""
+
+    def test_sensitive_fields_are_masked(self) -> None:
+        body = json.dumps(
+            {
+                "phone": "13800001111",
+                "user_name": "alice",
+                "challenge": "CHAL-SECRET",
+                "code_key": "CK-SECRET",
+                "password": "pw-secret",
+                "verify_code": "123456",
+                "token_code": "TK-SECRET",
+                "access_token": "AT-SECRET",
+                "refresh_token": "RT-SECRET",
+                "sign": "SIGN-SECRET",
+                "code": "1234",
+            }
+        ).encode("utf-8")
+        line = authn._redact_body(body)
+        for secret in (
+            "13800001111",
+            "alice",
+            "CHAL-SECRET",
+            "CK-SECRET",
+            "pw-secret",
+            "123456",
+            "TK-SECRET",
+            "AT-SECRET",
+            "RT-SECRET",
+            "SIGN-SECRET",
+            "1234",
+        ):
+            self.assertNotIn(secret, line)
+        for field in ("phone", "user_name", "challenge", "code_key"):
+            self.assertIn(f"{field}=***", line)
 
 
 if __name__ == "__main__":

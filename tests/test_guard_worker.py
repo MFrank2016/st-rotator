@@ -155,8 +155,9 @@ class LeakGuardWorkerTest(unittest.TestCase):
             worker = self._worker(store=store, clock=clock, accounts=[a, b], rotate=rotate)
             worker.run_once()
             self.assertEqual(self.rotate_calls, ["A", "B"])  # A 抛异常不影响 B
-            self.assertEqual(store.pending(), [])  # 仍清空
-            self.assertEqual(store.last_rotate_date(), "2026-10-09")
+            # 失败项保留待重试；没清空就不能记 last_rotate_date，否则当天不再重试
+            self.assertEqual(store.pending(), ["A"])
+            self.assertEqual(store.last_rotate_date(), "")
 
     # ------------------------------------------------------------ S3 定时轮换
     def test_rotate_at_two_am_then_idempotent_same_day(self) -> None:
@@ -232,7 +233,9 @@ class LeakGuardWorkerTest(unittest.TestCase):
             worker = self._worker(store=store, clock=clock, accounts=[])
             worker.run_once()
             self.assertEqual(self.rotate_calls, [])
-            self.assertEqual(store.pending(), [])  # 结束后清空
+            # 账号已被删除属永久失败：直接出清，否则会每天重试一次
+            self.assertEqual(store.pending(), [])
+            self.assertEqual(store.last_rotate_date(), "2026-10-09")
 
     def test_account_without_credentials_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -244,7 +247,9 @@ class LeakGuardWorkerTest(unittest.TestCase):
             worker = self._worker(store=store, clock=clock, accounts=[account])
             worker.run_once()
             self.assertEqual(self.rotate_calls, [])
-            self.assertEqual(store.pending(), [])
+            # 凭据可能稍后补上：保留待重试
+            self.assertEqual(store.pending(), ["A"])
+            self.assertEqual(store.last_rotate_date(), "")
 
     def test_rotation_failure_keeps_going(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -264,7 +269,80 @@ class LeakGuardWorkerTest(unittest.TestCase):
             )
             worker.run_once()
             self.assertEqual(self.rotate_calls, ["A", "B"])  # A 失败不影响 B
+            # 只有成功项出清，失败项留着下一轮重试
+            self.assertEqual(store.pending(), ["A"])
+
+    def test_partial_success_keeps_only_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = GuardStore.load(Path(tmp) / "guard.json")
+            a = AccountConfig(name="A", api_keys=["sk-a"], user="u", password="p")
+            b = AccountConfig(name="B", api_keys=["sk-b"], user="u", password="p")
+            store.add_pending(["A", "B"])
+
+            def rotate(account: AccountConfig) -> RotationOutcome:
+                if account.name == "B":
+                    return RotationOutcome(False, "check_error", "boom")
+                return RotationOutcome(True, "ok", "")
+
+            clock = _Clock(_epoch_at(2026, 10, 9, 2, 0))
+            worker = self._worker(
+                store=store, clock=clock, accounts=[a, b], rotate=rotate
+            )
+            worker.run_once()
+            self.assertEqual(store.pending(), ["B"])
+            self.assertEqual(store.last_rotate_date(), "")
+
+    def test_failed_item_is_retried_and_succeeds_same_day(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = GuardStore.load(Path(tmp) / "guard.json")
+            account = AccountConfig(
+                name="A", api_keys=["sk-a"], user="u", password="p"
+            )
+            store.add_pending(["A"])
+            verdicts = iter([False, True])
+
+            def rotate(account: AccountConfig) -> RotationOutcome:
+                if next(verdicts):
+                    return RotationOutcome(True, "ok", "")
+                return RotationOutcome(False, "check_error", "flaky")
+
+            clock = _Clock(_epoch_at(2026, 10, 9, 2, 0))
+            worker = self._worker(
+                store=store, clock=clock, accounts=[account], rotate=rotate
+            )
+            worker.run_once()
+            self.assertEqual(store.pending(), ["A"])
+            clock.t = _epoch_at(2026, 10, 9, 3, 0)  # 下一个 interval 重试
+            worker.run_once()
+            self.assertEqual(self.rotate_calls, ["A", "A"])
             self.assertEqual(store.pending(), [])
+            self.assertEqual(store.last_rotate_date(), "2026-10-09")
+
+    def test_retry_rounds_are_capped_per_day(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = GuardStore.load(Path(tmp) / "guard.json")
+            account = AccountConfig(
+                name="A", api_keys=["sk-a"], user="u", password="p"
+            )
+            store.add_pending(["A"])
+
+            def rotate(account: AccountConfig) -> RotationOutcome:
+                return RotationOutcome(False, "check_error", "always")
+
+            clock = _Clock(_epoch_at(2026, 10, 9, 2, 0))
+            worker = self._worker(
+                store=store, clock=clock, accounts=[account], rotate=rotate
+            )
+            for _ in range(6):
+                clock.t += 3600  # 每次都到了可轮换时刻
+                worker.run_once()
+            self.assertEqual(len(self.rotate_calls), 3)  # 当天最多 3 轮
+            self.assertEqual(store.pending(), ["A"])
+            self.assertEqual(store.last_rotate_date(), "")
+            # 次日重置计数，继续重试
+            clock.t = _epoch_at(2026, 10, 10, 2, 0)
+            worker.run_once()
+            self.assertEqual(len(self.rotate_calls), 4)
 
     # ------------------------------------------------------------ 线程生命周期
     def test_start_stop_daemon_thread(self) -> None:

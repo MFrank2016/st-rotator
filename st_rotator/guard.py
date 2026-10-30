@@ -38,6 +38,7 @@ import os
 import threading
 import time
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -46,6 +47,10 @@ from .config import AccountConfig
 
 # 通用池积分增量的最小可辨识阈值（单位同积分采样）：低于它视为浮点噪声，不计入泄漏判定。
 MIN_CREDIT_DELTA = 1.0
+
+# 同一批失败项当天最多补跑几轮（每轮间隔 = worker interval）。次日重置。
+# 没有这个上限，失败项会在每次扫描时重试，等于无限重试。
+_MAX_ROTATE_ROUNDS_PER_DAY = 3
 
 
 class GuardError(RuntimeError):
@@ -165,11 +170,17 @@ class GuardStore:
             self._save()
             return True
 
-    def finish_rotation(self, date: str) -> None:
-        """记录一次轮换完成：清空待轮换清单 + 记下日期，一次性落盘。"""
+    def finish_rotation(self, date: str, *, keep: Sequence[str] = ()) -> None:
+        """结束本轮轮换：清掉已完成条目，``keep`` 里的失败项保留待重试。
+
+        只有清单真正清空时才记下 ``last_rotate_date``：否则「今天已轮换」的
+        短路会让失败项当天再也不会被重试。
+        """
         with self._lock:
-            self._pending = []
-            self._last_rotate_date = str(date)
+            kept = set(keep)
+            self._pending = [name for name in self._pending if name in kept]
+            if not self._pending:
+                self._last_rotate_date = str(date)
             self._save()
 
     def last_rotate_date(self) -> str:
@@ -225,6 +236,9 @@ class LeakGuardWorker:
         self._status_lock = threading.Lock()
         self._last_scan_at: float | None = None
         self._last_rotate_at: float | None = None
+        # 失败项当天已补跑的轮次（内存态：重启后重置，最多多试一轮，不会失控）
+        self._retry_date: str = ""
+        self._retry_rounds: int = 0
 
     # ------------------------------------------------------------ 线程生命周期
 
@@ -317,14 +331,26 @@ class LeakGuardWorker:
             )
 
     def _rotation_due(self, now: float) -> bool:
-        """是否到了每日轮换时刻（本地时间）且今天还没轮换过。"""
+        """是否到了每日轮换时刻（本地时间）且今天还没完成过。
+
+        清单里还有上一轮失败留下的条目时，当天最多补跑
+        ``_MAX_ROTATE_ROUNDS_PER_DAY`` 轮（次日重置计数），避免无限重试。
+        """
         lt = time.localtime(now)
-        if self._store.last_rotate_date() == local_date(now):
+        date = local_date(now)
+        if self._store.last_rotate_date() == date:
             return False
-        return (lt.tm_hour, lt.tm_min) >= (self._rotate_hour, self._rotate_minute)
+        if (lt.tm_hour, lt.tm_min) < (self._rotate_hour, self._rotate_minute):
+            return False
+        if not self._store.pending():
+            return True
+        if self._retry_date != date:
+            self._retry_date = date
+            self._retry_rounds = 0
+        return self._retry_rounds < _MAX_ROTATE_ROUNDS_PER_DAY
 
     def _rotate_pending(self, now: float) -> None:
-        """对待轮换清单里的每个账号执行一次轮换；随后清空清单并记下日期。"""
+        """对待轮换清单里的每个账号执行一次轮换；成功项出清，失败项留待重试。"""
         date = local_date(now)
         names = self._store.pending()
         if not names:
@@ -339,20 +365,25 @@ class LeakGuardWorker:
         by_name = {account.name: account for account in self._accounts()}
         ok = 0
         failed = 0
+        remaining: list[str] = []
         for name in names:
             account = by_name.get(name)
             if account is None:
+                # 永久失败（账号已被删掉）：保留只会每天重试一次，直接出清
                 failed += 1
                 self._log(f"[泄漏守卫] 账号 {name} 已不在配置中，跳过轮换")
                 continue
             if not account.user or not account.password:
+                # 凭据可能稍后补上：保留待重试
                 failed += 1
+                remaining.append(name)
                 self._log(f"[泄漏守卫] 账号 {name} 未配置登录凭据，无法轮换")
                 continue
             try:
                 outcome = self._rotate(account)
             except Exception as exc:  # noqa: BLE001 - 单账号异常不影响其它账号
                 failed += 1
+                remaining.append(name)
                 self._log(
                     f"[泄漏守卫] 账号 {name} 轮换异常：{type(exc).__name__}: {exc}"[
                         :DETAIL_LIMIT
@@ -364,15 +395,23 @@ class LeakGuardWorker:
                 self._log(f"[泄漏守卫] 账号 {name} 轮换成功，Key 已更新")
             else:
                 failed += 1
+                remaining.append(name)
                 self._log(
                     f"[泄漏守卫] 账号 {name} 轮换失败（{outcome.status}）：{outcome.message}"
                 )
-        self._store.finish_rotation(date)
+        self._store.finish_rotation(date, keep=remaining)
+        if remaining:
+            if self._retry_date != date:
+                self._retry_date = date
+                self._retry_rounds = 0
+            self._retry_rounds += 1
         self._last_rotate_at = now
         self._set_status(
             self.STATUS_ROTATED,
-            f"轮换 {ok} 成功 / {failed} 失败",
-            log_line=f"[泄漏守卫] {date} 定时轮换完成：成功 {ok}，失败 {failed}",
+            f"轮换 {ok} 成功 / {failed} 失败"
+            + ("（失败项稍后重试）" if remaining else ""),
+            log_line=f"[泄漏守卫] {date} 定时轮换完成：成功 {ok}，失败 {failed}"
+            + (f"，{len(remaining)} 项留待重试" if remaining else ""),
         )
 
     # ------------------------------------------------------------ 手动操作
@@ -445,22 +484,19 @@ class LeakGuardWorker:
         }
 
     def _next_rotate_at(self) -> float:
-        """下一次轮换时刻（本地时间）的 epoch 秒。"""
+        """下一次轮换时刻（本地时间）的 epoch 秒。
+
+        用日历加一天而不是 ``+86400``：跨夏令时那天只有 23 / 25 小时，
+        固定秒数会把 HH:MM 算歪。
+        """
         now = self._clock()
-        lt = time.localtime(now)
-        candidate = time.mktime(
-            (
-                lt.tm_year,
-                lt.tm_mon,
-                lt.tm_mday,
-                self._rotate_hour,
-                self._rotate_minute,
-                0,
-                0,
-                0,
-                -1,
-            )
+        local = datetime.fromtimestamp(now)
+        candidate = local.replace(
+            hour=self._rotate_hour,
+            minute=self._rotate_minute,
+            second=0,
+            microsecond=0,
         )
-        if candidate <= now:
-            candidate += 86400
-        return candidate
+        if candidate <= local:
+            candidate += timedelta(days=1)
+        return candidate.timestamp()

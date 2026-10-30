@@ -790,6 +790,98 @@ class CleanupTest(AutoRenewWorkerTest):
         self.assertEqual(res["status"], "password_error")
         self.assertEqual(worker.account_status()["账号1"]["status"], "password_error")
 
+    def test_rotate_now_persist_failure_returns_plaintext(self):
+        """persist 抛错：状态标 persist_error，明文随返回交还调用方，日志只留脱敏标识。"""
+        from st_rotator.keypool import mask_key
+
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-old"], user="u1", password="p1"
+        )
+
+        def boom(name, keys_list, new_key):
+            raise OSError("disk full")
+
+        worker = self._worker(
+            accounts=[account],
+            login=_FakeLogin(),
+            keys=_FakeKeys(),
+            persist=boom,
+        )
+        res = worker.rotate_now("账号1")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["status"], "persist_error")
+        self.assertEqual(res["key"], "sk-new-plain")
+        self.assertEqual(worker.account_status()["账号1"]["status"], "persist_error")
+        joined = "\n".join(self.log_lines[0])
+        self.assertNotIn("sk-new-plain", joined)
+        self.assertIn(mask_key("sk-new-plain"), joined)
+
+    def test_run_once_persist_failure_does_not_escape(self):
+        """落盘失败不能逃出 run_once：账号状态是 persist_error 而不是笼统的 check_error。"""
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-bad"], user="u1", password="p1"
+        )
+        probe, _ = self._probe_stub({"sk-bad": ("invalid", "401")})
+
+        def boom(name, keys_list, new_key):
+            raise OSError("disk full")
+
+        worker = self._worker(
+            accounts=[account],
+            probe=probe,
+            login=_FakeLogin(),
+            keys=_FakeKeys(),
+            persist=boom,
+        )
+        worker.run_once()
+        self.assertEqual(worker.account_status()["账号1"]["status"], "persist_error")
+
+    def test_login_state_mutations_hold_lock(self):
+        """_bad_password / _locked_until 的所有读写都必须在 _login_state_lock 内。"""
+        from st_rotator.quota import QuotaAuthError, QuotaHTTPError
+
+        account = AccountConfig(
+            name="账号1", api_keys=["sk-a"], user="u1", password="p1"
+        )
+        worker = self._worker(accounts=[account])
+        seen: list[bool] = []
+        lock = worker._login_state_lock
+
+        def locked() -> bool:
+            if lock.acquire(blocking=False):
+                lock.release()
+                return False
+            return True
+
+        class _SpyDict(dict):
+            def get(self, key, default=None):
+                seen.append(locked())
+                return super().get(key, default)
+
+            def __setitem__(self, key, value):
+                seen.append(locked())
+                return super().__setitem__(key, value)
+
+            def pop(self, key, default=None):
+                seen.append(locked())
+                return super().pop(key, default)
+
+        worker._bad_password = _SpyDict()
+        worker._locked_until = _SpyDict()
+        worker._note_login_failure(account, QuotaAuthError("x", wrong_password=True))
+        worker._note_login_failure(
+            account,
+            QuotaHTTPError(
+                "403",
+                response='{"reason":"forbidLoginForMoment","message":"The account has been locked, please try again after 10 minutes"}',
+            ),
+        )
+        self.assertEqual(worker._known_bad_password(account), "x")
+        self.assertGreater(worker._login_locked(account), 0.0)
+        worker._clear_login_failure(account.name)
+        self.assertTrue(seen)
+        self.assertTrue(all(seen), seen)
+
     def test_loop_runs_cleanup_periodically(self):
         account = AccountConfig(name="空账号", api_keys=["sk-1"], user="", password="")
         worker = self._worker(accounts=[account], interval=0.05, cleanup_interval=0.05)

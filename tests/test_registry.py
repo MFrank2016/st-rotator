@@ -423,7 +423,12 @@ class RegistrationAuditTest(unittest.TestCase):
                     "used_phones": [],
                     "spend": {"date": "", "start_balance": None, "last_balance": None},
                     "registrations": [
-                        {"name": "账号0", "phone": "130", "outcome": "ok", "created_at": 1.0},
+                        {
+                            "name": "账号0",
+                            "phone": "130",
+                            "outcome": "ok",
+                            "created_at": 1.0,
+                        },
                         {
                             "name": "账号1",
                             "phone": "131",
@@ -465,3 +470,26 @@ class RegistrationAuditTest(unittest.TestCase):
         reloaded = json.loads(path.read_text(encoding="utf-8"))
         self.assertTrue(all("success" in e for e in reloaded["registrations"]))
         self.assertTrue(all("outcome" not in e for e in reloaded["registrations"]))
+
+
+class RegistryFileModeTest(unittest.TestCase):
+    """replenish.json 含明文账号密码：落盘后必须只有属主可读写。"""
+
+    def _path(self) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return Path(tmp.name) / "replenish.json"
+
+    def test_saved_file_is_owner_only(self):
+        path = self._path()
+        reg = Registry.load(path)
+        reg.claim_phone("13700000000")
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_save_tightens_preexisting_loose_file(self):
+        path = self._path()
+        reg = Registry.load(path)
+        reg.claim_phone("13700000001")
+        path.chmod(0o644)
+        reg.save()
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)

@@ -666,7 +666,7 @@ class ReplenishWorkerTest(unittest.TestCase):
         self.assertEqual(password, "")  # 改密未生效，不落一个假密码
         self.assertEqual(phone, "13800000013")
         self.assertEqual(api_key, "sk-new-plain")
-        self.assertEqual(self.persist_outcomes, ["takeover_password_unset"])
+        # persist 只落「用户名 + 空密码」；不再带 outcome 标记（审计记录里有 detail）
         self.assertEqual(self._status(worker), ReplenishWorker.STATUS_CHECK_ERROR)
 
     # ------------------------------------------------------------ 6. S3 短信超时换新号
@@ -1084,7 +1084,47 @@ class ReplenishWorkerTest(unittest.TestCase):
         self.assertFalse(entry["is_new"])
         self.assertFalse(entry["password_reset"])
         self.assertEqual(entry["detail"], "改密短信超时，账号已接管但未改密")
-        self.assertEqual(entry["username"], "")
+        # 审计必须与实际落盘一致：username 已取回、password 落的是空串
+        self.assertEqual(entry["username"], "接管实名")
+        self.assertEqual(entry["password"], "")
+        self.assertEqual(self.persist_calls[0][0], "接管实名")
+        self.assertEqual(self.persist_calls[0][2], "")
+
+    def test_hard_failures_reset_after_success(self):
+        """NUMBER_FAILURE_MAX 是「连续」失败：中间成功一次就清零，本轮继续补。"""
+        registry = self._registry()
+        sms = _FakeSms(phones=[f"1390{i:07d}" for i in range(8)])
+        worker = self._worker(
+            sms=sms,
+            authn=_FakeAuthn(),
+            keys=_FakeKeys(),
+            registry=registry,
+            target=2,  # need=2：成功一次后仍需再补一个，循环不会提前结束
+        )
+        results = iter(
+            [
+                RuntimeError("boom-1"),
+                RuntimeError("boom-2"),
+                True,  # 成功：hard_failures 清零
+            ]
+            + [RuntimeError(f"boom-{i}") for i in range(3, 3 + NUMBER_FAILURE_MAX)]
+        )
+        calls = {"n": 0}
+
+        def fake_one() -> str:
+            calls["n"] += 1
+            item = next(results)
+            if isinstance(item, Exception):
+                raise item
+            return "ok"
+
+        worker._replenish_one = fake_one  # type: ignore[method-assign]
+        worker._cycle()
+        # 累计口径：成功前已失败 2 次，再失败 NUMBER_FAILURE_MAX-2 次就放弃（共 2+1+3=6 次）；
+        # 连续口径：成功后清零，要连续失败满 NUMBER_FAILURE_MAX 次才放弃（共 2+1+5=8 次）
+        self.assertEqual(calls["n"], 3 + NUMBER_FAILURE_MAX)
+        self.assertEqual(self._status(worker), ReplenishWorker.STATUS_CHECK_ERROR)
+        self.assertIn("本轮放弃", worker.account_status()["_replenish"]["message"])
 
     def test_sms_timeout_giveup_records_failures(self):
         registry = self._registry()
@@ -1106,6 +1146,29 @@ class ReplenishWorkerTest(unittest.TestCase):
         self.assertIn("短信超时", entry["detail"])
         self.assertEqual(entry["phone"], phones[-1])  # 最后一次尝试的号码
         self.assertEqual(registry.count_registrations(False), 1)
+
+    def test_incorrect_sms_code_giveup_records_wrong_reason(self):
+        """验证码校验失败不能被归因成「短信超时」。"""
+        registry = self._registry()
+        phones = [f"1390{i:07d}" for i in range(SOFT_RETRY_MAX)]
+        sms = _FakeSms(phones=phones, msg="【商汤】验证码 888888")
+        authn = _FakeAuthn(
+            sms_login_excs=[
+                AuthnError(400, "incorrect_sms_code", "smsLogin: incorrectSmsCode")
+                for _ in range(SOFT_RETRY_MAX)
+            ]
+        )
+        worker = self._worker(
+            sms=sms, authn=authn, keys=_FakeKeys(), registry=registry, target=1
+        )
+        worker.run_once()
+        (entry,) = registry.registrations()
+        self.assertFalse(entry["success"])
+        self.assertEqual(entry["reason"], "sms_code_wrong")
+        self.assertIn("验证码校验失败", entry["detail"])
+        self.assertIn(
+            "验证码校验失败", worker.account_status()["_replenish"]["message"]
+        )
 
     def test_captcha_required_records_failure(self):
         registry = self._registry()

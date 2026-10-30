@@ -55,6 +55,22 @@ def _as_float(value: Any) -> float:
     return float(value)
 
 
+#: 新契约（9 键）的全部字段；缺任何一个都说明记录损坏，不能猜
+_NEW_RECORD_KEYS = frozenset(
+    {
+        "created_at",
+        "phone",
+        "username",
+        "password",
+        "is_new",
+        "password_reset",
+        "success",
+        "reason",
+        "detail",
+    }
+)
+
+
 def _migrate_registration(entry: Mapping[str, Any]) -> dict[str, Any]:
     """把旧格式注册审计（``name`` / ``outcome``）迁移成新的 9 键契约。
 
@@ -63,8 +79,11 @@ def _migrate_registration(entry: Mapping[str, Any]) -> dict[str, Any]:
     ``outcome == "ok"``，失败时把原 ``outcome`` 放进 ``reason`` 以便追溯（成功记录
     ``reason`` 留空，与新契约一致）。已是新格式的记录原样返回。
     """
-    if "success" in entry:
+    if _NEW_RECORD_KEYS <= set(entry):
         return dict(entry)
+    if "success" in entry:
+        missing = sorted(_NEW_RECORD_KEYS - set(entry))
+        raise RegistryError(f"注册审计记录字段不完整（缺 {missing}）")
     outcome = str(entry.get("outcome") or "")
     success = outcome == "ok"
     return {
@@ -116,8 +135,9 @@ class Registry:
             raise RegistryError(f"replenish.json 不是合法 JSON: {exc}") from exc
         if not isinstance(raw, Mapping):
             raise RegistryError("replenish.json 根节点必须是对象")
-        if raw.get("version") != 1:
-            raise RegistryError(f"replenish.json 版本不支持: {raw.get('version')!r}")
+        version = raw.get("version")
+        if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+            raise RegistryError(f"replenish.json 版本不支持: {version!r}")
         used_raw = raw.get("used_phones")
         if not isinstance(used_raw, list) or not all(
             isinstance(p, str) for p in used_raw
@@ -166,6 +186,8 @@ class Registry:
         tmp.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
+        # 含明文账号密码：收紧到仅属主可读写（write_text 受 umask 影响，通常 0644）
+        os.chmod(tmp, 0o600)
         os.replace(tmp, self.path)
 
     # ------------------------------------------------------------ 已用号码

@@ -907,9 +907,21 @@ class StRotator:
                 self._log(f"[一换一] {key.account} 触发过频（全局 {_FX_ACTIVE} 个任务在烧），跳过")
                 return
             _FX_LAST[key.account] = now
-        threading.Thread(
-            target=self._flash_lite_burn, args=(key, fx), daemon=True, name=f"fx-{key.account}"
-        ).start()
+            # 检查与占用必须原子：自增放在这里，否则 N 个账号的请求会同时通过上限检查
+            _FX_ACTIVE += 1
+        try:
+            threading.Thread(
+                target=self._flash_lite_burn,
+                args=(key, fx),
+                daemon=True,
+                name=f"fx-{key.account}",
+            ).start()
+        except Exception as exc:  # noqa: BLE001 - 线程起不来就归还额度，别永久占用
+            with _FX_LOCK:
+                _FX_ACTIVE -= 1
+            self._log(
+                f"[一换一] {key.account} 烧点线程启动失败：{type(exc).__name__}: {exc}"
+            )
 
     def _flash_lite_burn(self, key: ApiKey, fx: Any) -> None:
         """烧点任务本体（后台线程，不阻塞正常流量）。
@@ -920,8 +932,7 @@ class StRotator:
         3. 推广池积分也耗尽（429 entitlement）→ 收工，不硬烧
         """
         global _FX_ACTIVE
-        with _FX_LOCK:
-            _FX_ACTIVE += 1
+        # 并发额度已在 _maybe_flash_lite_exchange 里原子占用（检查 + 自增同锁）
         try:
             cooldown_s = max(60.0, float(self.config.cooldown.model_unavailable))
             deadline = time.time() + cooldown_s

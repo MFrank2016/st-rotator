@@ -2218,7 +2218,7 @@ function renderSubkeys(state) {
       var u = k.usage || {};
       var last = u.last_used_at ? fmtTime(u.last_used_at) : "—";
       var rate = u.prompt_tokens > 0 ? Math.round((u.cached_tokens || 0) / u.prompt_tokens * 100) + "%" : "—";
-      var shown = skRevealed[k.id] ? k.key : k.masked;
+      var shown = skRevealed[k.id] ? skRevealed[k.id] : k.masked;
       var keyCell = '<span class="mono">' + esc(shown) + "</span> " +
         '<button class="tiny" data-sk="reveal" data-id="' + esc(k.id) + '">' + (skRevealed[k.id] ? "隐藏" : "显示") + "</button> " +
         '<button class="tiny" data-sk="copy" data-id="' + esc(k.id) + '">复制</button>';
@@ -2381,14 +2381,23 @@ async function onSubkeyAction(action, button) {
     return;
   }
   if (action === "reveal") {
-    skRevealed[id] = !skRevealed[id];
-    refreshState();
+    if (skRevealed[id]) { delete skRevealed[id]; refreshState(); return; }
+    try {
+      var data = await api("/api/subkeys/reveal", { method: "POST", body: JSON.stringify({ id: id }) });
+      skRevealed[id] = data.key;
+      refreshState();
+    } catch (err) { toast(err.message, "err"); }
     return;
   }
   if (action === "copy") {
-    var sk = lastState.subkeys || {};
-    var found = (sk.keys || []).filter(function (k) { return k.id === id; })[0];
-    copyText(found ? found.key : "", "子 Key");
+    try {
+      var key = skRevealed[id];
+      if (!key) {
+        var revealed = await api("/api/subkeys/reveal", { method: "POST", body: JSON.stringify({ id: id }) });
+        key = revealed.key;
+      }
+      copyText(key, "子 Key");
+    } catch (err) { toast(err.message, "err"); }
     return;
   }
 }

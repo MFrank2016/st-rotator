@@ -298,6 +298,35 @@ class RotateAccountTest(unittest.TestCase):
         self.assertEqual(outcome.status, "check_error")
         self.assertEqual(len(outcome.message), DETAIL_LIMIT)
 
+    # ------------------------------------------------------------ 9. 落盘失败
+    def test_persist_failure_returns_plaintext_and_marks_reason(self):
+        """persist 抛错：异常不逃逸，明文随结果交还调用方，状态标 persist_error。"""
+        account = self._account(api_keys=["sk-a"])
+        keys = _FakeKeys()
+
+        def boom(name, keys_list, new_key):
+            raise OSError("disk full")
+
+        outcome = rotate_account(
+            account, login=_FakeLogin(), keys=keys, persist=boom
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.status, "persist_error")
+        self.assertEqual(outcome.new_key, "sk-new-plain")
+        self.assertIn("disk full", outcome.message)
+        self.assertLessEqual(len(outcome.message), DETAIL_LIMIT)
+        # 明文只走返回值，不进错误文案
+        self.assertNotIn("sk-new-plain", outcome.message)
+
+    def test_success_outcome_carries_no_plaintext(self):
+        """成功路径已落盘，结果里不带明文（避免多一条泄露面）。"""
+        account = self._account(api_keys=["sk-a"])
+        outcome = rotate_account(
+            account, login=_FakeLogin(), keys=_FakeKeys(), persist=self._persist
+        )
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.new_key, "")
+
 
 if __name__ == "__main__":
     unittest.main()

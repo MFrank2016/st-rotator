@@ -294,6 +294,7 @@ def _endpoint_label(method: str, url: str) -> str:
 
 
 # 请求体里绝不明文落日志的字段：密码 / 短信验证码 / token / 签名 / 授权码
+# 以及手机号、用户名、login challenge、验证码 code_key（同样能定位到人 / 会话）
 _SENSITIVE_KEYS = frozenset(
     {
         "password",
@@ -303,6 +304,10 @@ _SENSITIVE_KEYS = frozenset(
         "access_token",
         "refresh_token",
         "code",
+        "phone",
+        "user_name",
+        "challenge",
+        "code_key",
     }
 )
 
@@ -393,6 +398,10 @@ class HttpAuthn:
         # urllib 分支共用一个 Cookie 罐：register/smsLogin 建立的会话 Cookie 必须在随后
         # 跟随 OIDC 重定向换取 code 时可见，否则 /oauth2/auth 不返回 code（curl 分支同理）。
         self._shared_opener = self._opener()
+        # 本次授权请求发出的 state，exchange_code 时比对回调里的 state（CSRF 防护）。
+        # 补号流程是「mint → register/smsLogin → exchange」的串行序列，同一实例同一时刻
+        # 只跑一个尝试，实例级保存足够；并发共用实例会因 state 被覆盖而失败（fail-closed）。
+        self._oidc_state: str | None = None
 
     def reset_session(self) -> None:
         """清空会话 Cookie，隔离每个补号尝试。
@@ -609,6 +618,26 @@ class HttpAuthn:
             raise AuthnError(0, "unknown", f"重定向 URL 缺少 {key}")
         return match.group(1)
 
+    def _verify_state(self, redirect_url: str) -> None:
+        """比对回调 state 与本次授权请求发出的 state；不一致即拒绝（CSRF 防护）。
+
+        没有会话存储，state 只能挂在实例上（见 ``_oidc_state`` 的说明）。
+        回调里缺 state 也按不一致处理：宁可失败，也不接受无法核验的授权码。
+        """
+        expected = self._oidc_state
+        if expected is None:
+            raise AuthnError(
+                0, "unknown", "OIDC state 未初始化（未先调用 mint_login_challenge）"
+            )
+        got = (
+            urllib.parse.parse_qs(urllib.parse.urlsplit(redirect_url).query).get(
+                "state"
+            )
+            or [""]
+        )[0]
+        if not secrets.compare_digest(got, expected):
+            raise AuthnError(0, "invalid", "OIDC state 校验失败（回调 state 不匹配）")
+
     # --- OIDC 流程 ---
     def mint_login_challenge(self, *, intent: str | None = None) -> tuple[str, str]:
         """走 Hydra authorize + PKCE，跟随重定向拿到 login_challenge。
@@ -616,6 +645,7 @@ class HttpAuthn:
         返回 (challenge, code_verifier)；``intent="register"`` 时附加 intent 参数。
         """
         verifier, challenge = _pkce()
+        state = secrets.token_urlsafe(16)
         params: dict[str, str] = {
             "client_id": CLIENT_ID,
             "response_type": "code",
@@ -623,7 +653,7 @@ class HttpAuthn:
             "scope": SCOPE,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
-            "state": secrets.token_urlsafe(16),
+            "state": state,
         }
         if intent == "register":
             params["intent"] = "register"
@@ -648,6 +678,7 @@ class HttpAuthn:
             )
         if not loc:
             raise AuthnError(0, "unknown", "未能获取 login_challenge")
+        self._oidc_state = state
         return self._query_param(loc, "login_challenge"), verifier
 
     def exchange_code(
@@ -667,6 +698,7 @@ class HttpAuthn:
             )
         if not loc:
             raise AuthnError(0, "unknown", "未能获取 authorization code")
+        self._verify_state(loc)
         code = self._query_param(loc, "code")
         form = urllib.parse.urlencode(
             {

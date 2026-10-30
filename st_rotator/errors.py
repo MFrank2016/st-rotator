@@ -2,10 +2,13 @@
 
 分层原则：
 - ``RotatorError``      本工具所有异常的基类，方便调用方一把兜住
+- ``ConfigError``       配置文件缺失 / 格式非法 / 字段取值不合法
 - ``NoAvailableKey``    "暂时没有可用 Key"——可重试，通常是全部冷却中
 - ``AllKeysInvalid``    "所有 Key 都废了"——不可重试，必须换凭据
 - ``RotationExhausted`` "轮换用尽仍失败"——重试次数打完还没成功
 - ``ApiError``          "上游明确拒绝"——4xx 业务错误，换 Key 也没用
+- ``StreamInterrupted`` 流式已开始吐字后中断——不能重试（避免重复输出）
+- ``DeadlineExceeded``  整条请求超出墙钟预算——主动断开上游
 """
 
 from __future__ import annotations

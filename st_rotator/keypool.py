@@ -282,6 +282,7 @@ class ApiKey:
         cooldown = max(0.0, self.cooldown_until - now)
         if self.account_state is not None:
             cooldown = max(cooldown, self.account_state.cooldown_until - now)
+            self.account_state._prune(now)  # 账号级窗口也要清旧条目，否则 rpm_window 只涨不落
             window_len = len(self.account_state._window)
             rpm_limit = self.account_state.rpm_limit or self.rpm_limit
         else:
@@ -515,6 +516,11 @@ class KeyPool:
                     return self._reserve(self._pick(candidates), now)
 
                 wait = self._next_wait(now, excluded)
+                if wait is None:
+                    # 没有任何可等待的 Key：再等也不会有 release 把它变出来
+                    raise NoAvailableKey(
+                        f"没有可用的 Key（全部失效或本轮已排除）：{self._describe(now, excluded)}"
+                    )
                 if fail_fast > 0 and wait > fail_fast:
                     raise NoAvailableKey(
                         f"最快 {wait:.0f}s 后才有 Key 可用（超过快速失败阈值 {fail_fast:g}s）："
@@ -607,8 +613,12 @@ class KeyPool:
                 return key
         return candidates[0]
 
-    def _next_wait(self, now: float, excluded: frozenset[str]) -> float:
-        """还需要等多久才可能有 Key 可用（0 表示只是并发打满，等 release 通知）。"""
+    def _next_wait(self, now: float, excluded: frozenset[str]) -> float | None:
+        """还需要等多久才可能有 Key 可用。
+
+        ``0.0`` = 只是并发打满，等 release 通知即可；
+        ``None`` = 没有任何可等的 Key（全部失效或本轮已排除），等下去也不会有结果。
+        """
         soonest: float | None = None
         for key in self._keys:
             if key.key in excluded or key.status is KeyStatus.INVALID:
@@ -617,7 +627,7 @@ class KeyPool:
             if moment <= now:
                 return 0.0
             soonest = moment if soonest is None else min(soonest, moment)
-        return 0.0 if soonest is None else max(soonest - now, 0.0)
+        return None if soonest is None else max(soonest - now, 0.0)
 
     def any_usable(self) -> bool:
         """当前是否有任何 Key 立即可用（不等待）。额度耗尽的快速失败靠它判断。"""
@@ -627,11 +637,12 @@ class KeyPool:
             return any(k.is_usable(now) for k in self._keys)
 
     def soonest_wait(self) -> float:
-        """最快还要等多久才有 Key 可用（秒）。"""
+        """最快还要等多久才有 Key 可用（秒）；没有可等的 Key 时返回 0。"""
         with self._cond:
             now = self._clock()
             self._refresh(now)
-            return self._next_wait(now, frozenset())
+            wait = self._next_wait(now, frozenset())
+            return 0.0 if wait is None else wait
 
     def _describe(self, now: float, excluded: frozenset[str] = frozenset()) -> str:
         parts = []
@@ -709,6 +720,10 @@ class KeyPool:
             if retry_after and retry_after > delay:
                 delay = min(retry_after, self.cooldown.max * 4)  # 尊重服务端建议，但别被拖死
             now = self._clock()
+            # 状态只升不降：已判 INVALID 的 Key 不能被 429 降级成 COOLDOWN
+            # （否则会继续打已知失效的凭据，还会用更短的冷却提前复活它）
+            if key.status is KeyStatus.INVALID:
+                return delay
             key.status = KeyStatus.COOLDOWN
             key.cooldown_until = now + delay
             key.cooldown_set_at = now
@@ -737,6 +752,9 @@ class KeyPool:
             key.stats.failures += 1
             delay = self.cooldown.server_error
             now = self._clock()
+            # 同 report_rate_limit：INVALID 不被 5xx 降级
+            if key.status is KeyStatus.INVALID:
+                return delay
             key.status = KeyStatus.COOLDOWN
             key.cooldown_until = max(key.cooldown_until, now + delay)
             key.cooldown_set_at = now
@@ -780,6 +798,9 @@ class KeyPool:
                 return 0.0
             now = self._clock()
             until = now + delay
+            # 同 report_rate_limit：INVALID 不被「模型不在套餐」降级
+            if key.status is KeyStatus.INVALID:
+                return delay
             key.status = KeyStatus.COOLDOWN
             key.cooldown_until = max(key.cooldown_until, until)
             key.cooldown_set_at = now

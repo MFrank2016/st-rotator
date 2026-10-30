@@ -185,7 +185,10 @@ class SubKeyManager:
             return False
 
     def save(self) -> bool:
-        """立即落盘（幂等；内部有脏标记，无修改时不会重复写）。"""
+        """立即落盘（无条件完整重写，不检查脏标记；幂等但不会跳过写入）。
+
+        只有后台自动保存线程才按 ``_dirty`` 决定是否写。
+        """
         with self._lock:
             return self._save_locked()
 
@@ -227,8 +230,16 @@ class SubKeyManager:
                     return key
         return None
 
+    def reveal(self, identifier: str) -> str:
+        """按 id / 名称返回单个子 Key 的完整密钥（仅供控制台「显示 / 复制」）。
+
+        完整密钥刻意不进 :meth:`snapshot`：状态快照会整页下发，泄漏面太大。
+        """
+        with self._lock:
+            return self._require(identifier).key
+
     def snapshot(self) -> List[Dict[str, Any]]:
-        """全部子 Key 的展示快照（新创建的在前）。"""
+        """全部子 Key 的展示快照（新创建的在前，只含掩码，绝不含明文）。"""
         with self._lock:
             items: List[Dict[str, Any]] = []
             for key in self._keys:
@@ -239,7 +250,6 @@ class SubKeyManager:
                     {
                         "id": key.id,
                         "name": key.name,
-                        "key": key.key,
                         "masked": key.masked,
                         "enabled": key.enabled,
                         "created_at": key.created_at,
@@ -375,8 +385,9 @@ class SubKeyManager:
             return sub
 
     def update(self, identifier: str, *, name: Optional[str] = None, note: Optional[str] = None) -> SubKey:
-        sub = self._require(identifier)
+        # 查找与修改必须在同一临界区：否则并发 revoke 会让这次修改落到孤儿对象上
         with self._lock:
+            sub = self._require(identifier)
             if name is not None:
                 name = (name or "").strip()
                 if not name:
@@ -393,29 +404,30 @@ class SubKeyManager:
 
     def set_enabled(self, identifier: str, enabled: bool) -> SubKey:
         """启用 / 停用子 Key。停用后该 Key 立即无法通过认证。"""
-        sub = self._require(identifier)
         with self._lock:
+            sub = self._require(identifier)
             sub.enabled = bool(enabled)
             self._dirty = True
             return sub
 
     def revoke(self, identifier: str) -> SubKey:
         """删除子 Key（撤销后该 Key 永久失效，历史记录保留）。"""
-        sub = self._require(identifier)
         with self._lock:
+            sub = self._require(identifier)
             self._keys.remove(sub)
             self._dirty = True
             return sub
 
     def reset_usage(self, identifier: str) -> SubKey:
         """清零该子 Key 的用量统计（不影响历史记录）。"""
-        sub = self._require(identifier)
         with self._lock:
+            sub = self._require(identifier)
             sub.usage = dict(_EMPTY_USAGE)
             self._dirty = True
             return sub
 
     def _require(self, identifier: str) -> SubKey:
+        """按 id / 名称 / 明文查找；调用方必须已持锁（RLock，可与 find 重入）。"""
         sub = self.find(identifier)
         if sub is None:
             raise KeyError("找不到指定的子 Key")

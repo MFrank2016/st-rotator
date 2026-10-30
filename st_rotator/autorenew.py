@@ -236,13 +236,17 @@ class RotationOutcome:
     """一次账号轮换的结果。
 
     ``status`` 取 ``AutoRenewWorker.STATUS_*`` 之一（ok / password_error /
-    check_error / unavailable）；本结构只承载结果，不负责写状态或打日志。
+    check_error / unavailable / persist_error）；本结构只承载结果，不负责写状态或打日志。
+
+    ``new_key`` 只在「平台已新建但本地落盘失败」（persist_error）时非空：
+    新 Key 明文只由 create_key 返回一次，必须交给调用方补救，不能静默丢弃。
     """
 
     ok: bool
     status: str
     message: str = ""
     wrong_password: bool = False
+    new_key: str = ""
 
 
 def rotate_account(
@@ -299,7 +303,19 @@ def rotate_account(
             False, "check_error", f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT]
         )
     emit(f"账号 {account.name}：已新建 Key {mask_key(created.api_key)}（{key_type}）")
-    persist(account.name, list(account.api_keys), created.api_key)
+    try:
+        persist(account.name, list(account.api_keys), created.api_key)
+    except Exception as exc:  # noqa: BLE001 - 落盘失败不能让明文随异常一起消失
+        # 明文不进日志（日志会落文件 / 控制台 / 远端），只随返回值交给调用方。
+        return RotationOutcome(
+            False,
+            "persist_error",
+            (
+                f"新 Key 落盘失败（平台侧已生效，{mask_key(created.api_key)}）："
+                f"{type(exc).__name__}: {exc}"
+            )[:DETAIL_LIMIT],
+            new_key=created.api_key,
+        )
     emit(f"账号 {account.name}：本地 Key 已更新为 {mask_key(created.api_key)}")
     return RotationOutcome(True, "ok", "")
 
@@ -318,6 +334,7 @@ class AutoRenewWorker:
     * ``password_error`` —— 登录失败且判定为凭据 / 密码问题。
     * ``check_error``    —— 登录或平台操作瞬时失败（网络 / 风控），下次再试。
     * ``unavailable``    —— 缺 jwcrypto 等依赖，无法登录。
+    * ``persist_error``  —— 平台已新建 Key 但本地落盘失败（明文随结果返回，需人工补救）。
 
     ``password_error`` 只能由「登录成功」（含配置密码改变后重新登录成功）清除；
     Key 探测不会清除它。登录被平台风控锁定时按锁定剩余时间退避，期间不重试，
@@ -334,6 +351,7 @@ class AutoRenewWorker:
     STATUS_PASSWORD_ERROR = "password_error"  # 登录失败且判定为凭据/密码问题
     STATUS_CHECK_ERROR = "check_error"  # 登录或平台操作瞬时失败（网络/风控），下次再试
     STATUS_UNAVAILABLE = "unavailable"  # 缺 jwcrypto 等依赖，无法登录
+    STATUS_PERSIST_ERROR = "persist_error"  # 平台已换 Key 但本地落盘失败
 
     def __init__(
         self,
@@ -367,6 +385,8 @@ class AutoRenewWorker:
         self._bad_password: dict[str, tuple[str, str]] = {}
         # 账号名 → 登录锁定截止时刻（time.monotonic()）
         self._locked_until: dict[str, float] = {}
+        # 上面两个字典同时被 daemon 循环与 rotate_now（UI/HTTP 线程）读写，单独加锁
+        self._login_state_lock = threading.Lock()
 
     # ------------------------------------------------------------ 线程生命周期
     def start(self) -> None:
@@ -446,8 +466,7 @@ class AutoRenewWorker:
             )
             self._log_failure_context(account.name, exc)
             return
-        self._bad_password.pop(account.name, None)
-        self._locked_until.pop(account.name, None)
+        self._clear_login_failure(account.name)
         try:
             extras = [
                 item
@@ -468,29 +487,41 @@ class AutoRenewWorker:
 
     def _known_bad_password(self, account: AccountConfig) -> str | None:
         """配置里的密码此前已被判错时返回当时的错误文案；密码改过则视为未知。"""
-        entry = self._bad_password.get(account.name)
+        with self._login_state_lock:
+            entry = self._bad_password.get(account.name)
         if entry is not None and entry[0] == account.password:
             return entry[1]
         return None
 
     def _login_locked(self, account: AccountConfig) -> float:
         """登录被平台锁定的剩余秒数；未锁定（或已到期）返回 0。"""
-        until = self._locked_until.get(account.name)
+        with self._login_state_lock:
+            until = self._locked_until.get(account.name)
         if until is None:
             return 0.0
         return max(0.0, until - time.monotonic())
 
+    def _clear_login_failure(self, name: str) -> None:
+        """登录成功：清掉该账号的密码错误 / 平台锁定记录。"""
+        with self._login_state_lock:
+            self._bad_password.pop(name, None)
+            self._locked_until.pop(name, None)
+
     def _note_login_failure(self, account: AccountConfig, exc: Exception) -> None:
         """登记登录失败：明确密码错长期跳过；平台锁定则退避到截止时刻（只记一次日志）。"""
-        if isinstance(exc, QuotaAuthError) and getattr(exc, "wrong_password", False):
-            self._bad_password[account.name] = (account.password, str(exc))
-        if isinstance(exc, QuotaHTTPError):
-            seconds = login_lock_seconds(exc)
-            if seconds is not None:
-                self._locked_until[account.name] = time.monotonic() + seconds
-                self._log(
-                    f"账号 {account.name}：登录被平台锁定，{int(seconds // 60)} 分钟内不再尝试"
-                )
+        locked_seconds: int | None = None
+        with self._login_state_lock:
+            if isinstance(exc, QuotaAuthError) and getattr(exc, "wrong_password", False):
+                self._bad_password[account.name] = (account.password, str(exc))
+            if isinstance(exc, QuotaHTTPError):
+                seconds = login_lock_seconds(exc)
+                if seconds is not None:
+                    self._locked_until[account.name] = time.monotonic() + seconds
+                    locked_seconds = int(seconds // 60)
+        if locked_seconds is not None:  # 锁外打日志：日志回调里可能再取锁
+            self._log(
+                f"账号 {account.name}：登录被平台锁定，{locked_seconds} 分钟内不再尝试"
+            )
 
     def _log_failure_context(self, account_name: str, exc: Exception) -> None:
         """失败时打印请求 / 响应报文，便于排查（请求只记端点，不含请求体）。"""
@@ -564,7 +595,7 @@ class AutoRenewWorker:
             return RotationOutcome(False, self.STATUS_CHECK_ERROR, "登录被平台锁定")
 
         def _on_login() -> None:
-            self._bad_password.pop(account.name, None)
+            self._clear_login_failure(account.name)
             self._log(f"账号 {account.name}：{reason}，开始轮换")
 
         def _login_guarded(user: str, password: str) -> TokenBundle:
@@ -594,6 +625,17 @@ class AutoRenewWorker:
             self._set_status(account.name, self.STATUS_UNAVAILABLE, outcome.message)
         elif outcome.status == self.STATUS_CHECK_ERROR:
             self._set_status(account.name, self.STATUS_CHECK_ERROR, outcome.message)
+        elif outcome.status == self.STATUS_PERSIST_ERROR:
+            # 明文只在 outcome.new_key 里（不进日志），日志只报脱敏标识与补救动作
+            self._set_status(
+                account.name,
+                self.STATUS_PERSIST_ERROR,
+                outcome.message,
+                log_line=(
+                    f"账号 {account.name}：新 Key 落盘失败，平台侧已生效（"
+                    f"{mask_key(outcome.new_key)}），请到平台复制该 Key 或重新轮换"
+                ),
+            )
         else:
             self._set_status(
                 account.name,
@@ -606,8 +648,9 @@ class AutoRenewWorker:
     def rotate_now(self, name: str) -> dict[str, Any]:
         """手动轮换某账号的 Key：登录 → 注销该账号全部 Key → 新建 → 落盘。
 
-        返回 ``{"ok", "status", "message"}``（**不含明文 Key**）。与自动轮换共用同一套
-        登录 / 平台调用 / persist，并同样把结果写入账号状态。
+        返回 ``{"ok", "status", "message"}``；仅在落盘失败（persist_error）时额外带
+        ``"key"``（平台已新建、本地未落盘的明文，只此一次），其余情况**不含明文 Key**。
+        与自动轮换共用同一套登录 / 平台调用 / persist，并同样把结果写入账号状态。
         """
         account = next((a for a in self._accounts() if a.name == name), None)
         if account is None:
@@ -623,11 +666,15 @@ class AutoRenewWorker:
                 "message": f"账号 {name} 未配置登录凭据",
             }
         outcome = self._rotate(account, reason="手动轮换")
-        return {
+        result = {
             "ok": outcome.ok,
             "status": outcome.status,
             "message": outcome.message,
         }
+        if outcome.new_key:
+            # 落盘失败：明文随结果交还调用方，否则平台上的新 Key 本地无记录
+            result["key"] = outcome.new_key
+        return result
 
     def _set_status(
         self, name: str, status: str, message: str, *, log_line: str | None = None

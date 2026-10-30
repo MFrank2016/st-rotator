@@ -42,6 +42,20 @@ class GuardStoreTest(unittest.TestCase):
             self.assertEqual(reloaded.pending(), [])
             self.assertEqual(reloaded.last_rotate_date(), "2026-10-09")
 
+    def test_finish_rotation_keeps_failed_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "guard.json"
+            store = GuardStore.load(path)
+            store.add_pending(["A", "B"])
+            store.finish_rotation("2026-10-09", keep=["B"])
+            self.assertEqual(store.pending(), ["B"])
+            # 还有遗留失败项：不能记日期，否则当天不会再重试
+            self.assertEqual(store.last_rotate_date(), "")
+            self.assertEqual(GuardStore.load(path).pending(), ["B"])
+            store.finish_rotation("2026-10-09")
+            self.assertEqual(store.pending(), [])
+            self.assertEqual(store.last_rotate_date(), "2026-10-09")
+
     def test_corrupt_json_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "guard.json"

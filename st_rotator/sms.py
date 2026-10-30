@@ -22,7 +22,8 @@ from .quota import USER_AGENT
 
 # ---------------------------------------------------------------- 常量
 ERROR_MARKER = "ERROR:"
-CODE_RUN = re.compile(r"(?<!\d)\d{6,8}(?!\d)")  # 两端均非数字的 6-8 位连续数字串
+# 两端均非数字的 6-8 位连续数字串；re.ASCII 防止全角数字（１２３４５６）被误当成验证码
+CODE_RUN = re.compile(r"(?<!\d)\d{6,8}(?!\d)", re.ASCII)
 
 
 class SmsError(RuntimeError):
@@ -110,7 +111,7 @@ class EjiemaSms:
 
     def get_phone(self, *, keyword: str = "商汤") -> str:
         """获取一个号码（keyWord 为发件人标签，如【商汤】→ 商汤）。"""
-        return self._request("getPhone", keyWord=keyword)
+        return self._request("getPhone", keyWord=keyword).strip()
 
     def get_msg(self, phone: str, *, keyword: str) -> str:
         """拉取该号码的短信原文（可能含 ``[尚未收到]``，由调用方轮询处理）。"""

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as futures
+import os
 import secrets
 import sys
 import threading
@@ -37,7 +38,6 @@ from .errors import (
     RotatorError,
     StreamInterrupted,
 )
-from .keypool import mask_key
 
 if TYPE_CHECKING:  # 仅类型标注用，运行时走函数内 lazy import
     from .autorenew import AutoRenewWorker, KeyTransport
@@ -50,8 +50,6 @@ if TYPE_CHECKING:  # 仅类型标注用，运行时走函数内 lazy import
     from .quota import TokenBundle
 
 # ---------------------------------------------------------------- 输出工具
-
-_WIDTHS = {"account": 12, "key": 18, "status": 10}
 
 
 def _print_table(
@@ -306,15 +304,19 @@ def _run_bench(
 
 def _print_bench(stats: dict[str, Any]) -> None:
     lat = stats["latencies"]
+    total = stats["total"]
     print(f"\n=== 压测结果 ===")
-    print(f"请求总数      : {stats['total']}  (并发 {stats['parallel']})")
+    print(f"请求总数      : {total}  (并发 {stats['parallel']})")
     print(
         f"max_tokens    : {stats['max_tokens'] if stats['max_tokens'] else '未设限（延迟会含模型生成时间）'}"
     )
     print(f"耗时          : {stats['wall']:.2f}s  →  实际吞吐 {stats['qps']:.2f} req/s")
-    print(
-        f"成功          : {stats['success']}  ({stats['success'] / stats['total']:.1%})"
-    )
+    if total:
+        print(
+            f"成功          : {stats['success']}  ({stats['success'] / total:.1%})"
+        )
+    else:
+        print("成功          : 0  (本次未发起请求，跳过成功率统计)")
     print(f"重试后仍 429  : {stats['rate_limited']}")
     print(f"其他失败      : {stats['failed']}")
     if lat:
@@ -592,9 +594,7 @@ def build_replenish_persist(
     此处不再重复登记，避免一条成功被记两笔。
     """
 
-    def persist(
-        user: str, phone: str, password: str, api_key: str, outcome: str = "ok"
-    ) -> None:
+    def persist(user: str, phone: str, password: str, api_key: str) -> None:
         with lock:
             name = account_name_for(user, store.account_names())
             rotator.pool.add_key(api_key, account=name)  # pool FIRST（铁律）
@@ -892,14 +892,26 @@ def _load_or_create_token(directory: Path) -> str:
     try:
         existing = path.read_text(encoding="utf-8").strip()
         if existing:
+            try:
+                os.chmod(path, 0o600)  # 旧版本留下的 0644 文件顺手收紧
+            except OSError:
+                pass
             return existing
     except OSError:
         pass
     token = secrets.token_urlsafe(18)
     try:
-        path.write_text(token, encoding="utf-8")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     except OSError:
-        pass  # 写不进去也要能跑，只是下次会换一个新口令
+        return token  # 写不进去也要能跑，只是下次会换一个新口令
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            # 口令文件必须 0600；O_CREAT 不改已存在旧文件的权限，写前再收紧一次
+            # （用 os.chmod 而不是 os.fchmod：后者只有 Unix 有，托盘也跑在 Windows）
+            os.chmod(path, 0o600)
+            handle.write(token)
+    except OSError:
+        pass
     return token
 
 
@@ -975,6 +987,10 @@ def cmd_tray(args: argparse.Namespace) -> int:
         )
     except OSError as exc:
         sink(f"[错误] 无法监听 {args.host}:{args.port}：{exc}")
+        # 端口占用：worker 已经 start()，必须先停掉，否则它们会对着已关闭的 rotator 空转
+        for worker in (console.auto_renew, console.replenish, console.leak_guard):
+            if worker is not None:
+                worker.stop()
         rotator.close()
         return 1
 

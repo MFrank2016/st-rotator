@@ -143,7 +143,8 @@ class AdaptiveRateLimiter:
         self._penalties = 0
         self._raises = 0
         self._successes = 0
-        self._history: list[tuple[float, float]] = []  # (时刻, 速率) 便于排查
+        # (单调时刻, 速率, 墙钟时刻) 便于排查
+        self._history: list[tuple[float, float, float]] = []
 
     # ------------------------------------------------------------ 只读
 
@@ -216,8 +217,11 @@ class AdaptiveRateLimiter:
             return self._rate
 
     def _record(self, now: float) -> None:
-        # 只保留最近 200 次调整，避免长期运行吃内存
-        self._history.append((round(now, 3), round(self._rate, 4)))
+        # 只保留最近 200 次调整，避免长期运行吃内存。
+        # 第一列是单调时钟（用于计算 / 排序），第三列是墙钟时间（便于和日志对齐）。
+        self._history.append(
+            (round(now, 3), round(self._rate, 4), round(time.time(), 3))
+        )
         if len(self._history) > 200:
             del self._history[:100]
 

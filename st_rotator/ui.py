@@ -32,7 +32,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
@@ -517,6 +516,17 @@ class ConsoleState:
                 "message": f"已创建子 Key：{sub.name}。完整密钥只显示这一次，请立即复制保存。",
             }
         )
+
+    def reveal_subkey(self, identifier: str) -> UiResponse:
+        """按需取回单个子 Key 的完整密钥（控制台「显示 / 复制」用）。"""
+        try:
+            manager = self._require_subkeys()
+            key = manager.reveal(identifier)
+        except ConfigError:
+            return UiResponse.error("未启用子 Key", status=404)
+        except KeyError as exc:
+            return UiResponse.error(str(exc), status=404)
+        return UiResponse.json({"ok": True, "id": identifier, "key": key})
 
     def update_subkey(self, identifier: str, *, name: str | None = None, note: str | None = None) -> UiResponse:
         try:
@@ -1014,6 +1024,22 @@ class ConsoleState:
             self._log(
                 f"[控制台] 账号 {name}：更换 Key 失败（{result.get('status')}）：{message}"
             )
+            if result.get("key"):
+                # 平台已新建但本地落盘失败：明文随错误响应交还调用方（仅此一次）
+                return UiResponse.json(
+                    {
+                        "ok": False,
+                        "account": name,
+                        "status": result.get("status"),
+                        "key": result["key"],
+                        "error": {
+                            "message": message,
+                            "code": None,
+                            "type": "console_error",
+                        },
+                    },
+                    status=status,
+                )
             return UiResponse.error(message, status=status)
         fresh = next((a for a in self.config.accounts if a.name == name), None)
         new_key = fresh.api_keys[0] if fresh and fresh.api_keys else ""
@@ -1484,10 +1510,8 @@ class ConsoleState:
                     rpm_limit_raw = payload.get("rpm_limit")
                     rpm_limit: int | None = None
                     if rpm_limit_raw is not None and str(rpm_limit_raw).strip() != "":
-                        try:
-                            rpm_limit = _clamp_int(rpm_limit_raw, 30, 1, 10000)
-                        except Exception:
-                            rpm_limit = None
+                        # _clamp_int 内部已兜住非法值（返回默认 30），不需要再包一层
+                        rpm_limit = _clamp_int(rpm_limit_raw, 30, 1, 10000)
                     return self.add_keys(
                         str(payload.get("keys") or payload.get("key") or ""),
                         account=(str(payload.get("account")).strip() or None)
@@ -1536,6 +1560,8 @@ class ConsoleState:
                     return self.create_subkey(
                         str(payload.get("name") or ""), note=str(payload.get("note") or "")
                     )
+                if path == "/api/subkeys/reveal":
+                    return self.reveal_subkey(str(payload.get("id") or ""))
                 if path == "/api/subkeys/update":
                     return self.update_subkey(
                         str(payload.get("id") or ""),
@@ -1695,7 +1721,10 @@ def open_console_window(
     if not executable:
         return False, "未找到 Edge / Chrome，请手动用浏览器打开该地址"
     profile = Path(profile_dir) if profile_dir else default_profile_dir()
-    profile.mkdir(parents=True, exist_ok=True)
+    try:
+        profile.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return False, f"无法创建独立配置目录 {profile}：{exc}"
     command = [
         executable,
         f"--app={url}",

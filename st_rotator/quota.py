@@ -64,10 +64,13 @@ class QuotaHTTPError(RuntimeError):
         self,
         detail: str,
         *,
+        status: int | None = None,
         request: str | None = None,
         response: str | None = None,
     ) -> None:
         super().__init__(detail)
+        # 原生 HTTPError 的 code 只留在 detail 文本里，调用方无法判断 401 —— 单列出来
+        self.status = status
         self.request = request
         self.response = response
 
@@ -334,6 +337,7 @@ class HttpQuotaTransport:
             detail = f"HTTP {exc.code} {exc.reason} [{step}] {url}"
             raise QuotaHTTPError(
                 detail + (f" :: {raw[:300]}" if raw else ""),
+                status=exc.code,
                 request=f"{method} {urllib.parse.urlsplit(url).path}",
                 response=raw[:2000],
             ) from exc
@@ -356,9 +360,17 @@ class HttpQuotaTransport:
             urllib.request.Request(JWKS_URL, headers={"User-Agent": USER_AGENT}),
             step="jwks",
         )
-        jwks = json.loads(resp.read().decode("utf-8"))
-        key = next(k for k in jwks["keys"] if k.get("kid") == JWKS_KID)
-        self._pubkey = jwk.JWK(kty="RSA", n=key["n"], e=key["e"])
+        raw = resp.read().decode("utf-8", "replace")
+        try:
+            jwks = json.loads(raw)
+            key = next(k for k in jwks["keys"] if k.get("kid") == JWKS_KID)
+            self._pubkey = jwk.JWK(kty="RSA", n=key["n"], e=key["e"])
+        except (ValueError, KeyError, TypeError, AttributeError, StopIteration) as exc:
+            raise QuotaHTTPError(
+                f"JWKS 响应缺少 kid={JWKS_KID} 的公钥：{type(exc).__name__}: {exc}",
+                request=f"GET {urllib.parse.urlsplit(JWKS_URL).path}",
+                response=raw[:2000],
+            ) from exc
         return self._pubkey
 
     def login(self, user: str, password: str) -> TokenBundle:
@@ -674,23 +686,28 @@ class QuotaService:
         return None
 
     def _fetch_one(self, name: str, user: str, phone: str) -> AccountQuota:
+        # 调用方不得持锁：这里会做多次 HTTP（单次超时 20s）
         try:
-            token = self._tokens.get(name)
-            if token is not None and self._token_needs_refresh(token):
-                token = None
-                self._tokens.pop(name, None)
+            with self._lock:
+                token = self._tokens.get(name)
+                if token is not None and self._token_needs_refresh(token):
+                    token = None
+                    self._tokens.pop(name, None)
             if token is None:
                 token = self._transport.login(user, self._password_of(name))
-                self._tokens[name] = token
+                with self._lock:
+                    self._tokens[name] = token
             try:
                 pools = self._transport.fetch_pools(token.access_token)
-            except urllib.error.HTTPError as exc:
-                if exc.code != 401:
-                    raise
+            except QuotaHTTPError as exc:
                 # 401：token 失效 → 丢弃、重新登录一次，再重试一次 fetch（spec §6.4）
-                self._tokens.pop(name, None)
+                if exc.status != 401:
+                    raise
+                with self._lock:
+                    self._tokens.pop(name, None)
                 token = self._transport.login(user, self._password_of(name))
-                self._tokens[name] = token
+                with self._lock:
+                    self._tokens[name] = token
                 pools = self._transport.fetch_pools(token.access_token)
             aq = map_account_quota(name, user, phone, pools, fetched_at=self._clock())
             self._note_credits(name, aq)
@@ -698,7 +715,8 @@ class QuotaService:
         except QuotaUnavailable as exc:
             return AccountQuota(name, user, phone, "error", str(exc), None, None, self._clock())
         except Exception as exc:  # noqa: BLE001 - 单账号失败不影响其它
-            self._tokens.pop(name, None)
+            with self._lock:
+                self._tokens.pop(name, None)
             return AccountQuota(
                 name, user, phone, "error", f"{type(exc).__name__}: {exc}", None, None, self._clock()
             )
@@ -738,26 +756,45 @@ class QuotaService:
                 pass
 
     def snapshot(self, *, force: bool = False) -> list[AccountQuota]:
+        """返回每账号余量：网络请求在锁外执行，锁只保护缓存读写。
+
+        并发下同一账号可能被两个调用方同时抓取（后台采样器 + 控制台刷新）——
+        接受这次重复：结果一致、最多多一次 HTTP，比引入在途去重 + 等待条件
+        更简单，也不会出现「等别人抓完」的死锁。
+        """
+        accounts = self._accounts()
+        now = self._clock()
+        results: dict[str, AccountQuota] = {}
+        pending: list[tuple[str, str, str]] = []
         with self._lock:
-            out: list[AccountQuota] = []
-            for name, user, phone, password in self._accounts():
+            for name, user, phone, password in accounts:
                 if not (user and password):
-                    out.append(
-                        AccountQuota(name, user, phone, "unconfigured", None, None, None, None)
+                    results[name] = AccountQuota(
+                        name, user, phone, "unconfigured", None, None, None, None
                     )
                     continue
                 cached = self._cache.get(name)
                 if cached is not None and not force:
                     ttl = self._ttl if cached.status == "ok" else self.error_ttl
-                    if cached.fetched_at is not None and self._clock() - cached.fetched_at < ttl:
-                        out.append(cached)
+                    if cached.fetched_at is not None and now - cached.fetched_at < ttl:
+                        results[name] = cached
                         continue
-                aq = self._fetch_one(name, user, phone)
-                self._cache[name] = aq
-                out.append(aq)
-            return out
+                pending.append((name, user, phone))
+        for name, user, phone in pending:
+            results[name] = self._fetch_one(name, user, phone)
+        with self._lock:
+            # close() 之后绝不再往缓存里写（采样线程可能刚从 _fetch_one 回来）
+            if not self._stop.is_set():
+                for name, _user, _phone in pending:
+                    self._cache[name] = results[name]
+        return [results[name] for name, *_rest in accounts]
 
     def close(self) -> None:
+        """停止后台采样并清空缓存；join 带超时，避免被长 HTTP 永久卡住。"""
         self._stop.set()
-        self._cache.clear()
-        self._tokens.clear()
+        sampler = self._sampler
+        if sampler is not None:
+            sampler.join(timeout=5.0)
+        with self._lock:
+            self._cache.clear()
+            self._tokens.clear()
