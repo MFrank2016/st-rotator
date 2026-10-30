@@ -289,6 +289,34 @@ class EjiemaSmsTest(unittest.TestCase):
         self.assertEqual(self._qs()["keyWord"], ["商汤"])
 
 
+class HttpExceptionTest(unittest.TestCase):
+    def test_incomplete_read_is_wrapped_as_sms_error(self):
+        import http.client
+        from unittest import mock
+
+        client = sms.EjiemaSms("tok", base="http://127.0.0.1:9")
+        with mock.patch(
+            "st_rotator.sms.urllib.request.urlopen",
+            side_effect=http.client.IncompleteRead(b"x", 10),
+        ):
+            with self.assertRaises(sms.SmsError) as cm:
+                client.left_amount()
+        self.assertTrue(cm.exception.retryable)
+
+    def test_bad_status_line_is_wrapped_as_sms_error(self):
+        import http.client
+        from unittest import mock
+
+        client = sms.EjiemaSms("tok", base="http://127.0.0.1:9")
+        with mock.patch(
+            "st_rotator.sms.urllib.request.urlopen",
+            side_effect=http.client.BadStatusLine("garbage"),
+        ):
+            with self.assertRaises(sms.SmsError) as cm:
+                client.get_phone()
+        self.assertTrue(cm.exception.retryable)
+
+
 class WaitSmsCodeTest(unittest.TestCase):
     # 6. 轮询：首次 [尚未收到] → 二次出现验证码 → 返回最后一个 6-8 位数字串
     def test_wait_sms_code_polls_and_returns(self):

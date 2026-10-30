@@ -39,7 +39,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
@@ -898,12 +898,27 @@ class ConsoleState:
                         except Exception:  # noqa: BLE001 - 回滚失败不掩盖原始错误
                             pass
                         raise
-                    if len(parts) == 4:
-                        self.store.set_account_credentials(
-                            target, user=user, phone=phone, password=password
+                    try:
+                        if len(parts) == 4:
+                            self.store.set_account_credentials(
+                                target, user=user, phone=phone, password=password
+                            )
+                        self.store.reload()
+                        self.rotator.config.accounts = list(
+                            self.store.config.accounts
                         )
-                    self.store.reload()
-                    self.rotator.config.accounts = list(self.store.config.accounts)
+                    except Exception:
+                        # 池已接受、但写凭据 / 校验 / 同步失败：把 Key 从池和 store 里一起撤掉，
+                        # 否则会出现「池里有、配置里没有」的脱节状态
+                        try:
+                            self.rotator.remove_key(key)
+                        except Exception:  # noqa: BLE001 - 回滚失败不掩盖原始错误
+                            pass
+                        try:
+                            self.store.remove_key(key)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        raise
                 added.append(
                     {"id": item.id, "key": item.masked, "account": item.account}
                 )
@@ -954,19 +969,19 @@ class ConsoleState:
 
     def remove_one(self, identifier: str) -> UiResponse:
         """从内存池和配置文件里同时删除一把 Key。"""
-        item = self.rotator.pool.find_by_id(identifier)
-        if item is None:
-            return UiResponse.error("池中找不到这把 Key（可能已被删除）", status=404)
-        plain, label = item.key, f"{item.account} / {item.masked}"
-        if (
-            self.rotator.pool.find_key(plain) is not None
-            and len(self.rotator.pool) <= 1
-        ):
-            return UiResponse.error(
-                "这是池里最后一把 Key，删掉后就无法提供服务了；请先添加新 Key"
-            )
-
+        # 「最后一把」判断与删除必须在同一临界区：否则两个并发请求（多标签页 /
+        # 与自动轮换）都能通过检查，最终把 Key 删光
         with self.lock:
+            item = self.rotator.pool.find_by_id(identifier)
+            if item is None:
+                return UiResponse.error(
+                    "池中找不到这把 Key（可能已被删除）", status=404
+                )
+            plain, label = item.key, f"{item.account} / {item.masked}"
+            if len(self.rotator.pool) <= 1:
+                return UiResponse.error(
+                    "这是池里最后一把 Key，删掉后就无法提供服务了；请先添加新 Key"
+                )
             removed = self.rotator.remove_key(plain)
             self.store.remove_key(plain)
             self.store.reload()
@@ -1017,9 +1032,12 @@ class ConsoleState:
         self._log(f"[控制台] 手动轮换 Key：账号 {name}")
         result = worker.rotate_now(name)
         if not result.get("ok"):
-            status = {"not_found": 404, "no_credentials": 400}.get(
-                str(result.get("status")), 502
-            )
+            # busy = 后台正在扫描/轮换（非阻塞返回），按「稍后重试」处理
+            status = {
+                "not_found": 404,
+                "no_credentials": 400,
+                "busy": 409,
+            }.get(str(result.get("status")), 502)
             message = str(result.get("message") or "更换 Key 失败")
             self._log(
                 f"[控制台] 账号 {name}：更换 Key 失败（{result.get('status')}）：{message}"
@@ -1123,17 +1141,20 @@ class ConsoleState:
         )
 
     def set_options(self, payload: Mapping[str, Any]) -> UiResponse:
-        """改运行参数：调度策略 / 限速 / 重试预算。改动立即生效并落盘。"""
+        """改运行参数：调度策略 / 限速 / 重试预算。
+
+        先**全部校验**（不改任何内存态），全部通过后再统一提交：任一参数非法都不会
+        留下「策略已改、重试预算没改」这种部分生效的中间状态。
+        """
         changes: list[str] = []
 
-        strategy = payload.get("strategy")
-        if strategy is not None and strategy != self.config.strategy:
-            if strategy not in STRATEGIES:
+        # ---------------- 1. 校验（纯计算，不碰内存态） ----------------
+        strategy: str | None = None
+        strategy_payload = payload.get("strategy")
+        if strategy_payload is not None and strategy_payload != self.config.strategy:
+            if strategy_payload not in STRATEGIES:
                 return UiResponse.error(f"调度策略只能是 {list(STRATEGIES)} 之一")
-            with self.lock:
-                self.rotator.set_strategy(strategy)
-                self.store.set_strategy(strategy)
-            changes.append(f"策略={strategy}")
+            strategy = str(strategy_payload)
 
         rate_fields: dict[str, Any] = {}
         mode = payload.get("rate_mode")
@@ -1159,16 +1180,13 @@ class ConsoleState:
             if qps != self.config.rate_control.qps:
                 rate_fields["qps"] = qps
         if rate_fields:
+            # 用 RateControlConfig.__post_init__ 校验非法组合（只构造不赋值）
             try:
-                with self.lock:
-                    self.rotator.set_rate_control(**rate_fields)
-                    self.store.set_rate_control(**rate_fields)
+                replace(self.config.rate_control, **rate_fields)
             except ConfigError as exc:
                 return UiResponse.error(str(exc))
-            changes.append(
-                "限速=" + " ".join(f"{k}:{v}" for k, v in rate_fields.items())
-            )
 
+        scalar_changes: list[tuple[str, Any, str]] = []
         for field_name, label in (
             ("max_total_wait", "等待预算"),
             ("max_attempts", "最大重试"),
@@ -1186,17 +1204,14 @@ class ConsoleState:
                 return UiResponse.error("等待预算不能为负")
             if converted == getattr(self.config, field_name):
                 continue
-            with self.lock:
-                setattr(self.config, field_name, converted)
-                self.store.set_scalar(field_name, converted)
-            changes.append(f"{label}={converted}")
+            scalar_changes.append((field_name, converted, label))
 
+        fx_cfg = self.config.flash_lite_exchange
+        fx_changes: dict[str, Any] = {}
         fx_payload = payload.get("flash_lite")
         if fx_payload is not None:
             if not isinstance(fx_payload, dict):
                 return UiResponse.error("flash_lite 必须是对象")
-            fx_cfg = self.config.flash_lite_exchange
-            fx_changes: dict[str, Any] = {}
             for f in ("enabled", "image_enabled", "yield_to_serve"):
                 if f in fx_payload:
                     fx_changes[f] = bool(fx_payload[f])
@@ -1223,7 +1238,7 @@ class ConsoleState:
                 k: v for k, v in fx_changes.items() if getattr(fx_cfg, k) != v
             }
             if fx_changes:
-                # 先在纯数据上整体校验（不改内存态），通过后再落盘 + 生效
+                # 先在纯数据上整体校验（不改内存态）
                 candidate = {
                     f: getattr(fx_cfg, f)
                     for f in FlashLiteExchangeConfig.__dataclass_fields__
@@ -1233,21 +1248,13 @@ class ConsoleState:
                     FlashLiteExchangeConfig.from_dict(candidate)
                 except ConfigError as exc:
                     return UiResponse.error(str(exc))
-                with self.lock:
-                    for k, v in fx_changes.items():
-                        setattr(fx_cfg, k, v)
-                    self.store.set_section("flash_lite_exchange", fx_changes)
-                changes.append(
-                    "一换一 " + "，".join(f"{k}:{v}" for k, v in fx_changes.items())
-                )
 
+        rp_cfg = self.config.replenish
+        rp_changes: dict[str, Any] = {}
         rp_payload = payload.get("replenish")
-        token_msg = ""
         if rp_payload is not None:
             if not isinstance(rp_payload, dict):
                 return UiResponse.error("replenish 必须是对象")
-            rp_cfg = self.config.replenish
-            rp_changes: dict[str, Any] = {}
             if "enabled" in rp_payload:
                 rp_changes["enabled"] = bool(rp_payload["enabled"])
             for field_name, label in (
@@ -1285,7 +1292,7 @@ class ConsoleState:
                 k: v for k, v in rp_changes.items() if getattr(rp_cfg, k) != v
             }
             if rp_changes:
-                # 先在纯数据上整体校验（不改内存态），通过后再落盘 + 生效
+                # 先在纯数据上整体校验（不改内存态）
                 candidate = {
                     f: getattr(rp_cfg, f) for f in ReplenishConfig.__dataclass_fields__
                 }
@@ -1294,11 +1301,38 @@ class ConsoleState:
                     ReplenishConfig.from_dict(candidate)
                 except ConfigError as exc:
                     return UiResponse.error(str(exc))
-                with self.lock:
-                    for k, v in rp_changes.items():
-                        setattr(rp_cfg, k, v)
-                    if self.store is not None:
-                        self.store.set_section("replenish", rp_changes)
+
+        if not (strategy or rate_fields or scalar_changes or fx_changes or rp_changes):
+            return UiResponse.json({"ok": True, "message": "没有需要改动的参数"})
+
+        # ---------------- 2. 一次性提交 ----------------
+        with self.lock:
+            if strategy is not None:
+                self.rotator.set_strategy(strategy)
+                self.store.set_strategy(strategy)
+                changes.append(f"策略={strategy}")
+            if rate_fields:
+                self.rotator.set_rate_control(**rate_fields)
+                self.store.set_rate_control(**rate_fields)
+                changes.append(
+                    "限速=" + " ".join(f"{k}:{v}" for k, v in rate_fields.items())
+                )
+            for field_name, converted, label in scalar_changes:
+                setattr(self.config, field_name, converted)
+                self.store.set_scalar(field_name, converted)
+                changes.append(f"{label}={converted}")
+            if fx_changes:
+                for k, v in fx_changes.items():
+                    setattr(fx_cfg, k, v)
+                self.store.set_section("flash_lite_exchange", fx_changes)
+                changes.append(
+                    "一换一 " + "，".join(f"{k}:{v}" for k, v in fx_changes.items())
+                )
+            if rp_changes:
+                for k, v in rp_changes.items():
+                    setattr(rp_cfg, k, v)
+                if self.store is not None:
+                    self.store.set_section("replenish", rp_changes)
                 changes.append(
                     "补号 "
                     + "，".join(
@@ -1306,20 +1340,22 @@ class ConsoleState:
                         for k, v in rp_changes.items()
                     )
                 )
-                self._sync_replenish(rebuild="sms_token" in rp_changes)
-                self._reconcile_replenish_after_save()
-                if not self.config.replenish.sms_token:
-                    self.sms_token_ok = None
-                elif self.sms_factory is not None:
-                    try:
-                        self.sms_factory(self.config.replenish.sms_token).left_amount()
-                        self.sms_token_ok = True
-                    except Exception:  # noqa: BLE001 - Token 校验失败只标记不可用，不打断落盘
-                        self.sms_token_ok = False
-                        token_msg = "；易码 Token 校验失败，已标记不可用"
 
-        if not changes:
-            return UiResponse.json({"ok": True, "message": "没有需要改动的参数"})
+        # ---------------- 3. 提交后的副作用 ----------------
+        token_msg = ""
+        if rp_changes:
+            self._sync_replenish(rebuild="sms_token" in rp_changes)
+            self._reconcile_replenish_after_save()
+            if not self.config.replenish.sms_token:
+                self.sms_token_ok = None
+            elif self.sms_factory is not None:
+                try:
+                    self.sms_factory(self.config.replenish.sms_token).left_amount()
+                    self.sms_token_ok = True
+                except Exception:  # noqa: BLE001 - Token 校验失败只标记不可用，不打断落盘
+                    self.sms_token_ok = False
+                    token_msg = "；易码 Token 校验失败，已标记不可用"
+
         self._save_and_log("运行参数已更新：" + "，".join(changes))
         return UiResponse.json(
             {"ok": True, "message": "已更新：" + "，".join(changes) + token_msg}

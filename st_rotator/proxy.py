@@ -67,6 +67,20 @@ STATS_PATH = "/stats"
 MODEL_TEST_PATH = "/api/model-test"
 
 
+def _chunk_text_len(chunk: Any) -> int:
+    """流式分片里的正文长度（没有 usage 时用来估算输出 token）。"""
+    if not isinstance(chunk, Mapping):
+        return 0
+    choices = chunk.get("choices") or []
+    if not choices or not isinstance(choices[0], Mapping):
+        return 0
+    delta = choices[0].get("delta") or {}
+    if not isinstance(delta, Mapping):
+        return 0
+    content = delta.get("content")
+    return len(content) if isinstance(content, str) else 0
+
+
 def _extract_usage(result: Any) -> tuple[int, int, int] | None:
     """从上游响应中提取 (输入 token, 输出 token, 缓存命中 token)；取不到返回 None。"""
     if not isinstance(result, dict):
@@ -219,15 +233,25 @@ class LoginThrottle:
             self._failures.pop(key, None)
 
 
+#: 路径解码的最大轮数（超过就按可疑输入拒绝）
+_MAX_UNQUOTE_ROUNDS = 8
+
+
 def _has_parent_segment(path: str) -> bool:
-    """路径里只要有一个 `..` 段（含百分号/反斜杠编码）就判定为穿越。"""
+    """路径里只要有一个 `..` 段（含百分号 / 反斜杠 / 多重编码）就判定为穿越。
+
+    一直解码到稳定为止；解满 ``_MAX_UNQUOTE_ROUNDS`` 层还在变，说明是刻意套的
+    多层编码，直接按可疑输入拒绝（同时防止解码 DoS）。
+    """
     decoded = path
-    for _ in range(3):
+    for _ in range(_MAX_UNQUOTE_ROUNDS):
         new = unquote(decoded)
         if new == decoded:
-            break
+            return any(
+                seg == ".." for seg in decoded.replace("\\", "/").split("/")
+            )
         decoded = new
-    return any(seg == ".." for seg in decoded.replace("\\", "/").split("/"))
+    return True
 
 
 def error_payload(
@@ -848,7 +872,17 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
 
         # 流式统计 token 用量：注入 include_usage 让上游在末尾回一个 usage 块。
         if stream and self.rotator.config.track_stream_usage:
-            stream_options = dict(params.get("stream_options") or {})
+            raw_options = params.get("stream_options")
+            if raw_options is not None and not isinstance(raw_options, Mapping):
+                # 客户端可控：字符串 / 数字 / 数组直接 dict(...) 会抛异常（500）
+                self._send_json(
+                    400,
+                    error_payload(
+                        "'stream_options' must be an object", "invalid_request_error"
+                    ),
+                )
+                return
+            stream_options = dict(raw_options or {})
             stream_options["include_usage"] = True
             params["stream_options"] = stream_options
 
@@ -991,15 +1025,30 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             return
 
         self._begin_stream()
+        stream_usage: tuple[int, int, int] | None = None
+        text_len = 0
         try:
             if has_first:
                 self._note_usage(first_chunk.get("usage"))
+                if first_chunk.get("usage"):
+                    stream_usage = _extract_usage(first_chunk)
+                text_len += _chunk_text_len(first_chunk)
                 self._write_chunk(self._sse(first_chunk))
             for chunk in stream:
                 self._note_usage(chunk.get("usage"))
+                if chunk.get("usage"):
+                    # 注入 include_usage 后，上游会在最后一个 chunk 里带 usage
+                    stream_usage = _extract_usage(chunk)
+                text_len += _chunk_text_len(chunk)
                 self._write_chunk(self._sse(chunk))
             self._record_subkey_usage(
-                ok=True, model=model, messages=messages, stream=True, latency_ms=_elapsed_ms(started)
+                ok=True,
+                model=model,
+                messages=messages,
+                stream=True,
+                usage=stream_usage,
+                text_len=text_len,
+                latency_ms=_elapsed_ms(started),
             )
         except RotatorError as exc:
             # 已经发出 200 了，改不了状态码，只能补一条 error 事件收尾

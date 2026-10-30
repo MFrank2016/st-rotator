@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import sys
 import secrets
 import threading
 import time
@@ -447,7 +448,7 @@ class HttpQuotaTransport:
             raise QuotaAuthError(str(tok.get("error_description") or tok.get("error") or "未返回 access_token"))
         return TokenBundle(
             access_token=access,
-            refresh_token=str(tok.get("refresh_token", "")),
+            refresh_token=str(tok.get("refresh_token") or ""),
             expires_in=int(tok.get("expires_in", 10800)),
             acquired_at=_time.time(),
         )
@@ -650,8 +651,13 @@ class QuotaService:
         transport: QuotaTransport | None = None,
         clock: Callable[[], float] = time.monotonic,
         sampler_interval: float | None = None,
+        logger: Callable[[str], None] | None = None,
     ) -> None:
         self._config = config
+        self._log = logger or (
+            lambda message: print(message, file=sys.stderr)
+        )
+        self._sample_failures = 0
         self._ttl = ttl
         self.error_ttl = error_ttl
         self._transport: QuotaTransport = transport or HttpQuotaTransport()
@@ -748,12 +754,25 @@ class QuotaService:
             self.credits.note(name, pool_type, reset_at=pair.d7.reset_at, used=pair.d7.used)
 
     def _sample_loop(self, interval: float) -> None:
-        """后台每 interval 秒强制采样一次，保证无浏览器时也持续统计。"""
+        """后台每 interval 秒强制采样一次，保证无浏览器时也持续统计。
+
+        失败不静默：每次失败记一条日志，并按 2^n 退避（上限 1 小时）重试，
+        避免持久性故障（如平台登录锁定）刷屏又不被发现。
+        """
         while not self._stop.wait(interval):
             try:
                 self.snapshot(force=True)
-            except Exception:  # noqa: BLE001 - 采样失败不影响主流程
-                pass
+                self._sample_failures = 0
+            except Exception as exc:  # noqa: BLE001 - 采样失败不影响主流程
+                self._sample_failures += 1
+                backoff = min(
+                    interval * (2 ** min(self._sample_failures, 6)), 3600.0
+                )
+                self._log(
+                    f"[余量] 后台采样失败（连续 {self._sample_failures} 次）："
+                    f"{type(exc).__name__}: {exc}；{backoff:.0f}s 后重试"
+                )
+                self._stop.wait(backoff)
 
     def snapshot(self, *, force: bool = False) -> list[AccountQuota]:
         """返回每账号余量：网络请求在锁外执行，锁只保护缓存读写。

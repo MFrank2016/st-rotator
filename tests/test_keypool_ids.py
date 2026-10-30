@@ -6,7 +6,7 @@ import threading
 import time
 import unittest
 
-from st_rotator.config import AccountConfig
+from st_rotator.config import AccountConfig, CooldownConfig
 from st_rotator.errors import NoAvailableKey
 from st_rotator.keypool import KeyPool, KeyStatus
 
@@ -58,6 +58,52 @@ class KeyPoolNumericIdTest(unittest.TestCase):
         self.assertIsNotNone(removed)
         self.assertEqual(removed.id, 3)
         self.assertEqual([k["id"] for k in pool.snapshot()], [1, 2])
+
+
+class RequestWindowPruneTest(unittest.TestCase):
+    """_reserve 追加前要 prune：无限流（rpm_limit=None）的读取路径不会 prune。"""
+
+    def test_window_is_pruned_before_append(self) -> None:
+        clock = [100.0]
+        pool = KeyPool(
+            [AccountConfig(name="a", api_keys=["sk-a"])],  # rpm_limit=None → 不限流
+            clock=lambda: clock[0],
+        )
+        key = pool.find_key("sk-a")
+        key._window.extend([0.0, 1.0])  # 早已滑出 60s 窗口
+        key.account_state._window.extend([0.0, 1.0])
+        acquired = pool.acquire(timeout=1.0)
+        self.assertEqual(list(acquired._window), [100.0])
+        self.assertEqual(list(acquired.account_state._window), [100.0])
+
+
+class InvalidTtlRevivalTest(unittest.TestCase):
+    """invalid_ttl 语义：有限 TTL = 到点重新探测；<=0 = 永久失效。"""
+
+    def test_finite_ttl_revives_invalid_key_after_ttl(self) -> None:
+        clock = [100.0]
+        pool = KeyPool(
+            [AccountConfig(name="a", api_keys=["sk-a"])], clock=lambda: clock[0]
+        )
+        key = pool.find_key("sk-a")
+        pool.report_invalid(key, "401")
+        self.assertIs(key.status, KeyStatus.INVALID)
+        clock[0] = 100.0 + 601  # 默认 invalid_ttl=600
+        pool._refresh(clock[0])
+        self.assertIs(key.status, KeyStatus.HEALTHY)
+
+    def test_zero_ttl_never_revives(self) -> None:
+        clock = [100.0]
+        pool = KeyPool(
+            [AccountConfig(name="a", api_keys=["sk-a"])],
+            CooldownConfig(invalid_ttl=0),
+            clock=lambda: clock[0],
+        )
+        key = pool.find_key("sk-a")
+        pool.report_invalid(key, "401")
+        clock[0] += 10**9
+        pool._refresh(clock[0])
+        self.assertIs(key.status, KeyStatus.INVALID)
 
 
 class KeyPoolAcquireNoCandidateTest(unittest.TestCase):

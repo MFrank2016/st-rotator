@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .client import StRotator, classify, extract_error, safe_text
 from .config import AccountConfig, Config
@@ -24,8 +24,12 @@ REASONING_EFFORT_VALUES = ("none", "low", "medium", "high")
 #: 上游补全端点路径（与 client.py 一致，不带前导斜杠）
 UPSTREAM_PATH = "chat/completions"
 
-#: 客户端工厂：调用一次得到一个新的 HttpClient（每个账号独立连接，互不串扰）
+#: 客户端工厂：调用一次得到一个新的 HttpClient（每个账号独立连接，互不串扰）。
+#: ``run_test(factory=...)`` 收的就是它；返回值必须是上下文管理器（用完即关）。
 ClientFactory = Callable[[], HttpClient]
+#: 工厂的构造函数：``build_client_factory(config)`` 得到上面那个 ``ClientFactory``。
+#: 注意两者不是同一个类型——``DEFAULT_CLIENT_FACTORY`` 是**这个**，不是 ``ClientFactory``。
+ClientFactoryBuilder = Callable[[Config], ClientFactory]
 #: SSE 事件回调：worker 线程内被调用，透传一个事件 dict
 Emitter = Callable[[dict[str, Any]], None]
 
@@ -88,8 +92,8 @@ def build_client_factory(config: Config) -> ClientFactory:
     return _factory
 
 
-#: 默认工厂（模块级属性，测试与代理可整体替换成假工厂）
-DEFAULT_CLIENT_FACTORY = build_client_factory
+#: 默认工厂构造器（模块级属性，测试与代理可整体替换成假工厂构造器）
+DEFAULT_CLIENT_FACTORY: ClientFactoryBuilder = build_client_factory
 
 
 def _noop(_event: dict[str, Any]) -> None:
@@ -178,7 +182,17 @@ def _run_stream(
     pieces: list[str] = []
     think_parts: list[str] = []
     ttft_ms: int | None = None
+    stream_usage: dict[str, Any] | None = None
     for chunk in StRotator._iter_sse_chunks(resp):
+        error = chunk.get("error")
+        if error:
+            # 上游把错误塞进 SSE 事件里（如 {"error": {...}}）：不能当成功收尾
+            message = (
+                str(error.get("message") or error)
+                if isinstance(error, Mapping)
+                else str(error)
+            )
+            return _failure(name, started, "fatal", message, emit)
         reasoning = _reasoning_text(chunk)
         if reasoning:
             if ttft_ms is None:
@@ -193,6 +207,7 @@ def _run_stream(
             emit({"type": "token", "account": name, "token": piece})
         usage = chunk.get("usage")
         if usage:
+            stream_usage = usage
             emit({"type": "usage", "account": name, "usage": usage})
     latency_ms = round((time.monotonic() - started) * 1000)
     emit(
@@ -210,6 +225,7 @@ def _run_stream(
         latency_ms=latency_ms,
         text="".join(pieces),
         reasoning="".join(think_parts),
+        usage=stream_usage,
         ttft_ms=ttft_ms,
     )
 

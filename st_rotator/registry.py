@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -164,7 +165,7 @@ class Registry:
             # 旧格式记录已在内存迁移；尽力落盘使其持久化（写失败不影响加载）
             try:
                 reg.save()
-            except OSError as exc:  # noqa: BLE001 - 迁移落盘失败不应阻塞加载
+            except RegistryError as exc:  # noqa: BLE001 - 迁移落盘失败不应阻塞加载
                 print(f"[警告] 注册审计迁移落盘失败：{exc}", file=sys.stderr)
         return reg
 
@@ -181,14 +182,31 @@ class Registry:
             "registrations": self._registrations,
             "rotations": self._rotations,
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
-        # 含明文账号密码：收紧到仅属主可读写（write_text 受 umask 影响，通常 0644）
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, self.path)
+        # 写入失败统一包成 RegistryError（文档承诺的异常类型，调用方只捕获它）
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # 临时文件名唯一：锁是 per-instance，两个 Registry 写同一路径不能互相踩
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{self.path.name}-",
+                suffix=".tmp",
+                dir=str(self.path.parent),
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+                    )
+                # 含明文账号密码：仅属主可读写
+                os.chmod(tmp_name, 0o600)
+                os.replace(tmp_name, self.path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+        except OSError as exc:
+            raise RegistryError(f"写入 {self.path.name} 失败：{exc}") from exc
 
     # ------------------------------------------------------------ 已用号码
 
@@ -276,7 +294,8 @@ class Registry:
         """注册审计记录，最新在前，最多 ``limit`` 条。"""
         with self._lock:
             newest_first = list(reversed(self._registrations))
-        return newest_first[:limit]
+        # 返回浅拷贝：调用方改字段不会污染内部审计记录
+        return [dict(entry) for entry in newest_first[:limit]]
 
     def count_registrations(self, success: bool | None = None) -> int:
         """注册审计记录数；``success`` 非空时只计该成功 / 失败结果的条数。"""
@@ -329,7 +348,7 @@ class Registry:
             filtered.append(entry)
         start = (page - 1) * size
         return {
-            "items": filtered[start : start + size],
+            "items": [dict(entry) for entry in filtered[start : start + size]],
             "total": len(filtered),
             "page": page,
             "size": size,
@@ -355,7 +374,7 @@ class Registry:
         with self._lock:
             used = sorted(self._used)
             spend = self._spend_dict()
-            regs = list(reversed(self._registrations))
+            regs = [dict(entry) for entry in reversed(self._registrations)]
             rotations = self._rotations
         return {
             "used_phones": used,

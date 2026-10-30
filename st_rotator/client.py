@@ -86,6 +86,16 @@ _FX_ACTIVE = 0
 _FX_IMG_CACHE: dict[int, str] = {}
 # 带图请求体每发约 1MB×N 图，是唯一的内存大头：全局限 8 个在飞，防多账号同烧时 OOM
 _FX_IMG_SEM = threading.Semaphore(8)
+#: 烧点任务等大图额度 / 等线程收尾的最长时间（秒）：超时宁可放弃也不无限挂住
+_FX_IMG_WAIT = 30.0
+_FX_JOIN_TIMEOUT = 60.0
+#: 撞推广池分钟级 TPM 窗口后的降速间隔（秒）
+_FX_SOFT429_PAUSE = 1.0
+
+
+def _fx_soft429_pause(stop: threading.Event) -> None:
+    """推广池的分钟级 TPM 窗口：放慢一轮，别把窗口一直顶住（stop 可打断）。"""
+    stop.wait(_FX_SOFT429_PAUSE)
 
 
 def _noise_png_b64(size: int) -> str:
@@ -580,7 +590,9 @@ class StRotator:
                     return "invalid", probe_detail
                 if probe.status in RETRYABLE_STATUS:
                     return "unknown", probe_detail
-                return "invalid", probe_detail
+                # 400/422 这类是「请求/模型本身有问题」，不是凭据失效：
+                # 判成 invalid 会让自动续期白白轮换一把好 Key
+                return "unknown", probe_detail
             return "invalid", detail
         except NetworkError as exc:
             return "unknown", f"网络错误: {exc}"
@@ -818,17 +830,29 @@ class StRotator:
             )
             if fresh and not refresh:
                 return self._models_result(cached=True)
-            try:
-                payload = self.models()
-                self._models_cache = _parse_model_list(payload)
+
+        # 网络往返必须在锁外：否则一个慢上游会让所有状态接口排队。
+        # 并发下可能有两个线程同时拉取（接受这次重复：结果等价、只多一次请求，
+        # 换来的是控制台不被模型清单卡住）。
+        parsed: list[dict[str, Any]] | None = None
+        error = ""
+        try:
+            payload = self.models()
+            parsed = _parse_model_list(payload)
+        except Exception as exc:  # noqa: BLE001 - 清单拉取失败绝不能影响主流程
+            # 故意宽catch。上游不可达时 _post_with_rotation 会把 NetworkError 包装成
+            # RotationExhausted 抛出，但真实环境里还可能冒出别的类型（JSON 解析异常、
+            # 上游返回结构变化导致的 KeyError…）。模型清单只是锦上添花，
+            # 绝不能让它把状态接口带崩——上游出故障时用户正需要打开控制台排查。
+            error = f"{type(exc).__name__}: {exc}"
+
+        with self._models_lock:
+            if parsed is not None:
+                self._models_cache = parsed
                 self._models_error = ""
-            except Exception as exc:  # noqa: BLE001 - 清单拉取失败绝不能影响主流程
-                # 故意宽catch。上游不可达时 _post_with_rotation 会把 NetworkError 包装成
-                # RotationExhausted 抛出，但真实环境里还可能冒出别的类型（JSON 解析异常、
-                # 上游返回结构变化导致的 KeyError…）。模型清单只是锦上添花，
-                # 绝不能让它把状态接口带崩——上游出故障时用户正需要打开控制台排查。
-                self._models_error = f"{type(exc).__name__}: {exc}"
-                self._log(f"[警告] 拉取模型清单失败: {self._models_error}")
+            else:
+                self._models_error = error
+                self._log(f"[警告] 拉取模型清单失败: {error}")
             self._models_fetched_at = time.monotonic()
             return self._models_result(cached=False)
 
@@ -982,8 +1006,16 @@ class StRotator:
                     while serve_inflight() > 0 and not stop.is_set() and waited < 8.0:
                         time.sleep(0.3)
                         waited += 0.3
+                img_slot = False
                 if is_img:
-                    _FX_IMG_SEM.acquire()  # 大图请求进限流闸，防瞬时内存峰值
+                    # 大图请求进限流闸（防瞬时内存峰值）；等不到额度就放弃这一发，
+                    # 别把烧点线程无限挂住。没拿到额度就不需要 release。
+                    if not _FX_IMG_SEM.acquire(timeout=_FX_IMG_WAIT):
+                        self._log(
+                            f"[一换一] {key.account} 大图额度排队超时，跳过这一发"
+                        )
+                        return "soft429"
+                    img_slot = True
                 try:
                     resp = self._client.request("POST", "/chat/completions", json_body=payload, headers=self._auth(key))
                     if resp.status == 200:
@@ -1013,7 +1045,7 @@ class StRotator:
                     stop.set()
                     return "stop"
                 finally:
-                    if is_img:
+                    if img_slot:
                         _FX_IMG_SEM.release()
 
             def probe_recovered() -> bool:
@@ -1049,15 +1081,32 @@ class StRotator:
                 # 每轮并发打一小批
                 batch = min(max(1, fx.concurrency), fx.requests_per_trigger - done)
                 threads = []
+                batch_results: list[str] = []
+
+                def run(i: int) -> None:
+                    outcome = one(i)
+                    with lock:
+                        batch_results.append(outcome)
+
                 for _ in range(batch):
                     if stop.is_set() or time.time() >= deadline:
                         break
-                    t = threading.Thread(target=one, args=(round_i,), daemon=True)
+                    t = threading.Thread(target=run, args=(round_i,), daemon=True)
                     threads.append(t)
                     t.start()
                     round_i += 1
+                # 整批共享一个收尾预算：逐个 join(60s) 在并发 64 时最坏要等一小时
+                join_deadline = time.time() + _FX_JOIN_TIMEOUT
                 for t in threads:
-                    t.join()
+                    t.join(timeout=max(0.0, join_deadline - time.time()))
+                if any(t.is_alive() for t in threads):
+                    # 有烧点线程卡在上游：不再等（daemon 线程自己会收尾），本轮收工
+                    self._log(
+                        f"[一换一] {key.account} 烧点线程未在 {_FX_JOIN_TIMEOUT:.0f}s 内返回，结束本轮"
+                    )
+                    break
+                if "soft429" in batch_results:
+                    _fx_soft429_pause(stop)
 
                 # 每轮结束探测一次：通用池回补了就提前收工 + 立即复活账号
                 if probe_recovered():
@@ -1091,18 +1140,25 @@ class StRotator:
         return f"超出单请求时限 {self.config.deadline_seconds:g}s"
 
     def _check_deadline(self, deadline_at: float | None) -> None:
-        """到点就抛 DeadlineExceeded；不启用时是空操作。"""
-        if deadline_at is not None and time.monotonic() >= deadline_at:
+        """到点就抛 DeadlineExceeded；不启用时是空操作。
+
+        ``deadline_at`` 与 ``self._clock`` 同域（默认都是 time.monotonic），
+        注入假时钟时也一致——别再混用 time.monotonic。
+        """
+        if deadline_at is not None and self._clock() >= deadline_at:
             raise DeadlineExceeded(self._deadline_text())
 
-    @staticmethod
     def _clamp_deadline(
-        remaining: float | None, deadline_at: float | None
+        self, remaining: float | None, deadline_at: float | None
     ) -> float | None:
-        """把等待时间压到 deadline 剩余量以内；不启用时原样返回。"""
+        """把等待时间压到 deadline 剩余量以内；不启用时原样返回。
+
+        改成实例方法是为了用 ``self._clock``：deadline 与等待预算必须同域，
+        否则注入假时钟时两者会各算各的。
+        """
         if deadline_at is None:
             return remaining
-        left = max(0.0, deadline_at - time.monotonic())
+        left = max(0.0, deadline_at - self._clock())
         return left if remaining is None else min(remaining, left)
 
     def _acquire_timeout(self, remaining: float | None) -> float:
@@ -1223,7 +1279,14 @@ class StRotator:
                 if action == "ok":
                     self.pool.report_success(key, latency=self._clock() - started)
                     self.limiter.on_success()
-                    result = response.json()
+                    try:
+                        result = response.json()
+                    except ValueError as exc:
+                        # 反代返回 HTML 错误页等：JSONDecodeError 会一路逃出轮换逻辑
+                        raise RotatorError(
+                            f"上游返回非 JSON 响应（HTTP {response.status}）："
+                            f"{safe_text(response)[:120]}"
+                        ) from exc
                     self._warn_if_reasoning_ate_budget(result)
                     return result
 

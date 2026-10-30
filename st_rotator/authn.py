@@ -53,7 +53,12 @@ OIDC_BASE = OIDC_AUTH.removesuffix("/oauth2/auth")
 _CAPTCHA_MARKERS = ("captcha", "验证码")
 # 短信验证码错误（register/smsLogin 校验失败）。必须优先于 _CAPTCHA_MARKERS 判定：
 # 服务端该错误的中文文案为「验证码错误」，其中含「验证码」二字会误命中 captcha 标记。
-_SMS_CODE_MARKERS = ("incorrectsmscode", "incorrect_sms_code", "sms_code_incorrect")
+_SMS_CODE_MARKERS = (
+    "incorrectsmscode",
+    "incorrect_sms_code",
+    "sms_code_incorrect",
+    "验证码错误",  # 服务端的中文文案，见上面的顺序说明
+)
 _USERNAME_TAKEN_MARKERS = (
     "username_taken",
     "user_name_taken",
@@ -370,6 +375,36 @@ def _map_authn_error(
     )
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """不自动跟随重定向：``redirect_request`` 返回 None，opener 会把 3xx 作为
+    ``HTTPError`` 抛出，由 ``_open`` 转成 ``_RedirectResponse``。"""
+
+    def redirect_request(
+        self,
+        req: Any,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Any:  # noqa: ANN401 - 与 urllib 的签名保持一致
+        return None
+
+
+class _RedirectResponse:
+    """把 3xx 适配成「带 Location 的响应」，供 ``_follow_until`` 显式跟随。"""
+
+    def __init__(self, url: str, headers: Any) -> None:
+        self._url = url
+        self.headers = headers
+
+    def geturl(self) -> str:
+        return self._url
+
+    def read(self, *args: Any) -> bytes:
+        return b""
+
+
 class HttpAuthn:
     """默认实现：stdlib urllib.request + CookieJar，与 quota.HttpQuotaTransport 同风格。"""
 
@@ -423,13 +458,30 @@ class HttpAuthn:
         import http.cookiejar
 
         jar = http.cookiejar.CookieJar()
-        return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        # 禁用自动跟随：重定向由 _follow_until 显式处理。默认的 HTTPRedirectHandler
+        # 会一路跟到底，导致拿不到 3xx / Location，那套手动跟随逻辑成了死代码
+        # （curl 分支本来就是 allow_redirects=False，两条路径现在一致）。
+        return urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(jar), _NoRedirect()
+        )
 
     def _open(self, opener: Any, req: urllib.request.Request) -> Any:
-        """发一次请求并返回响应；HTTP 错误 / 网络层失败统一映射为 AuthnError。"""
+        """发一次请求并返回响应；HTTP 错误 / 网络层失败统一映射为 AuthnError。
+
+        GET 的 3xx 不算错误：包成带 ``Location`` 的响应，交给 ``_follow_until``
+        显式跟随（自动跟随已禁用，见 ``_opener``）。
+        """
         try:
             return opener.open(req, timeout=self.timeout)
         except urllib.error.HTTPError as exc:
+            location = exc.headers.get("Location") if exc.headers else None
+            if 300 <= exc.code < 400 and location and req.get_method() == "GET":
+                headers = exc.headers
+                try:
+                    exc.close()
+                except Exception:  # noqa: BLE001 - 关不掉也不影响跟随
+                    pass
+                return _RedirectResponse(req.full_url, headers)
             body, text = self._http_error_body(exc)
             raise _map_authn_error(
                 exc.code,
@@ -672,7 +724,7 @@ class HttpAuthn:
             )
             loc = self._follow_until(
                 opener,
-                resp.geturl(),
+                resp.headers.get("Location") or resp.geturl(),
                 lambda u: "login_challenge=" in u,
                 param="login_challenge",
             )
@@ -737,7 +789,7 @@ class HttpAuthn:
             )
         return TokenBundle(
             access_token=str(access),
-            refresh_token=str(tok.get("refresh_token", "")),
+            refresh_token=str(tok.get("refresh_token") or ""),
             expires_in=int(tok.get("expires_in", 10800)),
             acquired_at=time.time(),
         )

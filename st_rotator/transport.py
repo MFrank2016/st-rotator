@@ -164,6 +164,13 @@ class StreamResponse:
                     self._consumed_eof = True
                     break
                 yield line.decode("utf-8", "replace").rstrip("\r\n")
+        except NetworkError:
+            self._healthy = False
+            raise
+        except (OSError, http.client.HTTPException) as exc:
+            # 底层 socket / 协议错误统一成 NetworkError，调用方只需接这一种
+            self._healthy = False
+            raise NetworkError(f"{type(exc).__name__}: {exc}") from exc
         except Exception:
             self._healthy = False
             raise
@@ -393,7 +400,9 @@ class HttpClient:
     ) -> None:
         if healthy and conn.sock is not None:
             with self._lock:
-                if len(self._idle) < self._max_keepalive:
+                # close() 之后不能再放回池子：它已经排空过一次 idle，
+                # 再塞进去的连接没人会关，直接泄漏 socket
+                if not self._closed and len(self._idle) < self._max_keepalive:
                     self._idle.append(conn)
                     return
         with contextlib.suppress(Exception):
@@ -412,7 +421,15 @@ class HttpClient:
         if self._closed:
             raise NetworkError("HttpClient 已关闭")
 
-        self._sem.acquire()
+        # 排队等并发额度也要计入墙钟预算：否则慢上游时排队时间完全不受 deadline 约束
+        if deadline is not None:
+            wait_left = deadline - time.monotonic()
+            if wait_left <= 0:
+                raise NetworkError("等待并发额度前已超出 deadline")
+            if not self._sem.acquire(timeout=wait_left):
+                raise NetworkError("等待并发额度超时（已超出 deadline）")
+        else:
+            self._sem.acquire()
         handed_off = False
         conn: http.client.HTTPConnection | None = None
         abort: threading.Timer | None = None

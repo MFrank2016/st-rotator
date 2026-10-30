@@ -8,6 +8,7 @@ set_options 测试：真实 ConfigStore（tempfile 落盘真实 JSON）验证补
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from st_rotator.config import ConfigStore
@@ -112,6 +113,13 @@ class _FakeRotator:
 
     def probe_key(self, key: str) -> tuple[str, str]:
         return ("ok", "未校验")
+
+    def set_strategy(self, strategy: str) -> None:
+        self.config.strategy = strategy
+
+    def set_rate_control(self, **changes) -> dict:
+        self.config.rate_control = replace(self.config.rate_control, **changes)
+        return {}
 
     def available_models(
         self, *, refresh: bool = False, ttl: float = 300.0
@@ -232,6 +240,40 @@ class SnapshotReplenishTest(unittest.TestCase):
             self.assertEqual(state["invalid_accounts"], 0)
             self.assertEqual(state["registrations_ok"], 0)
             self.assertEqual(state["rotations"], 0)
+
+
+class SetOptionsAtomicityTest(unittest.TestCase):
+    """任一参数非法时不能留下「部分生效」的内存状态。"""
+
+    def test_invalid_later_field_rolls_back_earlier_ones(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _load_store(tmp)
+            rotator = _FakeRotator(store.config)
+            console = ConsoleState(store=store, rotator=rotator)  # type: ignore[arg-type]
+            before_raw = dict(store._raw)
+            resp = console.set_options(
+                {"strategy": "least_inflight", "max_attempts": 0}
+            )
+            self.assertEqual(resp.status, 400)
+            # 策略没有生效（内存 + raw 都是原值）
+            self.assertEqual(console.config.strategy, before_raw.get("strategy", "round_robin"))
+            self.assertNotIn("strategy", store._raw)
+            self.assertEqual(rotator.config.strategy, console.config.strategy)
+            self.assertEqual(console.config.max_attempts, 5)
+
+    def test_valid_payload_commits_all_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _load_store(tmp)
+            rotator = _FakeRotator(store.config)
+            console = ConsoleState(store=store, rotator=rotator)  # type: ignore[arg-type]
+            resp = console.set_options(
+                {"strategy": "least_inflight", "max_attempts": 3}
+            )
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(console.config.strategy, "least_inflight")
+            self.assertEqual(console.config.max_attempts, 3)
+            self.assertEqual(store._raw["strategy"], "least_inflight")
+            self.assertEqual(store._raw["max_attempts"], 3)
 
 
 class SetOptionsReplenishTest(unittest.TestCase):

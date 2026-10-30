@@ -23,7 +23,16 @@ class RateLimiter:
     ``rate <= 0`` 表示不限速。
     """
 
-    __slots__ = ("rate", "_burst", "_interval", "_lock", "_next", "_clock", "_sleeper")
+    __slots__ = (
+        "_rate",
+        "_burst",
+        "_interval",
+        "_lock",
+        "_next",
+        "_clock",
+        "_sleeper",
+        "_local",
+    )
 
     def __init__(
         self,
@@ -33,13 +42,25 @@ class RateLimiter:
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
-        self.rate = float(rate)
-        self._burst = max(1.0, float(burst))
-        self._interval = 1.0 / self.rate if self.rate > 0 else 0.0
         self._lock = threading.Lock()
-        self._next = 0.0
+        # 本线程最近一次预订的时间片（refund 只退自己真正预订过的那一次）
+        self._local = threading.local()
+        self._burst = max(1.0, float(burst))
         self._clock = clock
         self._sleeper = sleeper
+        self._next = 0.0
+        self.rate = float(rate)  # 通过 setter 同步 _interval
+
+    @property
+    def rate(self) -> float:
+        return self._rate
+
+    @rate.setter
+    def rate(self, value: float) -> None:
+        """改速率时同步重算放行间隔——否则 rate 改了却不生效（仍按旧间隔放行）。"""
+        rate = max(0.0, float(value))
+        self._rate = rate
+        self._interval = 1.0 / rate if rate > 0 else 0.0
 
     @property
     def enabled(self) -> bool:
@@ -51,30 +72,39 @@ class RateLimiter:
         Args:
             timeout: 最长等待秒数。若所需等待时间 > timeout，则不预订时间片直接抛出 TimeoutError。
         """
+        self._local.reserved = None  # 每次尝试先清掉上一次的残留预订
         if self._interval <= 0:
             return 0.0
         with self._lock:
             now = self._clock()
-            burst_window = (self._burst - 1.0) * self._interval
+            interval = self._interval
+            burst_window = (self._burst - 1.0) * interval
             earliest = now - burst_window
             base = max(earliest, self._next)
             wait = max(0.0, base - now)
             if timeout is not None and wait > timeout:
                 raise TimeoutError(f"限速等待超时（需等 {wait:.2f}s，预算 {timeout:.2f}s）")
-            self._next = base + self._interval
+            self._next = base + interval
+        self._local.reserved = interval
         if wait > 0:
             self._sleeper(wait)
         return wait
 
     def refund(self) -> None:
-        """若请求在真正发出前中止，回滚一次放行时间片，避免队列漂移。"""
-        if self._interval <= 0:
+        """回滚一次放行时间片：只退本线程真正预订过的那一次，且用预订时的速率。
+
+        没有未退的预订（没 acquire 过 / 已经退过 / acquire 超时没预订）时是空操作——
+        多退会把额度刷成正数。
+        """
+        interval = getattr(self._local, "reserved", None)
+        if interval is None:
             return
+        self._local.reserved = None
         with self._lock:
             now = self._clock()
-            burst_window = (self._burst - 1.0) * self._interval
+            burst_window = (self._burst - 1.0) * interval
             earliest = now - burst_window
-            self._next = max(earliest, self._next - self._interval)
+            self._next = max(earliest, self._next - interval)
 
     # 固定限速器没有反馈回路，提供空实现让调用方可以统一调用
     def on_success(self) -> None:
@@ -137,6 +167,8 @@ class AdaptiveRateLimiter:
         self._clock = clock
         self._sleeper = sleeper
         self._lock = threading.Lock()
+        # 本线程最近一次预订的时间片（refund 只退自己真正预订过的那一次）
+        self._local = threading.local()
         self._next = 0.0
         self._last_penalty = float("-inf")  # 从未被限流过
         self._last_raise = float("-inf")
@@ -165,6 +197,7 @@ class AdaptiveRateLimiter:
         Args:
             timeout: 最长等待秒数。若所需等待时间 > timeout，则不预订时间片直接抛出 TimeoutError。
         """
+        self._local.reserved = None  # 每次尝试先清掉上一次的残留预订
         with self._lock:
             interval = 1.0 / self._rate
             now = self._clock()
@@ -175,14 +208,21 @@ class AdaptiveRateLimiter:
             if timeout is not None and wait > timeout:
                 raise TimeoutError(f"自适应限速等待超时（需等 {wait:.2f}s，预算 {timeout:.2f}s）")
             self._next = base + interval
+        self._local.reserved = interval
         if wait > 0:
             self._sleeper(wait)
         return wait
 
     def refund(self) -> None:
-        """回滚一次放行时间片，避免未发出的请求导致队列漂移。"""
+        """回滚一次放行时间片：用 acquire 当时预订的间隔，且只退真正预订过的。
+
+        期间速率可能已被 AIMD 调过——用当前速率重算会退错额度。
+        """
+        interval = getattr(self._local, "reserved", None)
+        if interval is None:
+            return
+        self._local.reserved = None
         with self._lock:
-            interval = 1.0 / self._rate
             now = self._clock()
             burst_window = (self._burst - 1.0) * interval
             earliest = now - burst_window

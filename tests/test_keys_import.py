@@ -23,6 +23,12 @@ class _FakeRotator:
     def probe_key(self, key):
         self.probed.append(key)
         return ("ok", "未校验") if key.startswith("sk-good") else ("invalid", "401")
+    def remove_key(self, key):
+        if key in self.pool.keys:
+            self.pool.keys.remove(key)
+            return True
+        return False
+
     def add_key(self, key, *, account, max_concurrency=4, rpm_limit=None):
         self.pool.keys.add(key)
         class _Item:
@@ -138,6 +144,20 @@ class ImportKeysTest(unittest.TestCase):
             self.assertEqual(body["summary"]["ok"], 1)
             self.assertEqual(body["added"][0]["account"], "老账号")
             self.assertFalse(any(a.name == "u1" for a in st.store.config.accounts))
+
+    def test_post_pool_failure_rolls_back_pool_and_store(self):
+        """池已接受但写凭据失败：Key 必须从池和配置里一起撤掉。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self._state(tmp)
+            st.store.set_account_credentials = mock.Mock(  # type: ignore[method-assign]
+                side_effect=ConfigError("凭据写入失败")
+            )
+            body = st.import_keys("138--u2--right--sk-good5", account=None, max_concurrency=4).payload
+            self.assertEqual(body["summary"]["ok"], 0)
+            self.assertEqual(body["summary"]["error"], 1)
+            self.assertNotIn("sk-good5", st.rotator.pool.keys)  # 池里已回滚
+            self.assertNotIn("sk-good5", json.dumps(st.store._raw))  # 配置里也没有
+            self.assertFalse(any(a.name == "u2" for a in st.store.config.accounts))
 
     def test_format2_lazily_creates_service_when_none(self):
         with tempfile.TemporaryDirectory() as tmp:

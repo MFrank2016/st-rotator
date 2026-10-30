@@ -229,6 +229,8 @@ def _bind_win32() -> tuple[object, object, object]:
     kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
     kernel32.GlobalLock.restype = wintypes.LPVOID
     kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalFree.restype = wintypes.HGLOBAL
 
     return user32, shell32, kernel32
 
@@ -261,11 +263,16 @@ def copy_to_clipboard(text: str) -> bool:
             return False
         ptr = kernel32.GlobalLock(handle)
         if not ptr:
+            kernel32.GlobalFree(handle)  # 锁不住也要释放，否则句柄泄漏
             return False
         ctypes.memmove(ptr, ctypes.create_unicode_buffer(text), size)
         kernel32.GlobalUnlock(handle)
+        if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+            # 交出所有权失败：句柄仍归我们，必须自己释放
+            kernel32.GlobalFree(handle)
+            return False
         # 成功后所有权交给剪贴板，不能再自己释放
-        return bool(user32.SetClipboardData(CF_UNICODETEXT, handle))
+        return True
     finally:
         user32.CloseClipboard()
 
@@ -625,6 +632,8 @@ class TrayApp:
             wintypes.HWND(HWND_MESSAGE), None, hinst, None,
         )
         if not hwnd:
+            # 类已注册但窗口没建起来：先注销，否则同类名再注册会失败
+            user32.UnregisterClassW(class_name, hinst)
             raise OSError("CreateWindowExW 失败，无法创建托盘窗口")
         self._hwnd = hwnd
 
@@ -636,6 +645,10 @@ class TrayApp:
 
         self._add_icon()
         user32.SetTimer(hwnd, _TIMER_ID, _REFRESH_MS, None)
+        if self._stopping:
+            # 窗口创建前就收到过退出请求（定时器/信号线程）：当时没窗口可投递，
+            # 这里补投一次，否则消息循环会一直跑下去
+            user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
         self._ready.set()
 
         message = wintypes.MSG()

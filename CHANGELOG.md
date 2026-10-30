@@ -3,6 +3,72 @@
 版本号规则与发版标准流程见 [AGENTS.md](AGENTS.md)。
 一句话规则：**小版本 `+0.0.1`**（如 `1.3.0 → 1.3.1`），**大版本 `+0.1`**（如 `1.3.0 → 1.4.0`）。
 
+## [1.12.0] - 2026-10-30
+
+按代码审查结果处理剩余 52 个中危问题。本次含多处行为变化，详见文末「变更」。
+
+### 安全与输入校验
+
+- **`stream_options` 类型校验**：非对象（字符串/数字/列表）返回 400，不再因 `dict()` 抛异常变 500。
+- **路径穿越检查解码到稳定**：`_has_parent_segment` 由固定 3 轮改为解码至稳定（上限 8 轮），
+  四层以上嵌套编码（`%2525252e%2525252e`）不再绕过；超限直接拒绝。
+- **持久化结构校验**：`subkeys._load()` 拒绝 `keys: null`、非列表 `history`、空 key
+  （此前会在启动或渲染时抛 `TypeError`/`IndexError`）。
+- **`set_section` 不再静默覆盖**：section 名必须是非空字符串，既有值为非对象时报
+  `ConfigError` 而不是直接替换成 `{}`。
+- **登录不再自动跟随重定向**：禁用 urllib 默认的 `HTTPRedirectHandler`，3xx 由代码显式处理，
+  重定向链与跳数上限真正生效。
+
+### 并发与状态一致性
+
+- **配置改动先校验后提交**：`add_account` / `set_account_credentials` / `replace_account_keys`
+  失败时回滚 `_raw`，不再留下「内存已改、磁盘没写」的中间态。
+- **`set_options` 整单原子**：先全部校验再一次性提交，任一字段非法则一个都不生效
+  （此前合法字段会先落地）。
+- **导入 Key 失败回滚**：写凭据 / reload 失败时把已进池的 Key 一并移除，不再出现
+  「池里有、配置里没有」。
+- **删除「最后一把 Key」的判断移入锁内**：并发删除不再可能删光。
+- **`rotate_now` 改为非阻塞**：守卫正在扫描时立即返回 busy（控制台 409），不再卡住 UI 线程。
+- **轮换锁与 pending 移除同一临界区**：消除后台调度重复处理同一条目的窗口。
+- **限速器 `rate` 改为 property**：赋值同步更新内部间隔（此前改了不生效）；
+  `refund()` 用预订时的速率回滚且校验持有状态，不再多退或错退。
+- **`_models_lock` 不再跨网络调用持有**，`demo` 计数器加锁，`replenish.stop()` 可中断短信等待。
+
+### 错误契约与静默失败
+
+- **`RotationExhausted` / `ApiError` 支持 pickle**，跨进程传递不再报 `TypeError`。
+- **`registry._save()` 的 `OSError` 包成 `RegistryError`**，与文档声明一致。
+- **`transport` 流式读取的 `OSError`/`HTTPException` 包成 `NetworkError`**，
+  `_checkin` 检查 `_closed`，信号量等待受 deadline 约束。
+- **`sms` 捕获 `IncompleteRead`/`BadStatusLine`** 并转为可重试的 `SmsError`。
+- **模型测试**：流式 usage 存入结果；流中的 `{"error": ...}` 判为失败（此前当成功）。
+- **配额采样器**不再裸 `pass` 吞异常，改为记日志 + 指数退避。
+- **`logs.tail(limit<=0)` 返回空**；读日志尾部改为倒读，不再扫全文件；
+  并发轮转时捕获 `OSError` 而不是预检查。
+- **`refresh_token: null` 归一成空串**（此前存成字符串 `"None"`）。
+- **中文「验证码错误」归为验证码错误**，不再被 captcha 规则误判。
+- **fallback 对话探测不再把 400/422 判为 Key 失效**；非 JSON 的 2xx 响应包成明确错误。
+
+### 资源与缓存
+
+- **托盘**：剪贴板 `GlobalFree` 补齐两条错误路径并声明 `argtypes`；窗口创建失败时注销窗口类；
+  退出请求在窗口就绪后补投递（此前被丢弃）。
+- **图标缓存**：键纳入 `_darken` 系数与渲染器版本；写文件改为 tmp + `os.replace`。
+- **`keypool`**：请求窗口追加前统一 prune，不再随请求数无限增长。
+- **烧点 worker**：大图额度与线程 join 都加超时，不再无界阻塞。
+
+### 变更
+
+- **配置里的 `password` 不再 strip 首尾空白**（空白属于凭据）。升级后若出现密码错误，
+  先检查配置里密码首尾是否有多余空白。
+- **`${VAR}` 在「变量显式设为空串」时展开成空串**，不再抛 `ConfigError`；
+  需要「空也必须有值」请写 `${VAR:-默认值}`。
+- **`rotate_now` 在守卫忙碌时返回 409 + busy**，不再阻塞等待；脚本需自行重试。
+- **`set_options` 任一字段非法则整单拒绝**，不再部分生效。
+- **`Registry` 写失败抛 `RegistryError`**（原 `OSError`）；仓库外若 `except OSError` 需调整。
+- **`limiter.refund()` 跨线程调用变为空操作**（改为线程本地记录预订）。
+- **`/models` 也遵守 `always_limited` / `auth_as_429`**，与其它端点一致。
+
 ## [1.11.1] - 2026-10-30
 
 修复控制台前端（`dashboard.py` 内联脚本）的 7 个问题。这个文件此前从未被专门审查过。

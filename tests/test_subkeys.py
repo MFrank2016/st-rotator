@@ -82,5 +82,60 @@ class SnapshotMaskingTest(unittest.TestCase):
         self.assertIsNone(self.manager.find(sub.id))
 
 
+class LoadValidationTest(unittest.TestCase):
+    """持久化文件被手改坏时，_load() 不能把进程带崩。"""
+
+    def _load(self, payload: dict):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "subkeys.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        logs: list[str] = []
+        manager = SubKeyManager(path, autosave_interval=0, logger=logs.append)
+        self.addCleanup(manager.close)
+        return manager, logs
+
+    def test_null_keys_does_not_crash(self) -> None:
+        manager, _logs = self._load({"version": 1, "keys": None})
+        self.assertEqual(manager.count(), 0)
+        self.assertEqual(manager.snapshot(), [])
+
+    def test_non_list_keys_is_ignored(self) -> None:
+        manager, logs = self._load({"version": 1, "keys": 5})
+        self.assertEqual(manager.count(), 0)
+        self.assertTrue(any("keys" in line for line in logs))
+
+    def test_non_list_history_is_ignored(self) -> None:
+        manager, logs = self._load(
+            {"version": 1, "keys": [], "history": {"a": 1}}
+        )
+        self.assertEqual(manager.history_count(), 0)
+        self.assertTrue(any("history" in line for line in logs))
+
+    def test_empty_key_is_skipped(self) -> None:
+        manager, _logs = self._load(
+            {"version": 1, "keys": [{"name": "a", "key": ""}]}
+        )
+        self.assertEqual(manager.count(), 0)
+        # 旧实现会在这里 _mask_key("") -> IndexError
+        self.assertEqual(manager.snapshot(), [])
+
+    def test_loaded_key_survives_usage_defaults(self) -> None:
+        """补默认 usage 字段的循环不能把 key 变量覆盖掉（回归）。"""
+        manager, _logs = self._load(
+            {"version": 1, "keys": [{"name": "a", "key": "sk-sr-abcdef", "usage": {}}]}
+        )
+        item = manager.snapshot()[0]
+        self.assertEqual(item["masked"], "sk********ef")  # _mask_key 的短 Key 规则
+        self.assertIsNotNone(manager.authenticate("sk-sr-abcdef"))
+
+    def test_non_dict_usage_falls_back_to_defaults(self) -> None:
+        manager, _logs = self._load(
+            {"version": 1, "keys": [{"name": "a", "key": "sk-sr-x", "usage": 5}]}
+        )
+        item = manager.snapshot()[0]
+        self.assertEqual(item["usage"]["requests"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

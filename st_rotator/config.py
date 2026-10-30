@@ -6,6 +6,7 @@ Key 支持 ``${ENV_VAR}`` / ``${ENV_VAR:-默认值}`` 占位符，避免把密�
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -33,7 +34,11 @@ def expand_env(value: str) -> str:
         if current:
             return current
         if default is not None:
+            # ${VAR:-default}：未设置或显式设为空都取默认（POSIX :- 语义）
             return default
+        if current is not None:
+            # ${VAR} 且显式设为空串：尊重空串，不能当成"未设置"
+            return ""
         raise ConfigError(f"环境变量 {name} 未设置，且未提供默认值")
 
     return _ENV_PATTERN.sub(_sub, value)
@@ -685,9 +690,12 @@ class AccountConfig:
         if isinstance(keys, str):
             keys = [keys]
         name = data.pop("name", None) or "default"
-        for field_name in ("user", "phone", "password"):
+        for field_name in ("user", "phone"):
             if field_name in data and data[field_name] is not None:
                 data[field_name] = expand_env(str(data[field_name])).strip()
+        if "password" in data and data["password"] is not None:
+            # 密码里的空白是凭据的一部分：strip 会静默改坏登录凭据
+            data["password"] = expand_env(str(data["password"]))
         known = set(cls.__dataclass_fields__) - {"api_keys"}
         unknown = set(data) - known
         if unknown:
@@ -1072,6 +1080,7 @@ class ConfigStore:
         api_keys: Sequence[str],
     ) -> dict[str, Any]:
         """新建一个带登录凭据与 Key 的账号（重复名字报错），然后 reload。"""
+        backup = copy.deepcopy(self._raw)
         name = (name or "").strip()
         if not name:
             raise ConfigError("账号名不能为空")
@@ -1094,20 +1103,21 @@ class ConfigStore:
         if not [k for k in (api_keys or []) if str(k).strip()]:
             raise ConfigError(f"账号 {name} 的 api_keys 不能为空")
         accounts.append(entry)
-        self.reload()
+        self._reload_after_mutation(backup)
         return entry
 
     def set_account_credentials(
         self, name: str, *, user: str, phone: str, password: str
     ) -> None:
         """定点写入某账号的登录凭据（保留其余字段与占位符）。"""
+        backup = copy.deepcopy(self._raw)
         accounts = self._accounts_raw()
         for item in accounts:
             if isinstance(item, dict) and item.get("name") == name:
                 item["user"] = user
                 item["phone"] = phone
                 item["password"] = password
-                self.reload()
+                self._reload_after_mutation(backup)
                 return
         raise ConfigError(f"账号 {name} 不存在")
 
@@ -1116,12 +1126,13 @@ class ConfigStore:
         cleaned = [k.strip() for k in (keys or []) if k.strip()]
         if not cleaned:
             raise ConfigError(f"账号 {name} 的 api_keys 不能为空")
+        backup = copy.deepcopy(self._raw)
         accounts = self._accounts_raw()
         for item in accounts:
             if isinstance(item, dict) and item.get("name") == name:
                 item["api_keys"] = cleaned
                 self._touch(item)
-                self.reload()
+                self._reload_after_mutation(backup)
                 return
         raise ConfigError(f"账号 {name} 不存在")
 
@@ -1225,16 +1236,29 @@ class ConfigStore:
 
     def set_section(self, name: str, values: Mapping[str, Any]) -> dict[str, Any]:
         """定点更新一个嵌套配置节（如 flash_lite_exchange），其余字段原样保留。"""
+        if not isinstance(name, str) or not name:
+            raise ConfigError("set_section 需要非空的节名")
         if not isinstance(values, Mapping) or not values:
             raise ConfigError("set_section 需要非空的字段映射")
         section = self._raw.get(name)
-        if not isinstance(section, dict):
+        if section is None:
             section = {}
             self._raw[name] = section
+        elif not isinstance(section, dict):
+            # 已有值不是对象：不能悄悄覆盖掉用户手写的配置
+            raise ConfigError(f"配置节 {name} 不是对象，无法按字段更新")
         section.update(dict(values))
         return dict(section)
 
     # ------------------------------------------------------------ 重载
+
+    def _reload_after_mutation(self, backup: dict[str, Any]) -> None:
+        """改动已写进 raw 后做校验；失败则回滚，内存里不留未经验证的状态。"""
+        try:
+            self.reload()
+        except Exception:
+            self._raw = backup
+            raise
 
     def reload(self) -> Config:
         """从当前 raw 重新构造 Config（用于校验改动是否合法）。"""

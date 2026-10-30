@@ -1170,6 +1170,30 @@ class ReplenishWorkerTest(unittest.TestCase):
             "验证码校验失败", worker.account_status()["_replenish"]["message"]
         )
 
+    def test_stop_interrupts_sms_wait_without_timeout_audit(self):
+        """等待短信期间收到停止请求：立刻结束本轮，不写「短信超时」审计。"""
+        registry = self._registry()
+        holder: dict = {}
+
+        class _StoppingSms(_FakeSms):
+            def get_msg(self, phone: str, *, keyword: str) -> str:
+                holder["worker"]._stop.set()  # 模拟等待期间 stop()
+                return "[尚未收到]"
+
+        worker = self._worker(
+            sms=_StoppingSms(phones=["13800009999"]),
+            authn=_FakeAuthn(),
+            keys=_FakeKeys(),
+            registry=registry,
+            target=1,
+            sms_poll_interval=0.01,
+            sms_poll_timeout=10.0,
+            clock=lambda: 0.0,
+        )
+        holder["worker"] = worker
+        worker.run_once()
+        self.assertEqual(registry.registrations(), [])  # 停止不是失败
+
     def test_captcha_required_records_failure(self):
         registry = self._registry()
         sms = _FakeSms(phones=["13800000008"])

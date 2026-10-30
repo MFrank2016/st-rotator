@@ -383,7 +383,7 @@ class ReplenishWorker:
         )
         soft_retries = 0
         hard_failures = 0
-        while need > 0:
+        while need > 0 and not self._stop.is_set():
             try:
                 result = self._replenish_one()
                 if result == "ok":
@@ -519,6 +519,14 @@ class ReplenishWorker:
         self._log(f"[补号] 已向 {phone} 发送短信验证码，等待接收…")
 
         # d. 等短信；超时 -> 软重试（换新号，重跑 spend gate）
+        # 停止请求要能立刻打断轮询：用 Event.wait 代替 sleep，一置位就抛 _StopCycle，
+        # 否则 stop() 得干等满 sms_poll_timeout（默认 120s）。
+        def _sleep_or_stop(seconds: float) -> None:
+            if self._stop.wait(seconds):
+                raise _StopCycle()
+
+        if self._stop.is_set():
+            raise _StopCycle()
         code = wait_sms_code(
             self._sms,
             phone,
@@ -526,8 +534,11 @@ class ReplenishWorker:
             interval=self._sms_poll_interval,
             timeout=self._sms_poll_timeout,
             clock=self._clock,
+            sleep=_sleep_or_stop,
         )
         if code is None:
+            if self._stop.is_set():
+                raise _StopCycle()  # 停止请求不是「短信超时」，不写失败审计
             self._log(
                 f"[补号] 号码 {phone} 短信超时（{self._sms_poll_timeout:g}s），换号重试"
             )

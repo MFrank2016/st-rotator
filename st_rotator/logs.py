@@ -54,6 +54,8 @@ class LogBuffer:
             return self._cursor, items
 
     def tail(self, limit: int = 200) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []  # -0 会退化成 [0:]（整个缓冲区），必须显式挡住
         with self._lock:
             items = list(self._lines)[-limit:]
         return [
@@ -129,10 +131,32 @@ def make_log_sink(
     return sink
 
 
+def _tail_lines(handle: Any, lines: int) -> list[bytes]:
+    """从文件末尾按块倒读，只取最后 ``lines`` 行（不扫全文件）。"""
+    handle.seek(0, 2)
+    pos = handle.tell()
+    block = 64 * 1024
+    data = b""
+    while pos > 0 and data.count(b"\n") <= lines:
+        step = min(block, pos)
+        pos -= step
+        handle.seek(pos)
+        data = handle.read(step) + data
+    return data.splitlines(keepends=True)[-lines:]
+
+
 def read_log_tail(log_file: str | Path, lines: int = 200) -> Sequence[str]:
-    """从文件尾部读若干行（UI 兜底用；正常走 LogBuffer 更好）。"""
-    path = Path(log_file)
-    if not path.is_file():
+    """从文件尾部读若干行（UI 兜底用；正常走 LogBuffer 更好）。
+
+    直接从末尾按块倒读，只解析最后 N 行；文件在读取途中被轮转（不存在了）
+    时返回空列表，而不是让 ``OSError`` 冒到调用方。
+    """
+    if lines <= 0:
         return []
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        return list(deque(handle, maxlen=lines))
+    try:
+        with Path(log_file).open("rb") as handle:
+            return [
+                raw.decode("utf-8", "replace") for raw in _tail_lines(handle, lines)
+            ]
+    except OSError:
+        return []

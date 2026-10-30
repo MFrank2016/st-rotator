@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import random
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -34,36 +35,54 @@ class FakeUpstream:
     latency: tuple[float, float] = (0.01, 0.04)
     hits: dict[str, int] = field(default_factory=dict)
     rate_limited_total: int = 0
+    # 计数器是读-改-写：demo 压测会多线程并发打同一个 FakeUpstream，必须原子更新
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
 
-    def handle(self, request: Request) -> Response:
-        key = (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
-        self.hits[key] = self.hits.get(key, 0) + 1
-        time.sleep(random.uniform(*self.latency))
+    def _note_hit(self, key: str) -> None:
+        with self._lock:
+            self.hits[key] = self.hits.get(key, 0) + 1
 
-        path = request.path
-        if path.rstrip("/").endswith("models"):
-            if key in self.invalid_keys:
-                return Response(401, {}, b'{"error":{"message":"invalid api key"}}')
-            return Response(200, {}, json.dumps({"data": [{"id": DEMO_MODEL, "object": "model"}]}).encode())
+    def _note_limited(self) -> None:
+        with self._lock:
+            self.rate_limited_total += 1
 
+    def _key_error(self, key: str) -> Response | None:
+        """按 key 的配置返回鉴权 / 限流错误；与具体端点无关（/models 同样适用）。"""
         if key in self.invalid_keys:
             return Response(401, {}, b'{"error":{"message":"invalid api key"}}')
         if key in self.auth_as_429:
-            self.rate_limited_total += 1
+            self._note_limited()
             return Response(
                 429,
                 {"retry-after": "5"},
                 json.dumps({"error": {"message": "authentication failed: api key is invalid", "code": 429}}).encode(),
             )
         if key in self.always_limited:
-            self.rate_limited_total += 1
+            self._note_limited()
             return Response(
                 429,
                 {"retry-after": "2"},
                 json.dumps({"error": {"message": "Requests rate limit exceeded, retry_after: 2"}}).encode(),
             )
+        return None
+
+    def handle(self, request: Request) -> Response:
+        key = (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
+        self._note_hit(key)
+        time.sleep(random.uniform(*self.latency))
+
+        path = request.path
+        # 鉴权 / 限流开关对所有端点一致生效（含 /models）
+        error = self._key_error(key)
+        if error is not None:
+            return error
+        if path.rstrip("/").endswith("models"):
+            return Response(200, {}, json.dumps({"data": [{"id": DEMO_MODEL, "object": "model"}]}).encode())
+
         if random.random() < self.flaky_rate:
-            self.rate_limited_total += 1
+            self._note_limited()
             return Response(429, {}, b'{"error":{"message":"Too Many Requests"}}')
 
         try:

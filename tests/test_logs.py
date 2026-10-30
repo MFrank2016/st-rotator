@@ -7,8 +7,15 @@ import os
 import tempfile
 import unittest
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from unittest import mock
 
-from st_rotator.logs import LogBuffer, build_logger, make_log_sink
+from st_rotator.logs import (
+    LogBuffer,
+    build_logger,
+    make_log_sink,
+    read_log_tail,
+)
 
 
 def _has_file_handler(logger: logging.Logger) -> bool:
@@ -48,6 +55,77 @@ class BuildLoggerTest(unittest.TestCase):
         logger = build_logger(None)
         self.assertIsInstance(logger, logging.Logger)
         self.assertFalse(_has_file_handler(logger))
+
+
+class LogTailTest(unittest.TestCase):
+    def test_tail_zero_returns_empty(self) -> None:
+        buf = LogBuffer()
+        buf.append("a")
+        self.assertEqual(buf.tail(0), [])
+        self.assertEqual(buf.tail(-5), [])
+
+    def test_read_log_tail_returns_last_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "r.log")
+            with open(path, "w", encoding="utf-8") as handle:
+                for i in range(1000):
+                    handle.write(f"line-{i}\n")
+            tail = read_log_tail(path, 3)
+            self.assertEqual([line.strip() for line in tail], ["line-997", "line-998", "line-999"])
+
+    def test_read_log_tail_does_not_scan_whole_file(self) -> None:
+        class _Counting:
+            def __init__(self, handle) -> None:
+                self._handle = handle
+                self.bytes_read = 0
+
+            def seek(self, *args):
+                return self._handle.seek(*args)
+
+            def tell(self):
+                return self._handle.tell()
+
+            def read(self, size=-1):
+                data = self._handle.read(size)
+                self.bytes_read += len(data)
+                return data
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self._handle.close()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "r.log")
+            with open(path, "w", encoding="utf-8") as handle:
+                for i in range(4000):
+                    handle.write(f"line-{i:05d} padding padding padding\n")
+            size = os.path.getsize(path)
+            counter = {}
+
+            real_open = Path.open
+
+            def fake_open(self, *args, **kwargs):
+                handle = _Counting(real_open(self, *args, **kwargs))
+                counter["handle"] = handle
+                return handle
+
+            with mock.patch.object(Path, "open", fake_open):
+                tail = read_log_tail(path, 2)
+            self.assertEqual(len(tail), 2)
+            self.assertLess(counter["handle"].bytes_read, size)
+
+    def test_read_log_tail_missing_file_returns_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(read_log_tail(os.path.join(tmp, "nope.log"), 10), [])
+
+    def test_read_log_tail_handles_rotation_race(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "r.log")
+            Path(path).write_text("x\n", encoding="utf-8")
+            with mock.patch.object(Path, "open", side_effect=FileNotFoundError):
+                self.assertEqual(read_log_tail(path, 10), [])
 
 
 class LogBufferTimestampTest(unittest.TestCase):

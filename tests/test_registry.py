@@ -1,10 +1,12 @@
 """T4 registry.py 测试：原子 JSON 注册表（已用号码 / 每日花销 / 注册审计）。"""
 
 import json
+import os
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -493,3 +495,58 @@ class RegistryFileModeTest(unittest.TestCase):
         path.chmod(0o644)
         reg.save()
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+
+class RegistrySaveGuardTest(unittest.TestCase):
+    """写入失败包成 RegistryError、临时文件名唯一、返回值是副本。"""
+
+    def _reg(self) -> Registry:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return Registry.load(Path(tmp.name) / "replenish.json")
+
+    def test_save_wraps_oserror_as_registry_error(self):
+        reg = self._reg()
+        with mock.patch(
+            "st_rotator.registry.os.replace", side_effect=OSError("disk full")
+        ):
+            with self.assertRaises(RegistryError):
+                reg.claim_phone("13000000000")
+
+    def test_tmp_name_is_unique(self):
+        reg = self._reg()
+        seen: list[str] = []
+        real_replace = os.replace
+
+        def spy(src, dst):
+            seen.append(str(src))
+            real_replace(src, dst)
+
+        with mock.patch("st_rotator.registry.os.replace", side_effect=spy):
+            reg.claim_phone("13000000001")
+            reg.claim_phone("13000000002")
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(len(set(seen)), 2)  # 两次写入不共用同一个 tmp
+        self.assertFalse(any(p.endswith("replenish.json.tmp") for p in seen))
+        self.assertEqual(list(reg.path.parent.glob("*.tmp")), [])
+
+    def test_registrations_returns_copies(self):
+        reg = self._reg()
+        _record(reg, phone="130")
+        entry = reg.registrations()[0]
+        entry["phone"] = "hacked"
+        self.assertEqual(reg.registrations()[0]["phone"], "130")
+
+    def test_registrations_page_returns_copies(self):
+        reg = self._reg()
+        _record(reg, phone="130")
+        page = reg.registrations_page()
+        page["items"][0]["phone"] = "hacked"
+        self.assertEqual(reg.registrations_page()["items"][0]["phone"], "130")
+
+    def test_snapshot_returns_copies(self):
+        reg = self._reg()
+        _record(reg, phone="130")
+        snap = reg.snapshot()
+        snap["registrations"][0]["phone"] = "hacked"
+        self.assertEqual(reg.snapshot()["registrations"][0]["phone"], "130")

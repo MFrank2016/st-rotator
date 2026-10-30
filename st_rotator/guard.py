@@ -328,6 +328,7 @@ class LeakGuardWorker:
                     f"回看 {self._window:.0f}s）却有积分消耗，"
                     f"新增待轮换账号 {len(added)} 个：{detail}"
                 ),
+                always_log=True,  # 只要真的新增了标记就必须留审计，哪怕状态文案没变
             )
 
     def _rotation_due(self, now: float) -> bool:
@@ -420,7 +421,8 @@ class LeakGuardWorker:
         """手动更换某账号的 Key：登录 → 注销全部 Key → 新建 → 落盘；成功则移出待轮换清单。
 
         与定时轮换共用同一套 ``rotate`` 回调与 ``persist``；用 ``_cycle_lock`` 串行化，
-        避免与后台扫描 / 轮换并发。返回 ``{"ok", "status", "message"}``（**不含明文 Key**）。
+        避免与后台扫描 / 轮换并发。**不阻塞等待**：后台正在扫描/轮换时直接返回 busy，
+        否则会把调用它的 UI 线程拖住。返回 ``{"ok", "status", "message"}``（不含明文 Key）。
         """
         account = next((a for a in self._accounts() if a.name == name), None)
         if account is None:
@@ -431,25 +433,45 @@ class LeakGuardWorker:
                 "status": "no_credentials",
                 "message": f"账号 {name} 未配置登录凭据",
             }
+        if not self._cycle_lock.acquire(blocking=False):
+            return {
+                "ok": False,
+                "status": "busy",
+                "message": "泄漏守卫正在执行扫描/轮换，请稍后再试",
+            }
         try:
-            with self._cycle_lock:
-                outcome = self._rotate(account)
+            outcome = self._rotate(account)
+            if outcome.ok:
+                # 与轮换同一临界区移除：否则后台调度可能在窗口内重复处理同一条目
+                self._store.remove_pending(name)
         except Exception as exc:  # noqa: BLE001 - 手动操作也要把异常收敛为结果
             return {
                 "ok": False,
                 "status": "check_error",
                 "message": f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT],
             }
+        finally:
+            self._cycle_lock.release()
         if not outcome.ok:
             return {"ok": False, "status": outcome.status, "message": outcome.message}
-        self._store.remove_pending(name)
         self._log(f"[泄漏守卫] 手动更换 Key 成功：{name}")
         return {"ok": True, "status": "ok", "message": f"账号 {name} 已更换 Key"}
 
     # ------------------------------------------------------------ 状态
 
-    def _set_status(self, status: str, message: str, *, log_line: str | None = None) -> None:
-        """写入状态；仅在状态发生迁移时输出日志（log_line 非空且确实变化）。"""
+    def _set_status(
+        self,
+        status: str,
+        message: str,
+        *,
+        log_line: str | None = None,
+        always_log: bool = False,
+    ) -> None:
+        """写入状态；默认只在状态迁移时输出日志。
+
+        ``always_log=True`` 用于「事件型」日志（如新标记了待轮换账号）：同一句文案
+        可能连续出现多次，但每一次都是真实的审计事件，不能因状态没变被吞掉。
+        """
         with self._status_lock:
             changed = (
                 self._status.get("status") != status
@@ -457,7 +479,7 @@ class LeakGuardWorker:
             )
             if changed:
                 self._status = {"status": status, "message": message}
-        if changed and log_line is not None:
+        if log_line is not None and (changed or always_log):
             self._log(log_line)
 
     def status(self) -> dict[str, Any]:

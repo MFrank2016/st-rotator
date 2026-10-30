@@ -344,6 +344,64 @@ class LeakGuardWorkerTest(unittest.TestCase):
             worker.run_once()
             self.assertEqual(len(self.rotate_calls), 4)
 
+    def test_new_marks_are_audited_even_when_status_text_unchanged(self) -> None:
+        """两次「新增 1 个」文案相同，但第二次也必须留审计。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = GuardStore.load(Path(tmp) / "guard.json")
+            changes: list[tuple[str, float]] = []
+            clock = _Clock(_epoch_at(2026, 10, 9, 1, 0))
+            worker = self._worker(store=store, clock=clock, changes=changes)
+            changes.append(("A", 5.0))
+            worker.run_once()
+            changes.clear()
+            changes.append(("B", 7.0))
+            worker.run_once()
+            audit = [line for line in self.log_lines if "新增待轮换账号" in line]
+            self.assertEqual(len(audit), 2)
+            self.assertEqual(store.pending(), ["A", "B"])
+
+    def test_rotate_now_returns_busy_when_cycle_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = GuardStore.load(Path(tmp) / "guard.json")
+            account = AccountConfig(
+                name="A", api_keys=["sk-a"], user="u", password="p"
+            )
+            clock = _Clock(_epoch_at(2026, 10, 9, 1, 0))
+            worker = self._worker(store=store, clock=clock, accounts=[account])
+            worker._cycle_lock.acquire()
+            try:
+                res = worker.rotate_now("A")
+            finally:
+                worker._cycle_lock.release()
+            self.assertFalse(res["ok"])
+            self.assertEqual(res["status"], "busy")
+            self.assertEqual(self.rotate_calls, [])
+
+    def test_remove_pending_happens_inside_cycle_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = GuardStore.load(Path(tmp) / "guard.json")
+            store.add_pending(["A"])
+            account = AccountConfig(
+                name="A", api_keys=["sk-a"], user="u", password="p"
+            )
+            clock = _Clock(_epoch_at(2026, 10, 9, 1, 0))
+            worker = self._worker(store=store, clock=clock, accounts=[account])
+            seen: list[bool] = []
+            real = store.remove_pending
+
+            def spy(name: str) -> bool:
+                acquired = worker._cycle_lock.acquire(blocking=False)
+                if acquired:
+                    worker._cycle_lock.release()
+                seen.append(not acquired)  # True = 调用时锁被持有
+                return real(name)
+
+            store.remove_pending = spy  # type: ignore[method-assign]
+            res = worker.rotate_now("A")
+            self.assertTrue(res["ok"])
+            self.assertEqual(seen, [True])
+            self.assertEqual(store.pending(), [])
+
     # ------------------------------------------------------------ 线程生命周期
     def test_start_stop_daemon_thread(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

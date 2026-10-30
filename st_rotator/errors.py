@@ -53,6 +53,30 @@ class RotationExhausted(RotatorError):
         self.last_status = last_status
         self.last_body = last_body
 
+    def __reduce__(self) -> tuple:
+        # attempts 是必填关键字参数，默认的 BaseException.__reduce__ 用 args 重建会 TypeError
+        return (
+            _rebuild_rotation_exhausted,
+            (
+                self.args[0] if self.args else "",
+                self.attempts,
+                self.last_status,
+                self.last_body,
+            ),
+        )
+
+
+def _rebuild_rotation_exhausted(
+    message: str,
+    attempts: int,
+    last_status: int | None,
+    last_body: str | None,
+) -> RotationExhausted:
+    """pickle 反序列化入口（模块级，保证可导入）。"""
+    return RotationExhausted(
+        message, attempts=attempts, last_status=last_status, last_body=last_body
+    )
+
 
 class ApiError(RotatorError):
     """上游返回了不可通过换 Key 解决的错误（如 400 参数错、404 模型不存在）。"""
@@ -61,6 +85,20 @@ class ApiError(RotatorError):
         super().__init__(message or f"上游返回 {status}: {body[:500]}")
         self.status = status
         self.body = body
+
+    def __reduce__(self) -> tuple:
+        # 默认 __reduce__ 只用 args（message）重建，缺 status/body 会 TypeError
+        return (
+            _rebuild_api_error,
+            (self.status, self.body, self.args[0] if self.args else None),
+        )
+
+
+def _rebuild_api_error(
+    status: int, body: str, message: str | None
+) -> ApiError:
+    """pickle 反序列化入口（模块级，保证可导入）。"""
+    return ApiError(status, body, message)
 
 
 class StreamInterrupted(RotatorError):

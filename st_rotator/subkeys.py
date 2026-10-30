@@ -121,28 +121,41 @@ class SubKeyManager:
         if not isinstance(data, dict) or data.get("version") != 1:
             self._logger("子 Key 数据文件版本不识别，已忽略")
             return
-        for item in data.get("keys", []):
+        keys_raw = data.get("keys") or []
+        if not isinstance(keys_raw, list):
+            # 文件被手改成 keys: 5 / "x" 时不能直接迭代（TypeError 会崩在启动路径上）
+            self._logger("子 Key 数据文件的 keys 必须是列表，已忽略")
+            keys_raw = []
+        for item in keys_raw:
             if not isinstance(item, dict):
                 continue
-            if not isinstance(item.get("name"), str) or not isinstance(item.get("key"), str):
+            name = item.get("name")
+            key = item.get("key")
+            if not isinstance(name, str) or not isinstance(key, str) or not key:
+                # 空 key 会让 masked 的 key[0] 抛 IndexError（create 不会产生，但文件可能是手改的）
                 continue
-            usage = dict(item.get("usage") or {})
-            for key, value in _EMPTY_USAGE.items():
-                usage.setdefault(key, value)
+            usage_raw = item.get("usage")
+            usage = dict(usage_raw) if isinstance(usage_raw, dict) else {}
+            for usage_field, default in _EMPTY_USAGE.items():
+                usage.setdefault(usage_field, default)
             self._keys.append(
                 SubKey(
-                    name=item["name"],
-                    key=item["key"],
+                    name=name,
+                    key=key,
                     enabled=bool(item.get("enabled", True)),
                     created_at=str(item.get("created_at") or ""),
                     note=str(item.get("note") or ""),
                     usage=usage,
                 )
             )
-        history = data.get("history") or []
-        for event in history[-_HISTORY_LIMIT:]:
-            if isinstance(event, dict):
-                self._history.append(event)
+        history_raw = data.get("history")
+        if isinstance(history_raw, list):
+            for event in history_raw[-_HISTORY_LIMIT:]:
+                if isinstance(event, dict):
+                    self._history.append(event)
+        elif history_raw:
+            # truthy 的非列表（数字 / 对象）切片会抛 TypeError，整份数据当没有历史处理
+            self._logger("子 Key 数据文件的 history 必须是列表，已忽略")
 
     def _to_dict(self) -> Dict[str, Any]:
         return {

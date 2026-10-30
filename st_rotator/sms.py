@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import http.client
 import re
 import time
 import urllib.error
@@ -91,8 +92,9 @@ class EjiemaSms:
             raise SmsError(
                 f"{action} HTTP {exc.code}: {text}", retryable=exc.code >= 500
             ) from exc
-        except (urllib.error.URLError, OSError) as exc:
-            # socket.timeout / TimeoutError 均为 OSError 子类，一并归为网络层
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+            # socket.timeout / TimeoutError 均为 OSError 子类；IncompleteRead /
+            # BadStatusLine 是 HTTPException（不是 OSError），同样归为可重试网络层
             raise SmsError(
                 f"{action} {type(exc).__name__}: {exc}", retryable=True
             ) from exc

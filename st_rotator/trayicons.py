@@ -14,8 +14,10 @@ Windows 托盘需要一个 ``HICON``。本机没有 Pillow，也不想让用户�
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import struct
+import tempfile
 from pathlib import Path
 
 # ---------------------------------------------------------------- 状态配色
@@ -35,9 +37,15 @@ COLOR_STARTING = (0x3B, 0x82, 0xF6)
 ICON_SIZES = (16, 20, 24, 32, 48)
 
 _SUPERSAMPLE = 4
+#: 描边暗化系数（参与缓存键：改它必须让旧 ico 失效）
+_DARKEN_FACTOR = 0.62
+#: 渲染器版本：形状 / 描边 / 混合方式一变就 +1，强制重建缓存
+_ICON_RENDER_VERSION = 2
 
 
-def _darken(rgb: tuple[int, int, int], factor: float = 0.62) -> tuple[int, int, int]:
+def _darken(
+    rgb: tuple[int, int, int], factor: float = _DARKEN_FACTOR
+) -> tuple[int, int, int]:
     return tuple(max(0, min(255, int(c * factor))) for c in rgb)  # type: ignore[return-value]
 
 
@@ -147,6 +155,23 @@ _GENERATED_ICON = re.compile(
 )
 
 
+def _write_atomic(path: Path, data: bytes) -> None:
+    """先写同目录临时文件再原子替换：进程中途被杀也不会留下半个 .ico。"""
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".tray-", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def ensure_icons(directory: Path) -> dict[str, Path]:
     """确保每个状态都有一份 .ico 文件，返回 ``{状态: 路径}``。
 
@@ -157,11 +182,16 @@ def ensure_icons(directory: Path) -> dict[str, Path]:
     directory.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
     for state, color in STATE_COLORS.items():
-        key = f"{state}|{color}|{ICON_SIZES}|{_SUPERSAMPLE}"
+        # 缓存键必须覆盖**所有**影响像素的输入：颜色、尺寸、超采样、
+        # 暗化系数、渲染器版本（否则改了参数还复用旧图标）
+        key = (
+            f"v{_ICON_RENDER_VERSION}|{state}|{color}|{ICON_SIZES}"
+            f"|{_SUPERSAMPLE}|{_DARKEN_FACTOR}"
+        )
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
         path = directory / f"tray-{state}-{digest}.ico"
         if not path.exists():
-            path.write_bytes(build_ico(ICON_SIZES, color))
+            _write_atomic(path, build_ico(ICON_SIZES, color))
         paths[state] = path
 
     # 清掉历史版本的图标，别让目录越积越多。只删本函数生成的名字

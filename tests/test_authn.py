@@ -12,6 +12,7 @@ import json
 import threading
 import unittest
 import urllib.parse
+import urllib.request
 
 from st_rotator import authn
 from st_rotator.quota import REDIRECT_URI
@@ -209,6 +210,90 @@ class ExchangeCodeTest(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+
+class NullRefreshTokenTest(unittest.TestCase):
+    """refresh_token 为 null 时要归一成空串，不能变成字符串 "None"。"""
+
+    def test_null_refresh_token_becomes_empty_string(self):
+        holder = {}
+
+        def do_token(rec):
+            return _json({"access_token": "AT", "refresh_token": None})
+
+        server, thread, base = serve(
+            {
+                ("GET", "/oauth2/auth"): lambda rec: _redirect(
+                    "/login?login_challenge=CHAL"
+                ),
+                ("GET", "/login"): lambda rec: (200, {}, b"ok"),
+                ("GET", "/start"): lambda rec: _redirect(
+                    "/cb?code=CODE&state=" + holder["state"]
+                ),
+                ("GET", "/cb"): lambda rec: (200, {}, b"ok"),
+                ("POST", "/oauth2/token"): do_token,
+            }
+        )
+        try:
+            auth = authn.HttpAuthn(timeout=5.0, iam_base=base, oidc_base=base)
+            auth.mint_login_challenge()
+            holder["state"] = _FakeAuthn.requests[0]["query"]["state"][0]
+            bundle = auth.exchange_code(base + "/start", "VERIFIER")
+            self.assertEqual(bundle.refresh_token, "")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+
+class NoAutoRedirectTest(unittest.TestCase):
+    """opener 不自动跟随：3xx 由 _follow_until 显式处理。"""
+
+    def test_open_returns_redirect_instead_of_following(self):
+        server, thread, base = serve(
+            {
+                ("GET", "/a"): lambda rec: _redirect("/b"),
+                ("GET", "/b"): lambda rec: (200, {}, b"final"),
+            }
+        )
+        try:
+            auth = authn.HttpAuthn(timeout=5.0, iam_base=base, oidc_base=base)
+            resp = auth._open(
+                auth._shared_opener, urllib.request.Request(base + "/a")
+            )
+            self.assertEqual(resp.headers.get("Location"), "/b")
+            # 没有自动跟到 /b
+            self.assertEqual([rec["path"] for rec in _FakeAuthn.requests], ["/a"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_follow_until_follows_manually(self):
+        server, thread, base = serve(
+            {
+                ("GET", "/a"): lambda rec: _redirect("/b"),
+                ("GET", "/b"): lambda rec: (200, {}, b"final"),
+            }
+        )
+        try:
+            auth = authn.HttpAuthn(timeout=5.0, iam_base=base, oidc_base=base)
+            loc = auth._follow_until(
+                auth._shared_opener, base + "/a", lambda u: u.endswith("/b"), param="x"
+            )
+            self.assertEqual(loc, "/b")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+
+class ClassifyReasonTest(unittest.TestCase):
+    def test_chinese_sms_code_error_is_sms_not_captcha(self):
+        self.assertEqual(authn._classify_reason("验证码错误"), "incorrect_sms_code")
+
+    def test_captcha_hint_is_still_captcha(self):
+        self.assertEqual(authn._classify_reason("请完成验证码"), "invalid_captcha")
 
 
 class OidcStateTest(unittest.TestCase):

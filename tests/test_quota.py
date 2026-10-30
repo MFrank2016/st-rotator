@@ -432,6 +432,46 @@ class QuotaServiceTest(unittest.TestCase):
         self.assertEqual(len(out), 2)
         self.assertEqual(svc._cache, {})
 
+    def test_sampler_logs_failure_and_backs_off(self):
+        """后台采样失败必须留日志（不能静默 pass）。"""
+        logs: list[str] = []
+        svc = quota.QuotaService(
+            _config_with([{"name": "账号1", "api_keys": ["k1"], "user": "u1", "password": "p1"}]),
+            transport=_FakeTransport(),
+            clock=lambda: 0.0,
+            logger=logs.append,
+        )
+        calls: list[int] = []
+
+        def boom(*, force: bool = False):
+            calls.append(1)
+            svc._stop.set()  # 让下一轮直接退出，避免测试依赖计时
+            raise RuntimeError("platform locked")
+
+        svc.snapshot = boom  # type: ignore[method-assign]
+        svc._sample_loop(0.01)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(svc._sample_failures, 1)
+        self.assertTrue(any("后台采样失败" in line for line in logs))
+        self.assertIn("platform locked", logs[0])
+
+    def test_sampler_resets_failure_counter_on_success(self):
+        svc = quota.QuotaService(
+            _config_with([{"name": "账号1", "api_keys": ["k1"], "user": "u1", "password": "p1"}]),
+            transport=_FakeTransport(),
+            clock=lambda: 0.0,
+            logger=lambda _m: None,
+        )
+        svc._sample_failures = 3
+
+        def ok(*, force: bool = False):
+            svc._stop.set()
+            return []
+
+        svc.snapshot = ok  # type: ignore[method-assign]
+        svc._sample_loop(0.01)
+        self.assertEqual(svc._sample_failures, 0)
+
     def test_verify_credentials(self):
         svc = self._svc(_FakeTransport())
         self.assertIsNone(svc.verify_credentials("u1", "p1"))

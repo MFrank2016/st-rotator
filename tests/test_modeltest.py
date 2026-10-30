@@ -654,6 +654,56 @@ class NonStreamReasoningTest(unittest.TestCase):
         self.assertEqual(results[0].reasoning, "想")
 
 
+class StreamResultTest(unittest.TestCase):
+    """流式：usage 要进结果、流中 error 事件要判失败。"""
+
+    def _run(self, chunks):
+        config = _config([AccountConfig(name="账号1", api_keys=["sk-1"])])
+        body = "".join(
+            "data: " + json.dumps(c) + "\n\n" for c in chunks
+        ) + "data: [DONE]\n\n"
+        clients: list[_FakeClient] = []
+        req = modeltest.ModelTestRequest(
+            model="m", accounts=["账号1"], prompt="hi", stream=True
+        )
+        results = _run_test(
+            config, req, clients, _single_factory(clients, [Response(200, {}, body.encode())])
+        )
+        return results[0]
+
+    def test_usage_chunk_is_stored_on_result(self):
+        result = self._run(
+            [
+                {"choices": [{"delta": {"content": "hi"}}]},
+                {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 7}},
+            ]
+        )
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.usage, {"prompt_tokens": 5, "completion_tokens": 7})
+
+    def test_error_event_in_stream_marks_failure(self):
+        result = self._run(
+            [
+                {"choices": [{"delta": {"content": "hi"}}]},
+                {"error": {"message": "upstream boom"}},
+            ]
+        )
+        self.assertEqual(result.status, "error")
+        self.assertIn("upstream boom", result.error["message"])
+
+    def test_default_factory_builds_a_client_factory(self):
+        """DEFAULT_CLIENT_FACTORY 是「按 config 造工厂」，不是工厂本身。"""
+        from st_rotator.transport import HttpClient
+
+        config = _config([AccountConfig(name="账号1", api_keys=["sk-1"])])
+        factory = modeltest.DEFAULT_CLIENT_FACTORY(config)
+        client = factory()
+        try:
+            self.assertIsInstance(client, HttpClient)
+        finally:
+            client.close()
+
+
 class ClientLifecycleTest(unittest.TestCase):
     """每个账号的 HttpClient 用完必须关闭（否则长跑网关累积连接池/FD）。"""
 

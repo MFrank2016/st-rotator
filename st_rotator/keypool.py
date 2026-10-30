@@ -580,10 +580,14 @@ class KeyPool:
         if user:
             key.last_user = user
         key.last_used = now
+        # 先清 60s 外的旧条目再追加：rpm_limit 为空时读取路径不会 prune，
+        # 无条件追加会让窗口随请求数无限增长
+        key._prune(now)
         key._window.append(now)
         key.stats.requests += 1
         if key.account_state is not None:
             key.account_state.inflight += 1
+            key.account_state._prune(now)
             key.account_state._window.append(now)
         return key
 
