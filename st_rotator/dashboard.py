@@ -696,6 +696,8 @@ var S = {
   samples: [],
   timerState: null,
   timerLog: null,
+  stateBusy: false,
+  logBusy: false,
   timerCountdown: null,
   timerQuota: null,
   timerUsage: null,
@@ -744,9 +746,10 @@ function toast(message, kind) {
 
 function fmtInt(n) { return Number(n || 0).toLocaleString("en-US"); }
 
-function fmtTime(ts) {
-  if (!ts) return "—";
-  var d = new Date(ts * 1000);
+function fmtTime(value) {
+  if (!value) return "—";
+  var d = new Date(Number(value) * 1000);
+  if (isNaN(d.getTime())) return "—";
   function p(n) { return (n < 10 ? "0" : "") + n; }
   return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
     " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
@@ -780,7 +783,12 @@ function fmtCountdown(resetAt, longForm) {
 }
 
 /* 只取“未来”的重置时间：个别账号窗口刚过期时 reset_at 会短暂落在过去，若计入会把倒计时显示成 —。 */
-function minReset(a, b) { var now = Math.floor(Date.now() / 1000); if (!b || b <= now) return a; return a ? Math.min(a, b) : b; }
+function minReset(a, b) {
+  var now = Math.floor(Date.now() / 1000);
+  if (a && a <= now) a = null;  // a 过期也要过滤，否则 Math.min 会被过去时刻污染
+  if (!b || b <= now) return a;
+  return a ? Math.min(a, b) : b;
+}
 
 function quotaAggregate() {
   var agg = {g5: 0, g7: 0, f5: 0, f7: 0, reset5: null, reset7: null, ok: 0};
@@ -1174,7 +1182,8 @@ function renderReplenish(state) {
     badge = '<span class="pill neutral">未启动</span>';
   }
   var note = "";
-  if (rs.message) note = esc(rs.message);
+  // 只喂给 textContent（下方 noteEl.textContent = note），这里不能 esc——否则 & < > 会显示成实体
+  if (rs.message) note = rs.message;
   else if (rpo.sms_token_configured === false) note = "未配置易码 Token，补号未运行";
   else if (rpo.sms_token_ok === false) note = "易码 Token 不可用";
   else if (enabled && rp.running === false) note = "已开启，重启 ui / tray 后生效";
@@ -1339,16 +1348,21 @@ function renderSnippet(g) {
   $("snippet").textContent = text;
 }
 
+/* 用户在模型下拉里改过选择、还没点「应用为默认模型」时置脏：2 秒轮询重绘选项
+   可以继续，但不得把 select 的值改回服务端的 default_model。 */
+var modelSelectDirty = false;
+
 function renderModels(state) {
   var catalog = state.models || {};
   S.models = catalog.models || [];
   var select = $("model-select");
   var current = state.default_model;
+  var chosen = modelSelectDirty && select.value ? select.value : current;
   var options = S.models.map(function (m) { return m.id; });
-  if (current && options.indexOf(current) === -1) options.unshift(current);
-  if (!options.length) options = [current].filter(Boolean);
+  if (chosen && options.indexOf(chosen) === -1) options.unshift(chosen);
+  if (!options.length) options = [chosen].filter(Boolean);
   select.innerHTML = options.map(function (id) {
-    return '<option value="' + esc(id) + '"' + (id === current ? " selected" : "") + '>' + esc(id) + '</option>';
+    return '<option value="' + esc(id) + '"' + (id === chosen ? " selected" : "") + '>' + esc(id) + '</option>';
   }).join("") || '<option value="">（无可用模型）</option>';
   select.dataset.current = current || "";
 
@@ -1553,7 +1567,9 @@ function mtAppend(card, cls, text) {
   var box = card.querySelector("." + cls);
   if (!box) return;
   box.style.display = "block";
-  box.querySelector("pre").innerHTML += esc(text);
+  var pre = box.querySelector("pre");
+  // 纯文本追加：内容本来就是纯文本，不需要转义，也不必每个 token 重解析整段 innerHTML
+  if (pre) pre.textContent += text;
 }
 
 function onModelTestEvent(name, obj) {
@@ -1903,11 +1919,14 @@ function appendLogs(items) {
 }
 
 async function pollLogs() {
+  if (S.logBusy) return;  // 上一次还没回来：跳过本次 tick，避免重复追加
+  S.logBusy = true;
   try {
     var data = await api("/api/logs?cursor=" + S.cursor);
     S.cursor = data.cursor;
     if (data.items && data.items.length) appendLogs(data.items);
   } catch (err) { /* 静默：日志轮询失败不该刷屏 */ }
+  finally { S.logBusy = false; }  // 异常也必须清标志，否则轮询永久停摆
 }
 
 /* ------------------------------------------------------------------ 交互 */
@@ -2061,6 +2080,7 @@ async function onApplyModel() {
   try {
     var result = await api("/api/model", { method: "POST", body: JSON.stringify({ model: model }) });
     toast(result.message, "ok");
+    modelSelectDirty = false;  // 已提交为默认模型，后续轮询可以按服务端值回填
     await refreshState();
   } catch (err) { toast(err.message, "err"); }
 }
@@ -2170,15 +2190,6 @@ function copyText(text, label) {
 
 var skRevealed = {};
 
-function fmtTime(value) {
-  if (!value) return "—";
-  var d = new Date(Number(value) * 1000);
-  if (isNaN(d.getTime())) return "—";
-  function p(n) { return (n < 10 ? "0" : "") + n; }
-  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
-    " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
-}
-
 function renderSubkeys(state) {
   var sk = state.subkeys;
   var note = $("sk-note");
@@ -2197,6 +2208,12 @@ function renderSubkeys(state) {
     return;
   }
   createBox.style.display = "block";
+  // 首次拿到子 Key 区块时拉一次用量明细；之后只由分页按钮/操作触发，
+  // 不跟 2 秒轮询（否则每 2s 一次多余请求）。失败时下面会重新置 loaded=false，下个 tick 再试。
+  if (!skHist.loaded) {
+    skHist.loaded = true;
+    loadSubkeyHistory(1);
+  }
   var warns = [];
   if (!sk.admin_token_set) {
     warns.push("未设置管理 Token（--token）：本管理页面与 /api/* 接口当前无需凭据即可访问。" +
@@ -2250,7 +2267,7 @@ function renderSubkeys(state) {
 
 /* ------------------------------------------------- 用量明细（分页，默认每页 10 条） */
 
-var skHist = { page: 1, pageSize: 10, total: 0, loading: false, pending: 0 };
+var skHist = { page: 1, pageSize: 10, total: 0, loading: false, pending: 0, loaded: false };
 
 async function loadSubkeyHistory(page) {
   if (skHist.loading) {
@@ -2270,6 +2287,7 @@ async function loadSubkeyHistory(page) {
   } catch (err) {
     bar.innerHTML = "";
     box.innerHTML = '<div class="empty">' + esc(err.message) + "</div>";
+    skHist.loaded = false;  // 首拉失败：允许下一个 tick 再试
   } finally {
     skHist.loading = false;
     if (skHist.pending) {
@@ -2407,6 +2425,9 @@ async function onSubkeyAction(action, button) {
 var lastState = {};
 
 async function refreshState() {
+  // stateBusy 只给 2 秒定时器用（见文件末尾）：上一轮没回来就跳过本次 tick。
+  // 手动触发的刷新（按钮 / 操作后 await）不跳过，避免用户点了没反应。
+  S.stateBusy = true;
   try {
     var state = await api("/api/state");
     lastState = state;
@@ -2429,6 +2450,8 @@ async function refreshState() {
     else $("logfile").textContent = "未启用文件日志（仅内存缓冲）";
   } catch (err) {
     $("subline").innerHTML = '<span class="dot" style="background:var(--red)"></span>连接失败：' + esc(err.message);
+  } finally {
+    S.stateBusy = false;  // 异常也必须清标志，否则轮询永久停摆
   }
 }
 
@@ -2476,7 +2499,10 @@ function bind() {
     catch (err) { toast(err.message, "err"); }
   };
   $("btn-copy-base").onclick = function () { copyText((lastGateway.base_url || ""), "网关地址"); };
-  $("model-select").onchange = updateModelMeta;
+  $("model-select").onchange = function () {
+    modelSelectDirty = true;  // 用户手选：后续轮询不再覆盖该选择
+    updateModelMeta();
+  };
   $("avail-btn").onclick = function (event) {
     event.stopPropagation();
     var menu = $("avail-menu");
@@ -2559,7 +2585,7 @@ bind();
 refreshState().then(function () { refreshQuota(false); refreshUsage(); refreshSamples(); });
 renderReplenishRecords();  // 注册记录只在启动时拉一次，不做 2 秒轮询
 pollLogs();
-S.timerState = setInterval(refreshState, 2000);
+S.timerState = setInterval(function () { if (!S.stateBusy) refreshState(); }, 2000);
 S.timerLog = setInterval(pollLogs, 1200);
 S.timerCountdown = setInterval(tickCountdowns, 1000);
   S.timerQuota = setInterval(function () { refreshQuota(false); }, 60000);
