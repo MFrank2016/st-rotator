@@ -10,6 +10,12 @@ class BuildQuotaServiceTest(unittest.TestCase):
                                 "accounts": [{"name": "a", "api_keys": ["k"]}]})
         self.assertIsNone(build_quota_service(cfg))
 
+    def test_none_when_quota_disabled(self):
+        cfg = Config.from_dict({"base_url": "http://127.0.0.1:9/v1",
+                                "quota": {"enabled": False},
+                                "accounts": [{"name": "a", "api_keys": ["k"], "user": "u", "password": "p"}]})
+        self.assertIsNone(build_quota_service(cfg))
+
     def test_returns_service_when_credentials_present(self):
         cfg = Config.from_dict({"base_url": "http://127.0.0.1:9/v1",
                                 "accounts": [{"name": "a", "api_keys": ["k"], "user": "u", "password": "p"}]})

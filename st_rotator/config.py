@@ -588,6 +588,35 @@ class LeakGuardConfig:
 
 
 @dataclass
+class QuotaConfig:
+    """余量/积分采样（quota）：定时登录账号拉取余量与积分。
+
+    Attributes:
+        enabled: 是否启用采样服务；False 时 ``build_quota_service`` 不创建服务。
+    """
+
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigError(
+                f"quota.enabled 必须是布尔值，当前为 {self.enabled!r}"
+            )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any] | None) -> "QuotaConfig":
+        data = dict(data or {})
+        unknown = set(data) - set(cls.__dataclass_fields__)
+        if unknown:
+            raise ConfigError(f"quota 存在未知字段: {sorted(unknown)}")
+        return cls(**data)
+
+    def to_dict(self) -> dict[str, Any]:
+        """导出为可序列化字典。"""
+        return {"enabled": self.enabled}
+
+
+@dataclass
 class ModelFilterConfig:
     """模型白名单：只有名单内的模型能通过网关。
 
@@ -772,6 +801,8 @@ class Config:
     replenish: ReplenishConfig = field(default_factory=ReplenishConfig)
     # 泄漏防护（定时轮换 Key，限制单把 Key 的可观测窗口）
     leak_guard: LeakGuardConfig = field(default_factory=LeakGuardConfig)
+    # 余量/积分采样（定时登录账号拉取余量）
+    quota: QuotaConfig = field(default_factory=QuotaConfig)
 
     # 模型清单过滤（把几乎不可用的模型从清单里藏掉）
     model_filter: ModelFilterConfig = field(default_factory=ModelFilterConfig)
@@ -837,6 +868,7 @@ class Config:
         )
         replenish = ReplenishConfig.from_dict(data.pop("replenish", None))
         leak_guard = LeakGuardConfig.from_dict(data.pop("leak_guard", None))
+        quota = QuotaConfig.from_dict(data.pop("quota", None))
         model_filter = ModelFilterConfig.from_dict(data.pop("model_filter", None))
         headers = {
             str(k): expand_env(str(v))
@@ -851,6 +883,7 @@ class Config:
             "flash_lite_exchange",
             "replenish",
             "leak_guard",
+            "quota",
             "model_filter",
         }
         unknown = set(data) - known
@@ -865,6 +898,7 @@ class Config:
             flash_lite_exchange=flash_lite,
             replenish=replenish,
             leak_guard=leak_guard,
+            quota=quota,
             model_filter=model_filter,
             extra_headers=headers,
             **{k: expand_env(v) if isinstance(v, str) else v for k, v in data.items()},
@@ -900,6 +934,7 @@ class Config:
             "auto_renew": self.auto_renew.to_dict(),
             "replenish": self.replenish.to_dict(),
             "leak_guard": self.leak_guard.to_dict(),
+            "quota": self.quota.to_dict(),
             "accounts": [
                 {
                     "name": a.name,

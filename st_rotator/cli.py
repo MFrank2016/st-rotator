@@ -432,9 +432,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 
 def build_quota_service(config: Config) -> QuotaService | None:
-    """仅当存在配置了 user+password 的账号时才创建 QuotaService。"""
+    """仅当 quota.enabled 且存在配置了 user+password 的账号时才创建 QuotaService。
+
+    quota.enabled=false 时不创建采样服务。
+    """
     from .quota import QuotaService
 
+    if not config.quota.enabled:
+        return None
     if not any(a.user and a.password for a in config.accounts):
         return None
     return QuotaService(config, sampler_interval=300.0)
