@@ -127,7 +127,7 @@
 - `replenish.json` 按完整字段契约校验，残缺记录报 `RegistryError` 而不是被猜成失败记录。
 - `build_replenish_persist` 的 `persist` 回调移除了未使用的 `outcome` 参数。
 
-## [1.10.1] - 2026-10-31
+## [1.12.1] - 2026-10-31
 
 ### 新增
 
