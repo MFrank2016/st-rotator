@@ -274,6 +274,152 @@ def _passthrough_error(status: int, body: str) -> dict:
     return error_payload(body[:800] or f"upstream returned {status}", code=str(status))
 
 
+# ------------------------------------------------------------ 请求体清洗
+#
+# 为什么需要它：商汤网关对 chat/completions 的 schema 校验比 OpenAI 官方严，
+# 有一批"完全合法、官方也接受"的写法会被它判成 400。实测（2026-10-30，
+# deepseek-v4-flash，逐例对真实上游验证）下列写法全部 400：
+#
+#     {"role": "assistant", "content": null}          ← 无 tool_calls 时 400
+#     {"role": "assistant"}                           ← 连字段都没有
+#     {"role": "system",    "content": null}
+#     {"role": "tool",      "content": null}          ← 工具结果为空
+#     {"role": "tool"}                                ← 连字段都没有
+#     "arguments": {"a": 1}                           ← 必须是 JSON **字符串**
+#     "content": 123                                  ← 必须是字符串
+#     "temperature": "0.7"                            ← 必须是数字
+#     "logprobs" / "top_logprobs" / "metadata"        ← 商汤不认这些字段
+#
+# 这些写法是 Agent 框架的常规产出（OpenAI 与 DeepSeek 直连都接受），商汤却回：
+#
+#     400 {"message":"inference request is invalid",
+#          "type":"invalid_request_error","code":"invalid_parameter_error"}
+#     400 {"message":"invalid arguments", ... ,"code":"3"}
+#
+# 规范成等价安全写法后实测全部 200。注意**不能乱改**的地方：
+#   * 带 tool_calls 的 assistant 保持 content:null 不动（商汤接受，动它有风险）；
+#   * user.content 为 null/"" 会另报 "user content required"，那是真的空用户轮，
+#     伪造成空串只会把错误往后推 —— 不代改；
+#   * 越界数值（temperature 3、frequency_penalty 5）报错信息很明确，
+#     改成合法值等于篡改用户意图 —— 不动。
+_SENSENOVA_UNSUPPORTED_FIELDS = ("logprobs", "top_logprobs", "metadata")
+
+# content 允许是字符串或"多模态数组"（[{"type":"text",...}]），其余一律转成字符串
+_NULLABLE_CONTENT_ROLES = ("assistant", "system", "tool")
+
+# 商汤不认识的角色名 → 映射成等价的 system。
+# 实测（2026-10-30）：`{"role":"developer"}` 直接 400 "inference request is invalid"，
+# 改成 `system` 立刻 200。`developer` 是 OpenAI 新规范里替代 system 的角色，
+# Codex 等较新的 Agent 框架会大量使用 —— 不映射就会持续 400。
+_ROLE_ALIASES = {"developer": "system"}
+
+
+def _normalize_content(message: dict[str, Any]) -> dict[str, Any] | None:
+    """把单条消息的 content 规范成商汤能接受的形态；没改动则返回 None。
+
+    * 缺失 / 为 None → ``""``（带 tool_calls 的 assistant 除外，那种写法商汤接受）
+    * 数字 / 布尔等标量 → 转成字符串（实测 content:123 会 400 invalid arguments）
+    * 多模态数组 / 字符串 → 原样保留
+    """
+    role = message.get("role")
+    content = message.get("content")
+    missing = "content" not in message or content is None
+    if missing:
+        # assistant 带 tool_calls 时商汤接受 content:null，保持原样
+        if role == "assistant" and message.get("tool_calls"):
+            return None
+        if role in _NULLABLE_CONTENT_ROLES:
+            fixed = dict(message)
+            fixed["content"] = ""
+            return fixed
+        return None
+    if isinstance(content, (str, list)):
+        return None
+    if isinstance(content, (int, float, bool)):
+        fixed = dict(message)
+        fixed["content"] = str(content)
+        return fixed
+    return None
+
+
+def _normalize_tool_calls(message: dict[str, Any]) -> dict[str, Any] | None:
+    """``function.arguments`` 必须是 JSON 字符串：传了对象/数字就序列化过去。
+
+    实测 ``"arguments": {"a": 1}`` 会被商汤判 400 ``invalid arguments``；
+    OpenAI 规范本身要求它是字符串，这里只是帮忙补成合法的等价形式。
+    """
+    calls = message.get("tool_calls")
+    if not isinstance(calls, list) or not calls:
+        return None
+    changed = False
+    new_calls: list[Any] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            new_calls.append(call)
+            continue
+        func = call.get("function")
+        if not isinstance(func, dict):
+            new_calls.append(call)
+            continue
+        args = func.get("arguments")
+        if isinstance(args, str):
+            new_calls.append(call)
+            continue
+        fixed_call = dict(call)
+        fixed_func = dict(func)
+        fixed_func["arguments"] = json.dumps(args if args is not None else {}, ensure_ascii=False)
+        fixed_call["function"] = fixed_func
+        new_calls.append(fixed_call)
+        changed = True
+    if not changed:
+        return None
+    fixed_message = dict(message)
+    fixed_message["tool_calls"] = new_calls
+    return fixed_message
+
+
+def _normalize_role(message: dict[str, Any]) -> dict[str, Any] | None:
+    """把商汤不认识的角色名映射成等价角色（``developer`` → ``system``）。"""
+    role = message.get("role")
+    if not isinstance(role, str):
+        return None
+    mapped = _ROLE_ALIASES.get(role.strip().lower())
+    if mapped is None or mapped == role:
+        return None
+    fixed = dict(message)
+    fixed["role"] = mapped
+    return fixed
+
+
+def _normalize_messages(messages: Any) -> Any:
+    """把会让商汤网关误判 400 的消息写法规范成语义等价的安全写法。
+
+    处理四类（详见本节顶部注释）：``developer`` 等未知角色、content 缺失/null、
+    content 传了非字符串标量、``tool_calls[*].function.arguments`` 传了对象而非
+    JSON 字符串。非 list 输入原样返回。
+
+    返回新列表而不是原地改：调用方一旦清洗中途抛异常，仍能按原请求转发。
+    """
+    if not isinstance(messages, list):
+        return messages
+    normalized: list[Any] = []
+    changed = False
+    for message in messages:
+        if not isinstance(message, dict):
+            normalized.append(message)
+            continue
+        current: dict[str, Any] = message
+        # 依次过三道规范化，每道都基于上一道的结果继续（能改就换成新 dict）
+        for step in (_normalize_role, _normalize_content, _normalize_tool_calls):
+            result = step(current)
+            if result is not None:
+                current = result
+        if current is not message:
+            changed = True
+        normalized.append(current)
+    return normalized if changed else messages
+
+
 class RotatorProxyHandler(BaseHTTPRequestHandler):
     """把请求转交给轮换池的 HTTP 处理器。"""
 
@@ -857,6 +1003,18 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
                 400, error_payload("'messages' is required", "invalid_request_error")
             )
             return
+
+        # 商汤网关的 schema 比 OpenAI 官方严：Agent 常发的
+        # `{"role":"assistant","content":null}`（无 tool_calls）会被判 400
+        # "inference request is invalid"。这里在转发前做语义等价的规范化，
+        # 让所有接入的 Agent 自动免疫这类 400（详见模块顶部注释）。
+        # 清洗绝不能把请求打死：出任何异常就按原请求原样转发。
+        try:
+            messages = _normalize_messages(messages)
+            for field in _SENSENOVA_UNSUPPORTED_FIELDS:
+                params.pop(field, None)
+        except Exception:  # pragma: no cover - 兜底：清洗失败不影响转发
+            pass
 
         # max_tokens 下限：推理模型思考模式需要额外预算（SenseNova 建议 ≥2048），
         # 客户端给得过小时抬到下限，避免 content 被 reasoning_content 吃空。

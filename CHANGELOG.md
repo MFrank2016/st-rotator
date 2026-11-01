@@ -127,6 +127,17 @@
 - `replenish.json` 按完整字段契约校验，残缺记录报 `RegistryError` 而不是被猜成失败记录。
 - `build_replenish_persist` 的 `persist` 回调移除了未使用的 `outcome` 参数。
 
+## [1.12.2] - 2026-11-01
+
+### 修复
+
+- **Agent 客户端必现的 400（请求体清洗）**。商汤对 chat/completions 的 schema 校验比 OpenAI 严格，
+  下列写法合法但会被判 400 `invalid_parameter_error`：`assistant`/`system`/`tool` 的 `content`
+  缺失或为 `null`（无 `tool_calls` 兜底时）、`content` 是数字/布尔、`role: "developer"`、
+  `tool_calls[*].function.arguments` 是对象、以及 `logprobs`/`top_logprobs`/`metadata` 字段。
+  现在会在转发前规范成等价写法（带 `tool_calls` 的 `assistant` 保持 `null` 不动、`user` 的空
+  `content` 不改、越界数值不改），清洗失败时按原请求转发。
+
 ## [1.12.1] - 2026-10-31
 
 ### 新增
