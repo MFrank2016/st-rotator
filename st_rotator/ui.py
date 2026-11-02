@@ -384,6 +384,32 @@ class ConsoleState:
             "skipped": skipped,
         }
 
+    def export_accounts_json(self) -> dict[str, Any]:
+        """无损导出全部账号（含明文 password 与 tags），用于备份与还原。
+
+        不走 ``AccountConfig.to_dict()``：那个方法刻意不含 password，这里必须保留。
+        """
+        return {
+            "format": "st-rotator/accounts",
+            "version": 1,
+            "exported_at": time.time(),
+            "accounts": [
+                {
+                    "name": acct.name,
+                    "api_keys": list(acct.api_keys),
+                    "user": acct.user,
+                    "phone": acct.phone,
+                    "password": acct.password,
+                    "rpm_limit": acct.rpm_limit,
+                    "max_concurrency": acct.max_concurrency,
+                    "weight": acct.weight,
+                    "tags": list(acct.tags),
+                    "updated_at": acct.updated_at,
+                }
+                for acct in self.config.accounts
+            ],
+        }
+
     def snapshot(
         self, *, reveal_token: bool = False, request_base: str | None = None
     ) -> dict[str, Any]:
@@ -398,9 +424,7 @@ class ConsoleState:
             else None
         )
         blocked = (
-            list(catalog.get("blocked") or [])
-            if isinstance(catalog, Mapping)
-            else []
+            list(catalog.get("blocked") or []) if isinstance(catalog, Mapping) else []
         )
         return {
             "version": __version__,
@@ -528,7 +552,9 @@ class ConsoleState:
             return UiResponse.error(str(exc), status=404)
         return UiResponse.json({"ok": True, "id": identifier, "key": key})
 
-    def update_subkey(self, identifier: str, *, name: str | None = None, note: str | None = None) -> UiResponse:
+    def update_subkey(
+        self, identifier: str, *, name: str | None = None, note: str | None = None
+    ) -> UiResponse:
         try:
             manager = self._require_subkeys()
             sub = manager.update(identifier, name=name, note=note)
@@ -551,7 +577,13 @@ class ConsoleState:
             return UiResponse.error(str(exc), status=404)
         state = "启用" if sub.enabled else "停用"
         self._log(f"[子Key] {state} {sub.name}（{sub.masked}）")
-        return UiResponse.json({"ok": True, "enabled": sub.enabled, "message": f"已{state}子 Key：{sub.name}"})
+        return UiResponse.json(
+            {
+                "ok": True,
+                "enabled": sub.enabled,
+                "message": f"已{state}子 Key：{sub.name}",
+            }
+        )
 
     def revoke_subkey(self, identifier: str) -> UiResponse:
         try:
@@ -562,7 +594,9 @@ class ConsoleState:
         except KeyError as exc:
             return UiResponse.error(str(exc), status=404)
         self._log(f"[子Key] 删除 {sub.name}（{sub.masked}）")
-        return UiResponse.json({"ok": True, "message": f"已删除子 Key：{sub.name}，该 Key 立即失效"})
+        return UiResponse.json(
+            {"ok": True, "message": f"已删除子 Key：{sub.name}，该 Key 立即失效"}
+        )
 
     def reset_subkey_usage(self, identifier: str) -> UiResponse:
         try:
@@ -573,7 +607,9 @@ class ConsoleState:
         except KeyError as exc:
             return UiResponse.error(str(exc), status=404)
         self._log(f"[子Key] 清零用量：{sub.name}")
-        return UiResponse.json({"ok": True, "message": f"已清零子 Key {sub.name} 的用量统计"})
+        return UiResponse.json(
+            {"ok": True, "message": f"已清零子 Key {sub.name} 的用量统计"}
+        )
 
     def subkey_history(self, page: int = 1, page_size: int = 10) -> UiResponse:
         """子 Key 用量明细分页：默认每页 10 条，最新在前。"""
@@ -588,7 +624,9 @@ class ConsoleState:
                 "page": page,
                 "page_size": page_size,
                 "total": self.subkeys.history_count(),
-                "history": self.subkeys.history_snapshot(limit=page_size, offset=offset),
+                "history": self.subkeys.history_snapshot(
+                    limit=page_size, offset=offset
+                ),
             }
         )
 
@@ -757,9 +795,7 @@ class ConsoleState:
                     continue
                 self.store.reload()
                 self.rotator.config.accounts = list(self.store.config.accounts)
-            added.append(
-                {"id": item.id, "key": item.masked, "account": item.account}
-            )
+            added.append({"id": item.id, "key": item.masked, "account": item.account})
 
         if added:
             self._save_and_log(
@@ -904,9 +940,7 @@ class ConsoleState:
                                 target, user=user, phone=phone, password=password
                             )
                         self.store.reload()
-                        self.rotator.config.accounts = list(
-                            self.store.config.accounts
-                        )
+                        self.rotator.config.accounts = list(self.store.config.accounts)
                     except Exception:
                         # 池已接受、但写凭据 / 校验 / 同步失败：把 Key 从池和 store 里一起撤掉，
                         # 否则会出现「池里有、配置里没有」的脱节状态
@@ -950,6 +984,88 @@ class ConsoleState:
                 if account.user and account.user == user:
                     return account.name
         return user or phone
+
+    def import_accounts_json(self, payload: Mapping[str, Any]) -> UiResponse:
+        """导入账号 JSON：按账号名合并覆盖，逐条校验，坏条目不影响其余。
+
+        不做在线校验：不探测 Key、不验证登录凭据。
+        """
+        entries = payload.get("accounts") if isinstance(payload, Mapping) else None
+        if not isinstance(entries, list):
+            return UiResponse.error("JSON 里缺少 accounts 数组")
+        if self.store is None:
+            return UiResponse.error("当前没有可写的配置存储", status=409)
+
+        results: list[dict[str, Any]] = []
+        imported = failed = 0
+        with self.lock:
+            for index, entry in enumerate(entries, start=1):
+                name = (
+                    str(entry.get("name") or "") if isinstance(entry, Mapping) else ""
+                )
+                try:
+                    if not isinstance(entry, Mapping):
+                        raise ConfigError("账号条目必须是 JSON 对象")
+                    self.store.upsert_account(entry)
+                except Exception as exc:  # noqa: BLE001 - 单条失败不影响其余
+                    results.append(
+                        {
+                            "index": index,
+                            "name": name,
+                            "status": "error",
+                            "reason": str(exc),
+                        }
+                    )
+                    failed += 1
+                    continue
+                results.append(
+                    {
+                        "index": index,
+                        "name": name,
+                        "status": "ok",
+                        "reason": "已导入",
+                    }
+                )
+                imported += 1
+            if imported:
+                self.rotator.config.accounts = list(self.store.config.accounts)
+                self._sync_pool_accounts()
+
+        if imported:
+            self._save_and_log(f"通过控制台导入 {imported} 个账号（JSON）")
+        message = f"导入 {imported} 个账号"
+        if failed:
+            message += f"，失败 {failed} 个"
+        return UiResponse.json(
+            {
+                "ok": imported > 0,
+                "imported": imported,
+                "failed": failed,
+                "results": results,
+                "message": message,
+            }
+        )
+
+    def _sync_pool_accounts(self) -> None:
+        """把内存池对齐到刚 reload 的配置：补齐新 Key、剔除已不在配置里的 Key。"""
+        pool = getattr(self.rotator, "pool", None)
+        if pool is None:
+            return
+        for acct in self.store.config.accounts:
+            for key in acct.api_keys:
+                if pool.find_key(key) is None:
+                    pool.add_key(
+                        key,
+                        account=acct.name,
+                        rpm_limit=acct.rpm_limit,
+                        max_concurrency=acct.max_concurrency,
+                        weight=acct.weight,
+                        tags=acct.tags,
+                    )
+        current = {key for acct in self.store.config.accounts for key in acct.api_keys}
+        for item in pool.keys:
+            if item.key not in current:
+                pool.remove_key(item.key)
 
     def verify_one(self, identifier: str) -> UiResponse:
         """体检池中某一把 Key（identifier 可以是数字 id、key_id 或明文）。"""
@@ -1132,9 +1248,7 @@ class ConsoleState:
         )
         catalog = self.rotator.available_models()
         blocked = (
-            list(catalog.get("blocked") or [])
-            if isinstance(catalog, Mapping)
-            else []
+            list(catalog.get("blocked") or []) if isinstance(catalog, Mapping) else []
         )
         return UiResponse.json(
             {"ok": True, "available_models": available, "blocked": blocked}
@@ -1537,6 +1651,8 @@ class ConsoleState:
                         )
                     )
                 if path == "/api/accounts/export":
+                    if _first_str(query, "format", "") == "json":
+                        return UiResponse.json(self.export_accounts_json())
                     return UiResponse.json(self.export_accounts())
                 return UiResponse.error(f"未知接口 {path}", status=404)
 
@@ -1558,6 +1674,8 @@ class ConsoleState:
                         ),
                         rpm_limit=rpm_limit,
                     )
+                if path == "/api/accounts/import":
+                    return self.import_accounts_json(payload)
                 if path == "/api/keys/import":
                     return self.import_keys(
                         str(payload.get("lines") or ""),
@@ -1594,7 +1712,8 @@ class ConsoleState:
                     return self.set_paused(bool(payload.get("paused")))
                 if path == "/api/subkeys/create":
                     return self.create_subkey(
-                        str(payload.get("name") or ""), note=str(payload.get("note") or "")
+                        str(payload.get("name") or ""),
+                        note=str(payload.get("note") or ""),
                     )
                 if path == "/api/subkeys/reveal":
                     return self.reveal_subkey(str(payload.get("id") or ""))
@@ -1682,9 +1801,7 @@ def _empty_consumption() -> dict[str, Any]:
     return {"general": dict(zeros), "flash_lite": dict(zeros), "series": []}
 
 
-def _consumed_today(
-    spend: Mapping[str, Any], *, today: str | None = None
-) -> float:
+def _consumed_today(spend: Mapping[str, Any], *, today: str | None = None) -> float:
     """今日已用（元）：换天后视为 0，避免沿用昨天的余额差。
 
     与 ``replenish.spend_ok`` 同一口径：只有 ``spend["date"] == today`` 时才用

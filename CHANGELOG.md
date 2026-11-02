@@ -3,6 +3,25 @@
 版本号规则与发版标准流程见 [AGENTS.md](AGENTS.md)。
 一句话规则：**小版本 `+0.0.1`**（如 `1.3.0 → 1.3.1`），**大版本 `+0.1`**（如 `1.3.0 → 1.4.0`）。
 
+## [1.13.0] - 2026-11-02
+
+新增账号 JSON 无损导出 / 合并导入，用于备份与还原全部账号信息。
+
+### 新增
+
+- **`GET /api/accounts/export?format=json`**：导出全部账号，字段含 `name`、`api_keys`、
+  `user`、`phone`、`password`（明文）、`rpm_limit`、`max_concurrency`、`weight`、`tags`、
+  `updated_at`；没有 `user`/`password` 的账号也会导出。顶层带 `format` 与 `version`，
+  便于日后演进。
+- **`POST /api/accounts/import`**：接受上述 JSON，按账号名合并覆盖，新账号追加；
+  逐条校验，坏条目单独报错，不影响其余条目。导入不做在线校验，不探测 Key、不验证凭据；
+  导入成功后落盘并同步内存池。
+
+### 保持不变
+
+- 不带 `format` 的 `GET /api/accounts/export` 输出与之前完全一致。
+- `POST /api/keys/import` 行为不变。
+
 ## [1.12.0] - 2026-10-30
 
 按代码审查结果处理剩余 52 个中危问题。本次含多处行为变化，详见文末「变更」。

@@ -1141,6 +1141,38 @@ class ConfigStore:
         self._reload_after_mutation(backup)
         return entry
 
+    def upsert_account(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        """按账号名合并覆盖：同名账号整体替换，新账号追加，然后 reload。"""
+        backup = copy.deepcopy(self._raw)
+        acct = AccountConfig.from_dict(data)
+        if not isinstance(acct.tags, list) or any(
+            not isinstance(tag, str) for tag in acct.tags
+        ):
+            raise ConfigError(f"账号 {acct.name} 的 tags 必须是字符串列表")
+        entry = {
+            "name": acct.name,
+            "api_keys": list(acct.api_keys),
+            "user": acct.user,
+            "phone": acct.phone,
+            "password": acct.password,
+            "rpm_limit": acct.rpm_limit,
+            "max_concurrency": acct.max_concurrency,
+            "weight": acct.weight,
+            "tags": list(acct.tags),
+            # 原样保留：None 表示「未知（老配置）」，导入时补成当前时间会
+            # 把老账号伪装成刚写入，破坏备份还原的无损性。
+            "updated_at": acct.updated_at,
+        }
+        accounts = self._accounts_raw()
+        for index, item in enumerate(accounts):
+            if isinstance(item, dict) and item.get("name") == acct.name:
+                accounts[index] = entry
+                break
+        else:
+            accounts.append(entry)
+        self._reload_after_mutation(backup)
+        return entry
+
     def set_account_credentials(
         self, name: str, *, user: str, phone: str, password: str
     ) -> None:
