@@ -303,6 +303,12 @@ def classify(response: Response | StreamResponse, body: str) -> tuple[str, float
         # 全部不行再透传上游错误（见 _post_with_rotation 的 model 分支）。
         return "model", None
     if status in AUTH_STATUS:
+        # 403 有歧义：商汤既用它表示「凭据失效」，也用它表示「这个模型/端点不在
+        # 当前套餐里」。一律判失效会把一池好 Key 全打成 INVALID（只能等
+        # invalid_ttl 或重启恢复），所以只有错误体明确指向鉴权时才算失效，
+        # 否则按「模型不可用」换下一把 Key 试。
+        if status == 403 and not any(hint in lowered for hint in AUTH_HINTS):
+            return "model", None
         return "invalid", None
     if status == 429:
         lowered = (body or "").lower()
@@ -510,6 +516,55 @@ class StRotator:
         payload = self._build_payload(messages, model, params)
         payload["stream"] = True
         yield from self._stream_with_rotation("chat/completions", payload, attempts=attempts, raw=True, headers=headers)
+
+    # ------------------------------------------------------------ Anthropic 端点
+
+    def anthropic_message(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        attempts: int | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """非流式 Anthropic Messages（``POST /v1/messages``），自动轮换 Key。
+
+        与 :meth:`chat` 的区别：请求体**原样透传**（不做 OpenAI 字段拼装），
+        因为 Anthropic 的 ``messages`` / ``system`` / ``tools`` 语义与 OpenAI 不同，
+        任何"翻译"都可能改变语义。清洗只做「上游必 400」的那几处等价改写，
+        见 :mod:`st_rotator.anthropic`。
+        """
+        return self._post_with_rotation(
+            "messages",
+            dict(payload),
+            attempts=attempts,
+            headers=headers,
+            auth_scheme="api-key",
+        )
+
+    def anthropic_message_stream(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        attempts: int | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """流式 Anthropic Messages，逐条透传**原始 SSE 事件**。
+
+        Anthropic 的 SSE 是「带 event 名 + data JSON」的具名事件
+        （``message_start`` / ``content_block_delta`` / …），与 OpenAI 的
+        ``data: {...}`` 单行格式不同，所以这里按 dict 逐块透传：
+        ``{"type": <event名>, ...解析后的 data...}``，由上层原样写回客户端。
+        """
+        body = dict(payload)
+        body["stream"] = True
+        yield from self._stream_with_rotation(
+            "messages",
+            body,
+            attempts=attempts,
+            raw=True,
+            headers=headers,
+            auth_scheme="api-key",
+        )
 
     def embeddings(
         self, inputs: Any, *, model: str, attempts: int | None = None, **params: Any
@@ -897,8 +952,19 @@ class StRotator:
         return delay + self._rng.uniform(0.0, delay * 0.3)
 
     @staticmethod
-    def _auth(key: ApiKey) -> dict[str, str]:
-        """把当前租约对应的 Key 注入请求头。"""
+    def _auth(key: ApiKey, *, scheme: str = "bearer") -> dict[str, str]:
+        """把当前租约对应的 Key 注入请求头。
+
+        ``scheme`` 决定认证头形状：
+
+        * ``"bearer"`` —— ``Authorization: Bearer <key>``（OpenAI 兼容端点，默认）；
+        * ``"api-key"`` —— ``x-api-key: <key>``（Anthropic Messages 端点）。
+
+        两者都指向同一把池内 Key：商汤上游对 ``/v1/messages`` 同时接受这两种写法，
+        但 Anthropic 客户端/网关的惯例是 ``x-api-key``，这里跟随惯例以便与上游行为一致。
+        """
+        if scheme == "api-key":
+            return {"x-api-key": key.key}
         return {"Authorization": f"Bearer {key.key}"}
 
     # ------------------------------------------------------------ 智能一换一
@@ -1214,6 +1280,7 @@ class StRotator:
         attempts: int | None = None,
         method: str = "POST",
         headers: Mapping[str, str] | None = None,
+        auth_scheme: str = "bearer",
     ) -> dict[str, Any]:
         max_attempts = attempts or self.config.max_attempts
         excluded: set[str] = set()
@@ -1263,7 +1330,7 @@ class StRotator:
                 started = self._clock()
                 self._note_upstream_attempt(key)
                 req_headers = dict(headers) if headers else {}
-                req_headers.update(self._auth(key))
+                req_headers.update(self._auth(key, scheme=auth_scheme))
                 response = self._client.request(
                     method,
                     path,
@@ -1357,6 +1424,7 @@ class StRotator:
         attempts: int | None = None,
         raw: bool = False,
         headers: Mapping[str, str] | None = None,
+        auth_scheme: str = "bearer",
     ) -> Iterator[Any]:
         max_attempts = attempts or self.config.max_attempts
         excluded: set[str] = set()
@@ -1404,7 +1472,7 @@ class StRotator:
                 started = self._clock()
                 self._note_upstream_attempt(key)
                 req_headers = dict(headers) if headers else {}
-                req_headers.update(self._auth(key))
+                req_headers.update(self._auth(key, scheme=auth_scheme))
                 response = self._client.request(
                     "POST",
                     path,

@@ -1265,6 +1265,8 @@ function renderGateway(state) {
   var rows = [
     ["Base URL", g.base_url],
     ["对话端点", g.chat_endpoint],
+    ["Anthropic Base URL", g.anthropic_base_url],
+    ["Anthropic 端点", g.anthropic_messages_endpoint],
     ["API Key", tokenText],
     ["上游", g.upstream],
     ["健康检查", g.health_endpoint],
@@ -1278,7 +1280,8 @@ function renderGateway(state) {
 }
 
 function renderSnippetTabs() {
-  var tabs = [["python", "Python (OpenAI SDK)"], ["curl", "cURL"], ["node", "Node.js"], ["generic", "通用 Agent 配置"]];
+  var tabs = [["python", "Python (OpenAI SDK)"], ["curl", "cURL"], ["node", "Node.js"],
+              ["anthropic", "Anthropic / Claude"], ["generic", "通用 Agent 配置"]];
   $("snippet-tabs").innerHTML = tabs.map(function (t) {
     return '<button data-tab="' + t[0] + '" class="' + (S.tab === t[0] ? "active" : "") + '">' + esc(t[1]) + '</button>';
   }).join("");
@@ -1293,10 +1296,29 @@ function renderSnippet(g) {
   if (g) lastGateway = g;
   g = lastGateway || {};
   var base = g.base_url || "http://127.0.0.1:8080/v1";
+  var anthropicBase = g.anthropic_base_url || "http://127.0.0.1:8080/anthropic";
   var token = g.token || S.token || "<本地口令>";
   var model = g.model || "deepseek-v4-flash";
   var text;
-  if (S.tab === "curl") {
+  if (S.tab === "anthropic") {
+    text = '# Claude Code / Anthropic SDK 等客户端\n' +
+      'export ANTHROPIC_BASE_URL="' + anthropicBase + '"\n' +
+      'export ANTHROPIC_API_KEY="' + token + '"   # 填管理 Token 或用户 Key\n\n' +
+      'from anthropic import Anthropic\n\n' +
+      'client = Anthropic(\n' +
+      '    base_url="' + anthropicBase + '",\n' +
+      '    api_key="' + token + '",   # 网关本地鉴权，非商汤 Key\n' +
+      ')\n\n' +
+      'msg = client.messages.create(\n' +
+      '    model="' + model + '",\n' +
+      '    max_tokens=1024,\n' +
+      '    messages=[{"role": "user", "content": "你好"}],\n' +
+      ')\n' +
+      'print(msg.content)\n\n' +
+      '# 说明\n' +
+      '#   - Anthropic 走独立前缀 /anthropic，与上面的 OpenAI 兼容 /v1 互不影响\n' +
+      '#   - x-api-key 与 Authorization: Bearer 两种认证头都接受';
+  } else if (S.tab === "curl") {
     text = 'curl ' + base + '/chat/completions \\\n' +
       '  -H "Content-Type: application/json" \\\n' +
       '  -H "Authorization: Bearer ' + token + '" \\\n' +

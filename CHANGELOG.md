@@ -3,6 +3,45 @@
 版本号规则与发版标准流程见 [AGENTS.md](AGENTS.md)。
 一句话规则：**小版本 `+0.0.1`**（如 `1.3.0 → 1.3.1`），**大版本 `+0.1`**（如 `1.3.0 → 1.4.0`）。
 
+## [1.14.0] - 2026-11-15
+
+新增 Anthropic Messages 兼容端点，并补齐上游吸收的清洗与网关加固。
+
+### 新增
+
+- **Anthropic Messages 端点**：`POST /anthropic/v1/messages` 与
+  `GET /anthropic/v1/models`，走独立 `/anthropic` 前缀，客户端把
+  `ANTHROPIC_BASE_URL` 指向 `http://<host>:<port>/anthropic` 即可接入
+  Claude Code 等 Anthropic 原生客户端。与 OpenAI 兼容的 `/v1/*` 共用同一
+  Key 池、限流、冷却与模型白名单。
+  - 认证接受 `x-api-key` 与 `Authorization: Bearer`（同一套管理 Token / 子 Key，
+    子 Key 仍不能访问控制台）。
+  - 请求体只做语义等价的必要清洗：`messages[*].content` / 顶层 `system` 为
+    null 时补空串（assistant / user），`temperature` / `top_p` / `top_k` /
+    `max_tokens` 字符串转数字；不改 content 数组形态与越界数值。
+  - 流式响应按 Anthropic 具名 SSE 事件原样透传，不重组；错误体统一为
+    `{"type":"error","error":{...}}`。上游不提供 `count_tokens`，本网关同样不提供。
+- 控制台「网关接入信息」新增 Anthropic Base URL 与 Anthropic 端点；
+  「速贴」新增 Anthropic / Claude 页签（环境变量与 Python 片段）。
+
+### 修复与加固
+
+- **不收发调用方凭据**：转发上游时不再透传 `x-api-key`、`authorization`、
+  `proxy-authorization`、`cookie`。此前若客户端用 `x-api-key` 调用，上游会同时
+  收到网关凭据与池 Key 并返回 401，进而把整池 Key 误判为失效。
+- **403 歧义判定**：错误体不含鉴权提示时按「模型 / 端点不可用」换 Key，
+  不再直接标记 Key 失效；401 与含鉴权提示的 403 行为不变。
+- **补齐 400 清洗**：OpenAI 侧新增 `temperature` / `top_p` /
+  `frequency_penalty` / `presence_penalty` 字符串转数字；
+  `/v1/responses`、`/v1/embeddings` 等透传端点执行与 chat 相同的清洗。
+- **监听队列**：网关 backlog 有效设为 128（以 server 类属性在构造期生效），
+  短突发时不再因默认队列 5 丢连接。
+
+### 边界
+
+- `/v1/*` 的路径与响应语义不变；凭据头不透传、透传端点清洗属本次明确要求的行为变化。
+- 未引入 Anthropic 流式事件的任何重组或翻译；事件格式以上游为准。
+
 ## [1.13.0] - 2026-11-02
 
 新增账号 JSON 无损导出 / 合并导入，用于备份与还原全部账号信息。
