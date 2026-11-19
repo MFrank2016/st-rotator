@@ -55,6 +55,7 @@ from . import modeltest
 from . import ui
 from . import anthropic
 from .keypool import user_context
+from .model_policy import apply_chat_model_policy
 from .subkeys import SubKey, SubKeyManager
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -449,6 +450,20 @@ def _sanitize_params(params: dict[str, Any]) -> dict[str, Any]:
             except ValueError:
                 pass
     return params
+
+
+def sanitize_chat_payload(
+    payload: dict[str, Any], *, model_policy: bool = True
+) -> dict[str, Any]:
+    """对一整份 Chat 请求体做清洗（供原样透传端点与测试使用）。"""
+    if not isinstance(payload, dict):
+        return payload
+    if "messages" in payload:
+        payload["messages"] = _normalize_messages(payload["messages"])
+    _sanitize_params(payload)
+    if model_policy:
+        apply_chat_model_policy(payload)
+    return payload
 
 
 class RotatorProxyHandler(BaseHTTPRequestHandler):

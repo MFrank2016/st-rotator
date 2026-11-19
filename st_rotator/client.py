@@ -35,6 +35,7 @@ from .errors import (
 )
 from .keypool import ApiKey, KeyPool, mask_key
 from .limiter import AdaptiveRateLimiter, RateLimiter
+from .model_policy import apply_chat_model_policy, patch_model_metadata
 from .transport import HttpClient, NetworkError, Response, StreamResponse
 
 # 值得换个 Key 重试的状态码
@@ -363,6 +364,7 @@ def _parse_model_list(payload: Any) -> list[dict[str, Any]]:
         model_id = item.get("id") or item.get("name")
         if not model_id:
             continue
+        item = patch_model_metadata(item)
         models.append({
             "id": str(model_id),
             "name": str(item.get("name") or model_id),
@@ -855,8 +857,8 @@ class StRotator:
                 continue
             if not self.is_model_allowed(str(model_id or "")):
                 continue
-            kept.append(item)
-        if len(kept) == len(data):
+            kept.append(patch_model_metadata(item) if isinstance(item, dict) else item)
+        if kept == data:
             return payload
         filtered = dict(payload)
         filtered["data"] = kept
@@ -945,7 +947,8 @@ class StRotator:
             "messages": list(messages),
         }
         payload.update(params)
-        return payload
+        # 此处已经补齐默认模型，三个聊天入口共用策略，避免网关与直接调用分歧。
+        return apply_chat_model_policy(payload)
 
     def _backoff(self, attempt: int) -> float:
         delay = min(self.config.retry_backoff * (2 ** (attempt - 1)), self.config.max_retry_backoff)
