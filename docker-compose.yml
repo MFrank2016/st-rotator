@@ -4,6 +4,8 @@ services:
     image: st-rotator:latest
     container_name: st-rotator
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     # 仅发布到宿主机回环地址（本机调试用）；对外访问由 Caddy 反代（容器名 st-rotator）
     ports:
       - "127.0.0.1:18090:8080"
