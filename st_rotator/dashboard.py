@@ -603,6 +603,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </label>
         <button class="primary" id="btn-apply-options" style="height:33px">保存并应用</button>
       </div>
+      <div class="row" style="margin-bottom:12px">
+        <label class="field" style="width:250px;margin-bottom:0">
+          <span>重试退避模式</span>
+          <select id="opt-backoff-mode">
+            <option value="exponential">exponential · 指数（0.5s 起翻倍，8s 封顶）</option>
+            <option value="fixed">fixed · 固定（每次都等同样久）</option>
+          </select>
+        </label>
+        <label class="field" style="width:150px;margin-bottom:0">
+          <span>固定退避秒数</span>
+          <input id="opt-fixed-backoff" type="number" step="0.5" min="0" max="600">
+        </label>
+      </div>
       <div class="row" style="margin-bottom:12px;align-items:flex-end;flex-wrap:wrap">
         <label class="field" style="width:auto;margin-bottom:0;flex-direction:row;align-items:center;gap:6px">
           <input id="opt-fx-enabled" type="checkbox" style="width:auto;margin:0">
@@ -1867,6 +1880,12 @@ function renderOptions(state) {
   if (document.activeElement !== wait) wait.value = opt.max_total_wait;
   var attempts = $("opt-attempts");
   if (document.activeElement !== attempts) attempts.value = opt.max_attempts;
+  var bmode = $("opt-backoff-mode");
+  if (document.activeElement !== bmode) bmode.value = opt.backoff_mode || "exponential";
+  var fback = $("opt-fixed-backoff");
+  if (document.activeElement !== fback) fback.value = (opt.fixed_backoff == null ? "" : opt.fixed_backoff);
+  fback.disabled = bmode.value !== "fixed";
+  fback.style.opacity = fback.disabled ? "0.45" : "1";
   var fx = opt.flash_lite || {};
   var fe = $("opt-fx-enabled");
   if (document.activeElement !== fe) fe.checked = !!fx.enabled;
@@ -2111,6 +2130,7 @@ async function onApplyModel() {
    保存成功后清脏并恢复回填。按钮上的 * 与提示文字给出可见反馈。 */
 var OPT_FIELD_IDS = [
   "opt-strategy", "opt-rate-mode", "opt-qps", "opt-wait", "opt-attempts",
+  "opt-backoff-mode", "opt-fixed-backoff",
   "opt-fx-enabled", "opt-fx-concurrency", "opt-fx-req", "opt-fx-interval",
   "opt-fx-tokens", "opt-fx-imgsize", "opt-fx-imgcount", "opt-fx-image",
   "opt-fx-yield", "opt-fx-minmem",
@@ -2146,6 +2166,8 @@ async function onApplyOptions() {
     qps: parseFloat($("opt-qps").value),
     max_total_wait: parseFloat($("opt-wait").value),
     max_attempts: parseInt($("opt-attempts").value, 10),
+    backoff_mode: $("opt-backoff-mode").value,
+    fixed_backoff: parseFloat($("opt-fixed-backoff").value),
     flash_lite: {
       enabled: $("opt-fx-enabled").checked,
       image_enabled: $("opt-fx-image").checked,
@@ -2507,6 +2529,11 @@ function bind() {
     if (menu) menu.style.display = "none";
   });
   $("btn-apply-options").onclick = onApplyOptions;
+  $("opt-backoff-mode").onchange = function () {
+    var fixed = $("opt-fixed-backoff");
+    fixed.disabled = this.value !== "fixed";
+    fixed.style.opacity = fixed.disabled ? "0.45" : "1";
+  };
   $("btn-save-replenish").onclick = onApplyOptions;
   // 任一运行参数字段被编辑 -> 置脏并暂停轮询回填，直到点击保存。
   OPT_FIELD_IDS.forEach(function (id) {

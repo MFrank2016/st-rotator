@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from .client import StRotator
 from .config import (
+    BACKOFF_MODES,
     STRATEGIES,
     Config,
     ConfigStore,
@@ -468,7 +469,12 @@ class ConsoleState:
                 "max_qps": self.config.rate_control.max_qps,
                 "max_total_wait": self.config.max_total_wait,
                 "max_attempts": self.config.max_attempts,
+                "backoff_mode": self.config.backoff_mode,
+                "fixed_backoff": self.config.fixed_backoff,
+                "retry_backoff": self.config.retry_backoff,
+                "max_retry_backoff": self.config.max_retry_backoff,
                 "strategies": list(STRATEGIES),
+                "backoff_modes": list(BACKOFF_MODES),
                 "rate_modes": list(RateControlConfig.MODES),
                 "flash_lite": {
                     "enabled": self.config.flash_lite_exchange.enabled,
@@ -1328,6 +1334,31 @@ class ConsoleState:
                 continue
             scalar_changes.append((field_name, converted, label))
 
+        backoff_mode = payload.get("backoff_mode")
+        fixed_backoff = payload.get("fixed_backoff")
+        backoff_change = False
+        backoff_plan: tuple[str | None, float | None] = (None, None)
+        if backoff_mode is not None or fixed_backoff is not None:
+            mode_change: str | None = None
+            if backoff_mode is not None and backoff_mode != self.config.backoff_mode:
+                if backoff_mode not in BACKOFF_MODES:
+                    return UiResponse.error(f"退避模式只能是 {list(BACKOFF_MODES)} 之一")
+                mode_change = str(backoff_mode)
+            seconds_change: float | None = None
+            if fixed_backoff is not None:
+                try:
+                    seconds_change = float(fixed_backoff)
+                except (TypeError, ValueError):
+                    return UiResponse.error(f"固定退避秒数不是合法数字：{fixed_backoff!r}")
+                if seconds_change < 0:
+                    return UiResponse.error("固定退避秒数不能为负")
+                if seconds_change > 600:
+                    return UiResponse.error("固定退避秒数不能超过 600 秒")
+                if seconds_change == self.config.fixed_backoff:
+                    seconds_change = None
+            backoff_change = mode_change is not None or seconds_change is not None
+            backoff_plan = (mode_change, seconds_change)
+
         fx_cfg = self.config.flash_lite_exchange
         fx_changes: dict[str, Any] = {}
         fx_payload = payload.get("flash_lite")
@@ -1424,7 +1455,7 @@ class ConsoleState:
                 except ConfigError as exc:
                     return UiResponse.error(str(exc))
 
-        if not (strategy or rate_fields or scalar_changes or fx_changes or rp_changes):
+        if not (strategy or rate_fields or scalar_changes or fx_changes or rp_changes or backoff_change):
             return UiResponse.json({"ok": True, "message": "没有需要改动的参数"})
 
         # ---------------- 2. 一次性提交 ----------------
@@ -1443,6 +1474,14 @@ class ConsoleState:
                 setattr(self.config, field_name, converted)
                 self.store.set_scalar(field_name, converted)
                 changes.append(f"{label}={converted}")
+            if backoff_change:
+                mode_change, seconds_change = backoff_plan
+                self.rotator.set_backoff(mode=mode_change, fixed_seconds=seconds_change)
+                self.store.set_backoff(mode=mode_change, fixed_seconds=seconds_change)
+                if mode_change is not None:
+                    changes.append(f"退避={mode_change}")
+                if seconds_change is not None:
+                    changes.append(f"固定退避={seconds_change:g}s")
             if fx_changes:
                 for k, v in fx_changes.items():
                     setattr(fx_cfg, k, v)

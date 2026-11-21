@@ -184,6 +184,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         f"限速: {rc.mode}"
         + (f" (qps={rc.qps})" if rc.mode != "off" else "")
         + f" | 单请求预算: {config.max_total_wait or '不限'}s | 最大重试: {config.max_attempts}"
+        + (
+            f" | 退避: 固定 {config.fixed_backoff:g}s"
+            if config.backoff_mode == "fixed"
+            else f" | 退避: 指数 {config.retry_backoff:g}s→{config.max_retry_backoff:g}s"
+        )
     )
     rotator = StRotator(config)
     try:
@@ -1075,6 +1080,11 @@ def cmd_bench(args: argparse.Namespace) -> int:
             else " (关闭)"
         )
         + f" | 单请求预算: {config.max_total_wait or '不限'}s | 最大重试: {config.max_attempts}"
+        + (
+            f" | 退避: 固定 {config.fixed_backoff:g}s"
+            if config.backoff_mode == "fixed"
+            else f" | 退避: 指数 {config.retry_backoff:g}s→{config.max_retry_backoff:g}s"
+        )
     )
     with StRotator(
         config,
